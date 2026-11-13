@@ -377,36 +377,46 @@ pub enum Outcome {
     Refused(String),
 }
 
-/// Refusals written in one minute; the rest of that minute are counted in one closing row.
-const REFUSALS_A_MINUTE: usize = 60;
+/// Allowed rows, and refusals, written in one minute; the rest of that minute are counted in
+/// one closing row each.
+const ROWS_A_MINUTE: usize = 60;
 
-/// Which audit rows a request leaves: a destination once an hour, and each refusal up to
-/// `REFUSALS_A_MINUTE`, so neither a browser nor a looping agent floods state.db.
+/// The destinations remembered for the hour; past it, each is written as new, under the
+/// minute's cap.
+const SEEN_AN_HOUR: usize = 4096;
+
+/// Which audit rows a request leaves: a destination once an hour and each refusal, each up to
+/// `ROWS_A_MINUTE`, so neither a browser nor a looping agent floods state.db.
 #[derive(Default)]
 pub struct Audit {
     hour: i64,
     seen: HashSet<String>,
     minute: i64,
+    allowed: usize,
     refused: usize,
 }
 
 impl Audit {
-    /// Once the minute of the last refusals is over: the row counting those not written, if
-    /// any. The writer calls it every second, so the count does not wait for a later request.
-    pub fn flush(&mut self, now: i64) -> Option<(String, String, String)> {
+    /// Once the minute of the last rows is over: the rows counting those not written, if any.
+    /// The writer calls it every second, so the count does not wait for a later request.
+    pub fn flush(&mut self, now: i64) -> Vec<(String, String, String)> {
         if now / 60 == self.minute {
-            return None;
+            return Vec::new();
         }
-        let more = self.refused.saturating_sub(REFUSALS_A_MINUTE);
-        (self.minute, self.refused) = (now / 60, 0);
+        let counts = [("allowed", self.allowed), ("refused", self.refused)];
+        (self.minute, self.allowed, self.refused) = (now / 60, 0, 0);
         // No request's own row: `proxy`, with no destination.
-        (more > 0).then(|| {
-            (
-                "proxy".into(),
-                String::new(),
-                format!("refused: {more} more"),
-            )
-        })
+        (counts.into_iter())
+            .map(|(word, n)| (word, n.saturating_sub(ROWS_A_MINUTE)))
+            .filter(|(_, more)| *more > 0)
+            .map(|(word, more)| {
+                (
+                    "proxy".into(),
+                    String::new(),
+                    format!("{word}: {more} more"),
+                )
+            })
+            .collect()
     }
 
     /// The `(tool, args, outcome)` rows to write for a request to `dest` (`host:port -> ip`).
@@ -417,7 +427,7 @@ impl Audit {
         dest: &str,
         o: Outcome,
     ) -> Vec<(String, String, String)> {
-        let mut rows: Vec<_> = self.flush(now).into_iter().collect();
+        let mut rows = self.flush(now);
         let outcome = match o {
             Outcome::Allowed => {
                 if now / 3600 != self.hour {
@@ -429,11 +439,18 @@ impl Audit {
                     "swap" => format!("swap {dest}"),
                     _ => dest.split(" -> ").next().unwrap_or(dest).to_string(),
                 };
-                (self.seen.insert(key)).then(|| "allowed".to_string())
+                let new = !self.seen.contains(&key);
+                self.allowed += usize::from(new);
+                let written = new && self.allowed <= ROWS_A_MINUTE;
+                // Seen only once its row is written, so one the cap cut is named next time.
+                if written && self.seen.len() < SEEN_AN_HOUR {
+                    self.seen.insert(key);
+                }
+                written.then(|| "allowed".to_string())
             }
             Outcome::Refused(reason) => {
                 self.refused += 1;
-                (self.refused <= REFUSALS_A_MINUTE).then(|| format!("refused: {reason}"))
+                (self.refused <= ROWS_A_MINUTE).then(|| format!("refused: {reason}"))
             }
         };
         rows.extend(outcome.map(|o| (tool.into(), dest.into(), o)));
@@ -1146,7 +1163,7 @@ fn write_audit(store: Store, notes: std::sync::mpsc::Receiver<Note>, mut cfg: Ar
                 tell = (note.notice).filter(|(what, host, _)| notices.due(note.at, what, host));
                 audit.note(note.at, note.tool, &note.dest, note.outcome)
             }
-            Err(RecvTimeoutError::Timeout) => audit.flush(crate::now()).into_iter().collect(),
+            Err(RecvTimeoutError::Timeout) => audit.flush(crate::now()),
             Err(RecvTimeoutError::Disconnected) => return,
         };
         if rows.is_empty() && tell.is_none() {
@@ -2552,9 +2569,9 @@ mod tests {
         };
         // The minute's end writes the count of the rest, with no later request to wait for,
         // once, and under no one request's tool.
-        assert_eq!(a.flush(59), None);
-        assert_eq!(a.flush(60), Some(row("proxy", "", "refused: 1 more")));
-        assert_eq!(a.flush(60), None);
+        assert_eq!(a.flush(59), []);
+        assert_eq!(a.flush(60), [row("proxy", "", "refused: 1 more")]);
+        assert_eq!(a.flush(60), []);
         assert_eq!(refuse(&mut a, 60), [row("http", "x:22", "refused: no")]);
         // A request that comes before any flush closes the minute before it itself.
         let rows: usize = (0..62).map(|_| refuse(&mut a, 119).len()).sum();
@@ -2566,6 +2583,62 @@ mod tests {
                 row("http", "x:22", "refused: no")
             ]
         );
+    }
+
+    /// A burst of new destinations is capped as refusals are: 60 rows a minute and one row
+    /// counting the rest, and the hour's set of destinations stays bounded.
+    #[test]
+    fn audit_folds_a_flood_of_allowed_destinations() {
+        let mut a = Audit::default();
+        let mut rows: Vec<_> = (0..1000)
+            .flat_map(|i| {
+                a.note(
+                    60,
+                    "connect",
+                    &format!("h{i}.example:443 -> 1.1.1.1"),
+                    Outcome::Allowed,
+                )
+            })
+            .collect();
+        rows.extend(a.flush(120));
+        assert_eq!(rows.len(), 61);
+        let more = (
+            "proxy".to_string(),
+            String::new(),
+            "allowed: 940 more".to_string(),
+        );
+        assert_eq!(rows.last(), Some(&more));
+        for i in 0..10_000 {
+            a.note(
+                180,
+                "connect",
+                &format!("n{i}.example:443 -> 1.1.1.1"),
+                Outcome::Allowed,
+            );
+        }
+        assert!(a.seen.len() <= SEEN_AN_HOUR);
+    }
+
+    /// A destination the minute's cap left unwritten is not taken as seen: after 60 decoys,
+    /// the one that matters is still named when it comes again.
+    #[test]
+    fn a_destination_cut_by_the_cap_is_named_later() {
+        let mut a = Audit::default();
+        let mut note = |now, host: &str| {
+            let dest = format!("{host}:443 -> 1.1.1.1");
+            a.note(now, "connect", &dest, Outcome::Allowed)
+        };
+        for i in 0..60 {
+            assert_eq!(note(60, &format!("decoy{i}.example")).len(), 1);
+        }
+        assert!(note(60, "exfil.example").is_empty());
+        let rows = note(120, "exfil.example");
+        let named = (
+            "connect".into(),
+            "exfil.example:443 -> 1.1.1.1".into(),
+            "allowed".into(),
+        );
+        assert!(rows.contains(&named), "{rows:?}");
     }
 
     #[tokio::test]

@@ -923,17 +923,23 @@ fn audit(cfg: &Config, store: &Store, card: &Card, tool: &str, outcome: &str) {
     crate::gate::audit_row(store, "card", tool, &args, &outcome);
 }
 
+/// A reminder to delete hand-made `card`, and the mark that it went (`told_at`), in one write:
+/// a reminder sent with no mark would go again on every tick, so neither lands without the
+/// other, and the tick tries again.
+fn remind(store: &Store, card: &Card, text: &str, now: i64) {
+    log(store.atomically(|store| {
+        store.card_told(card.id, now)?;
+        match card.channel.is_empty() {
+            true => store.notify_last_owner(text),
+            false => store.notify(&card.channel, &card.sender, text),
+        }
+    }));
+}
+
+/// A notice about `card` for its owner, after its change landed: one that cannot be written now
+/// is owed to a later tick (`Store::owe_notice`).
 fn tell(store: &Store, card: &Card, text: &str) {
-    let told = match card.channel.is_empty() {
-        true => store.notify_last_owner(text),
-        false => store.notify(&card.channel, &card.sender, text),
-    };
-    if let Err(e) = told {
-        eprintln!(
-            "zephyr: telling the owner about card #{} failed: {e}",
-            card.id
-        );
-    }
+    store.owe_notice(&card.channel, &card.sender, text);
 }
 
 fn note(store: &Store, card: &Card, word: &str, text: &str) {
@@ -960,7 +966,9 @@ pub fn refuses_currency(cfg: &Config, currency: &str) -> Option<String> {
 
 /// Issues a card the gate let through (`Checked` is its proof): records it, asks the provider,
 /// and tells the owner what to do next. `Ok` is what the agent is told, `Err` why no card was
-/// issued. Nothing is retried by itself.
+/// issued. The payment the window counted for it is taken out again only when the issuer
+/// made no card (no reference came back): one it made may still be charged until it is
+/// closed there. Nothing is retried by itself.
 pub async fn issue(
     cfg: &Config,
     checked: Checked,
@@ -968,6 +976,26 @@ pub async fn issue(
     asker: &Asker,
     proposal: Option<i64>,
     reason: Option<&str>,
+) -> Result<String, String> {
+    let payment = checked.payment();
+    let mut made = false;
+    let done = issue_card(cfg, checked, ask, asker, proposal, reason, &mut made).await;
+    if let (Err(_), Some(row), false) = (&done, payment, made) {
+        if let Err(e) = open_store(cfg).and_then(|s| s.unpay(row).map_err(|e| e.to_string())) {
+            eprintln!("zephyr: taking a card's payment out of the window failed: {e}");
+        }
+    }
+    done
+}
+
+async fn issue_card(
+    cfg: &Config,
+    checked: Checked,
+    ask: &CardAsk,
+    asker: &Asker,
+    proposal: Option<i64>,
+    reason: Option<&str>,
+    made: &mut bool,
 ) -> Result<String, String> {
     let issuer = issuer(cfg)?;
     let caps = issuer.can();
@@ -1016,6 +1044,7 @@ pub async fn issue(
             return Err(format!("card #{id} was not issued: {why}"));
         }
     };
+    *made = true;
     card.provider_ref = Some(issued.provider_ref);
     card.approval_url = issued.approval_url;
     let landed = db.get().card_issued(
@@ -1032,13 +1061,20 @@ pub async fn issue(
             .flatten()
             .is_some_and(|c| c.status == "waiting")
     };
-    if !landed.map_err(failed)? || !waiting() {
-        // Its close was asked while the issuer was answering (a `/stop`): what the issuer made
-        // is closed there now, and the card is `closing` until the issuer takes that, tried
-        // again on the tick. The owner is never told to approve it.
+    if let Err(e) = &landed {
+        eprintln!("zephyr: recording card #{id}'s reference failed: {e}");
+    }
+    if !landed.unwrap_or(false) || !waiting() {
+        // Its close was asked while the issuer was answering (a `/stop`), or its reference
+        // could not be recorded: what the issuer made is closed there now, and the card is
+        // `closing` until the issuer takes that, tried again on the tick. The owner is never
+        // told to approve it.
         let reference = card.provider_ref.as_deref().unwrap_or_default();
-        db.get().card_reclose(id, reference, now).map_err(failed)?;
-        let _ = poll_due(cfg, id);
+        if let Err(e) = db.get().card_reclose(id, reference, now) {
+            eprintln!("zephyr: recording card #{id}'s close failed: {e}");
+        }
+        poll_now(cfg, id);
+        close_in_hand(cfg, id);
         let said = close_at_issuer(cfg, &mut card).await;
         say(cfg, card, Word::Closed(LANDED.into(), said));
         return Err(format!("card #{id} was not issued: {LANDED}"));
@@ -1181,16 +1217,17 @@ pub fn issue_approved(cfg: &Arc<Config>, checked: Checked, ask: CardAsk, a: &cra
             Ok(_) => ("done", "a card was issued".to_string()),
             Err(why) => ("failed", why.clone()),
         };
+        // How it ended first, so it never stays `running`; a notice that cannot be written now
+        // is owed to a later tick.
         if let Err(e) = store.finish_action(id, status, &result) {
             eprintln!("zephyr: recording how #{id} ended failed: {e}");
         }
         if let Err(why) = done {
             let text = format!("the owner approved #{id}, but {why}");
-            let _ = store.action_note(id, "not run", &text);
-            let _ = match asker.channel.is_empty() {
-                true => store.notify_last_owner(&format!("[zephyr] {why}")),
-                false => store.notify(&asker.channel, &asker.sender, &format!("[zephyr] {why}")),
-            };
+            if let Err(e) = store.action_note(id, "not run", &text) {
+                eprintln!("zephyr: telling the agent about #{id} failed: {e}");
+            }
+            store.owe_notice(&asker.channel, &asker.sender, &format!("[zephyr] {why}"));
         }
     });
 }
@@ -1736,7 +1773,11 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
     fills::stop(cfg.state_dir(), card.id);
     live::forget(cfg.state_dir(), card.id, now);
     // This close is in hand: the tick's retry waits its turn.
-    let _ = poll_due(cfg, card.id);
+    poll_now(cfg, card.id);
+    // One already at the issuer is the close; its answer is recorded as any other.
+    if !close_in_hand(cfg, card.id) {
+        return;
+    }
     let (cfg, why) = (cfg.clone(), why.to_string());
     let mut card = card;
     tokio::spawn(async move {
@@ -1766,13 +1807,13 @@ fn closed(
     if let Err(e) = said {
         audit(cfg, store, card, "close", &e);
         log(store.card_closing(card.id, now));
+        let e = crate::vault::scrubbed(cfg, e);
+        let text = format!(
+            "[zephyr] card #{} could not be closed at the issuer: {e}; close it in the \
+             provider's app",
+            card.id
+        );
         if store.card_told_once(card.id, now).unwrap_or(false) {
-            let e = crate::vault::scrubbed(cfg, e);
-            let text = format!(
-                "[zephyr] card #{} could not be closed at the issuer: {e}; close it in the \
-                 provider's app",
-                card.id
-            );
             tell(store, card, &text);
         }
         return;
@@ -1781,6 +1822,7 @@ fn closed(
     // charge that comes in late is recorded, and counted, before the card ends closed.
     let fresh = store.card(card.id).ok().flatten();
     if let Some(fresh) = fresh.filter(|c| c.status == "closing" && chargeable(cfg, c)) {
+        poll_now(cfg, card.id);
         let (cfg, why) = (cfg.clone(), why.to_string());
         tokio::spawn(async move {
             let state = match issuer(&cfg) {
@@ -1811,25 +1853,26 @@ fn closed_now(cfg: &Config, store: &Store, card: &Card, why: &str, now: i64) {
         true => "unknown",
         false => "closed",
     };
+    let owner = match () {
+        _ if why == RETRY || why == LANDED => {
+            format!("[zephyr] card #{} is closed at the issuer now", card.id)
+        }
+        _ if to == "unknown" => delete_it(card, why),
+        _ => format!("[zephyr] card #{} is closed: {why}", card.id),
+    };
     if !store
         .move_card(card.id, &UNSETTLED, to, now)
         .unwrap_or(false)
     {
         return;
     }
+    match to == "unknown" && why != RETRY && why != LANDED {
+        true => remind(store, card, &owner, now),
+        false => tell(store, card, &owner),
+    }
     audit(cfg, store, card, "close", why);
     let text = format!("{why}; the card is closed and cannot be filled");
     note(store, card, "closed", &text);
-    if why == RETRY || why == LANDED {
-        let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
-        tell(store, card, &text);
-    } else if to == "unknown" {
-        log(store.card_told(card.id, now));
-        tell(store, card, &delete_it(card, why));
-    } else {
-        let text = format!("[zephyr] card #{} is closed: {why}", card.id);
-        tell(store, card, &text);
-    }
 }
 
 fn delete_it(card: &Card, why: &str) -> String {
@@ -1889,6 +1932,46 @@ fn poll_due(cfg: &Config, id: i64) -> bool {
     }
 }
 
+/// The cards with a close at their issuer in hand, by state folder: from when it is asked until
+/// its answer (`Word::Closed`, `Word::UsedClosed`) is recorded, whatever it takes, no other close
+/// or state of the card is asked.
+static CLOSES: Mutex<Vec<(PathBuf, i64)>> = Mutex::new(Vec::new());
+
+/// Notes a close of card `id` in hand; `false` when one already is, and none must be asked.
+fn close_in_hand(cfg: &Config, id: i64) -> bool {
+    let mut all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    let state = cfg.state_dir();
+    if all.iter().any(|(s, c)| s == state && *c == id) {
+        return false;
+    }
+    all.push((state.to_path_buf(), id));
+    true
+}
+
+/// Whether a close of card `id` is in hand.
+fn closing_now(cfg: &Config, id: i64) -> bool {
+    let all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter().any(|(s, c)| s == cfg.state_dir() && *c == id)
+}
+
+/// The close of card `id` was answered, and its word is being recorded.
+fn close_answered(cfg: &Config, id: i64) {
+    let mut all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(s, c)| !(s == cfg.state_dir() && *c == id));
+}
+
+/// Notes that card `id` is polled now, whatever its last poll: a close or an ask in hand puts
+/// the tick's next one a full interval off, so it never asks for a second close meanwhile.
+fn poll_now(cfg: &Config, id: i64) {
+    let mut all = POLLED.lock().unwrap_or_else(|e| e.into_inner());
+    let state = cfg.state_dir();
+    let now = std::time::Instant::now();
+    match all.iter_mut().find(|(s, c, _)| s == state && *c == id) {
+        Some((_, _, at)) => *at = now,
+        None => all.push((state.to_path_buf(), id, now)),
+    }
+}
+
 /// The statuses of a card that is not over: it may still be filled, charged or closed.
 const LIVE: [&str; 3] = ["waiting", "open", "charging"];
 /// Those, and `closing`: a close was asked and the issuer has not confirmed it yet.
@@ -1920,8 +2003,14 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     for (card, word) in words {
         match word {
             Word::State(state) => stated(cfg, store, card, state, now),
-            Word::Closed(why, said) => closed(cfg, store, &card, &why, said, now),
-            Word::UsedClosed(what, said) => used_closed(cfg, store, &card, &what, said),
+            Word::Closed(why, said) => {
+                close_answered(cfg, card.id);
+                closed(cfg, store, &card, &why, said, now)
+            }
+            Word::UsedClosed(what, said) => {
+                close_answered(cfg, card.id);
+                used_closed(cfg, store, &card, &what, said)
+            }
             Word::Settled(why, state) => match state {
                 Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
                 _ => closed_now(cfg, store, &card, &why, now),
@@ -1930,8 +2019,7 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     }
     for card in store.cards_in(&["unknown"]).unwrap_or_default() {
         if card.provider == "manual" && card.told_at.is_none_or(|at| at + 86_400 <= now) {
-            log(store.card_told(card.id, now));
-            tell(store, &card, &delete_it(&card, "it is past its time"));
+            remind(store, &card, &delete_it(&card, "it is past its time"), now);
         }
     }
     let mut asks: Vec<(Card, Option<&'static str>)> = Vec::new();
@@ -1939,9 +2027,12 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
         // A close the issuer refused is asked again; a card that may have been charged is
         // asked about first, so a charge is not missed ([`stated`] closes it again).
         if card.status == "closing" {
-            if card.provider_ref.is_some() && poll_due(cfg, card.id) {
-                let state = chargeable(cfg, &card);
-                asks.push((card, (!state).then_some(RETRY)));
+            // A close at the issuer now is answered first, however long it takes.
+            if card.provider_ref.is_some() && !closing_now(cfg, card.id) && poll_due(cfg, card.id) {
+                let close = (!chargeable(cfg, &card)).then_some(RETRY);
+                if close.is_none() || close_in_hand(cfg, card.id) {
+                    asks.push((card, close));
+                }
             }
             continue;
         }
@@ -1950,13 +2041,15 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
             log(store.card_closing(card.id, now));
             fills::stop(cfg.state_dir(), card.id);
             live::forget(cfg.state_dir(), card.id, now);
-            let _ = poll_due(cfg, card.id);
+            poll_now(cfg, card.id);
             // Only an issuer that reports charges can say a card went unused.
             let why = match caps(cfg).is_some_and(|c| c.charges) {
                 true => "expired unused",
                 false => "it is past its time",
             };
-            asks.push((card, Some(why)));
+            if close_in_hand(cfg, card.id) {
+                asks.push((card, Some(why)));
+            }
             continue;
         }
         // A card the issuer has not made yet is not asked about: its issue is in hand.
@@ -2008,9 +2101,17 @@ fn stated(
             }
         }
         Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
-        // A closing card the issuer has not closed: its close is asked again.
+        // A closing card the issuer has not closed: its close is asked again, only while the
+        // record still says `closing` (the copy may be older than a close that landed).
         Ok(CardState::Open | CardState::Waiting) | Err(_) if card.status == "closing" => {
-            let mut card = card;
+            let fresh = store.card(card.id).ok().flatten();
+            let Some(mut card) = fresh.filter(|c| c.status == "closing") else {
+                return;
+            };
+            if !close_in_hand(cfg, card.id) {
+                return;
+            }
+            poll_now(cfg, card.id);
             let cfg = cfg.clone();
             tokio::spawn(async move {
                 let said = close_at_issuer(&cfg, &mut card).await;
@@ -2019,31 +2120,27 @@ fn stated(
         }
         Ok(CardState::Closed) => {
             live::forget(cfg.state_dir(), card.id, now);
-            if store
-                .move_card(card.id, &UNSETTLED, "closed", now)
-                .unwrap_or(false)
-            {
+            let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
+            let moved = store.move_card(card.id, &UNSETTLED, "closed", now);
+            if moved.unwrap_or(false) {
+                if card.status == "closing" {
+                    tell(store, &card, &text);
+                }
                 audit(cfg, store, &card, "close", "closed at the issuer");
                 let text = "the issuer closed it; it cannot be filled";
                 note(store, &card, "closed", text);
-                if card.status == "closing" {
-                    let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
-                    tell(store, &card, &text);
-                }
             }
         }
         Ok(CardState::Failed(why)) => {
             live::forget(cfg.state_dir(), card.id, now);
-            if store
-                .move_card(card.id, &UNSETTLED, "failed", now)
-                .unwrap_or(false)
-            {
-                let why = crate::vault::scrubbed(cfg, why);
+            let why = crate::vault::scrubbed(cfg, why);
+            let text = format!("[zephyr] card #{} was not issued: {why}", card.id);
+            let moved = store.move_card(card.id, &UNSETTLED, "failed", now);
+            if moved.unwrap_or(false) {
+                tell(store, &card, &text);
                 audit(cfg, store, &card, "issue", &why);
                 let text = format!("no card: {why}; ask again if it is still wanted");
                 note(store, &card, "failed", &text);
-                let text = format!("[zephyr] card #{} was not issued: {why}", card.id);
-                tell(store, &card, &text);
             }
         }
         Ok(_) => {}
@@ -2060,36 +2157,49 @@ fn stated(
 fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i64) {
     let Some(first) = charges.first() else { return };
     live::forget(cfg.state_dir(), card.id, now);
-    let charge = store.card_charged(
-        card.id,
-        first.minor,
-        &first.currency,
-        first.merchant_id.as_deref(),
-        first.descriptor.as_deref(),
-        first.mcc.as_deref(),
-        now,
-    );
-    if !charge.unwrap_or(false) {
-        return;
-    }
     // The window counts what the issuer took in all, when that is more than the cap; in another
     // currency it cannot be counted, and the window holds the next payment as over.
     let same = charges.iter().all(|c| c.currency == card.currency);
-    let total = same.then(|| charges.iter().map(|c| c.minor).sum());
-    log(store.card_paid(card.id, total));
-    let what = charged(first);
-    audit(cfg, store, &card, "charge", &what);
+    let total = same.then(|| (charges.iter()).fold(0i64, |sum, c| sum.saturating_add(c.minor)));
     let over = first.minor > card.cap_minor || first.currency != card.currency;
-    if over || charges.len() > 1 {
+    let text = (over || charges.len() > 1).then(|| {
         let all: Vec<String> = charges.iter().map(charged).collect();
-        let text = format!(
+        format!(
             "[zephyr] card #{} took what you did not approve (up to {}, once): {}; the issuer \
              should have declined it",
             card.id,
             crate::approvals::money(card.cap_minor, &card.currency),
             all.join("; ")
-        );
-        tell(store, &card, &text);
+        )
+    });
+    // The charge and what the window counts land together; the notice follows, owed when it
+    // cannot be written now.
+    let charge = store.atomically(|store| {
+        let charged = store.card_charged(
+            card.id,
+            first.minor,
+            &first.currency,
+            first.merchant_id.as_deref(),
+            first.descriptor.as_deref(),
+            first.mcc.as_deref(),
+            now,
+        )?;
+        if charged {
+            store.card_paid(card.id, total)?;
+        }
+        Ok(charged)
+    });
+    if !charge.unwrap_or_else(|e| {
+        eprintln!("zephyr: recording card #{}'s charge failed: {e}", card.id);
+        false
+    }) {
+        return;
+    }
+    text.iter().for_each(|text| tell(store, &card, text));
+    let what = charged(first);
+    audit(cfg, store, &card, "charge", &what);
+    if !close_in_hand(cfg, card.id) {
+        return;
     }
     let (cfg, mut card) = (cfg.clone(), card);
     tokio::spawn(async move {
@@ -2438,6 +2548,275 @@ mod tests {
             notes.iter().all(|n| !n.text.contains("issued")),
             "the agent is told nothing"
         );
+    }
+
+    /// A card the issuer did not issue is no payment: the window's count is as it was.
+    #[tokio::test]
+    async fn a_card_that_was_not_issued_leaves_the_window_count() {
+        let dir = crate::test_dir("cards-issue-failed");
+        let text = format!(
+            "rpi = '/r'\nhome = {dir:?}\n[approvals]\ncurrency = 'CAD'\nmoney = 'auto 100'\n\
+             [cards]\nprovider = 'fake'\n"
+        );
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "card".into(),
+            args: serde_json::json!({"action": "request", "site": "https://shop.example/pay",
+                "merchant": "Shop", "amount": "10", "currency": "CAD"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let now = crate::now();
+        let (checked, ask) = crate::gate::decide_card(&cfg, &store, &req, owner, now).unwrap();
+        assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 1);
+        Fake::script(&cfg, |s| s.fail_issue = Some("declined".into()));
+        let asker = Asker {
+            channel: "chat".into(),
+            sender: "o".into(),
+            session: "main".into(),
+        };
+        let why = issue(&cfg, checked, &ask, &asker, None, None).await;
+        assert!(why.unwrap_err().contains("was not issued"));
+        assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 0);
+    }
+
+    /// A card the issuer made but zephyr could not record is closed at the issuer, and its
+    /// payment stays counted: until that close lands it could still be charged.
+    #[tokio::test]
+    async fn a_card_made_but_not_recorded_is_closed_and_stays_counted() {
+        let dir = crate::test_dir("cards-issue-unrecorded");
+        let text = format!(
+            "rpi = '/r'\nhome = {dir:?}\n[approvals]\ncurrency = 'CAD'\nmoney = 'auto 100'\n\
+             [cards]\nprovider = 'fake'\n"
+        );
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "card".into(),
+            args: serde_json::json!({"action": "request", "site": "https://shop.example/pay",
+                "merchant": "Shop", "amount": "10", "currency": "CAD"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let now = crate::now();
+        let (checked, ask) = crate::gate::decide_card(&cfg, &store, &req, owner, now).unwrap();
+        let block = "CREATE TRIGGER no_ref BEFORE UPDATE OF provider_ref ON cards \
+                     BEGIN SELECT RAISE(ABORT, 'no ref'); END";
+        store.db_for_test().execute_batch(block).unwrap();
+        let asker = Asker {
+            channel: "chat".into(),
+            sender: "o".into(),
+            session: "main".into(),
+        };
+        assert!(issue(&cfg, checked, &ask, &asker, None, None)
+            .await
+            .is_err());
+        assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 1);
+        let log = Fake::script(&cfg, |s| s.log.clone());
+        assert!(log.iter().any(|l| l.starts_with("close ")), "{log:?}");
+    }
+
+    /// An approved request that issued nothing ends `failed` even when its notice cannot be
+    /// written then; the notice is owed and written on a later tick.
+    #[tokio::test]
+    async fn an_approved_card_that_failed_ends_even_with_no_notice() {
+        let dir = crate::test_dir("cards-approved-owed");
+        let text = format!(
+            "rpi = '/r'\nhome = {dir:?}\n[approvals]\ncurrency = 'CAD'\nmoney = 'ask'\n\
+             [cards]\nprovider = 'fake'\n"
+        );
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "card".into(),
+            args: serde_json::json!({"action": "request", "site": "https://shop.example/pay",
+                "merchant": "Shop", "amount": "10", "currency": "CAD"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let held = crate::gate::decide(&cfg, &store, &req, owner, crate::now());
+        let crate::gate::Verdict::Hold { id, .. } = held else {
+            panic!("{held:?}")
+        };
+        let a = store.take_approved(id).unwrap().unwrap();
+        let (checked, ask) = crate::gate::approved_card(&cfg, &store, &a).unwrap();
+        Fake::script(&cfg, |s| s.fail_issue = Some("declined".into()));
+        let db = store.db_for_test();
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        db.execute_batch(block).unwrap();
+        let before = store.pending_outbox().unwrap().len();
+        issue_approved(&cfg, checked, ask, &a);
+        let status = || store.action(id).unwrap().unwrap().status;
+        for _ in 0..100 {
+            if status() != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(status(), "failed");
+        db.execute_batch("DROP TRIGGER no_outbox").unwrap();
+        store.retry_owed();
+        let out = store.pending_outbox().unwrap();
+        assert_eq!(out.len(), before + 1);
+        assert!(
+            out.last().unwrap().text.contains("was not issued"),
+            "{:?}",
+            out.last()
+        );
+    }
+
+    /// A close asked just before the card's poll comes due is the one close at the issuer: the
+    /// tick that follows while it is in hand does not ask for another.
+    #[tokio::test]
+    async fn a_close_just_before_the_poll_is_the_only_close() {
+        let dir = crate::test_dir("cards-close-poll");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        cfg.tick = std::time::Duration::from_millis(100);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        Fake::script(&cfg, |s| {
+            s.close_delay = std::time::Duration::from_millis(800)
+        });
+        // Polled now; the next poll is due in 600 ms.
+        assert!(poll_due(&cfg, id));
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        ask_close(
+            &cfg,
+            &store,
+            store.card(id).unwrap().unwrap(),
+            "the owner said it is done",
+        );
+        // Past when the poll would have been due, with the close still at the issuer.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tick(&cfg, &store, crate::now());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let closes = Fake::script(&cfg, |s| {
+            s.log.iter().filter(|l| l.starts_with("close")).count()
+        });
+        assert_eq!(closes, 1);
+    }
+
+    /// A reminder to delete a hand-made card and the mark that it was sent are one write: when
+    /// the mark cannot be written, no reminder goes, so the next tick does not send another.
+    #[tokio::test]
+    async fn a_reminder_goes_only_with_its_mark() {
+        let dir = crate::test_dir("cards-reminder-told");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'manual'\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "manual".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            channel: "chat".into(),
+            sender: "o".into(),
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store
+            .move_card(id, &["waiting"], "unknown", crate::now())
+            .unwrap());
+        let block = "CREATE TRIGGER no_told BEFORE UPDATE OF told_at ON cards \
+                     BEGIN SELECT RAISE(ABORT, 'no told'); END";
+        store.db_for_test().execute_batch(block).unwrap();
+        tick(&cfg, &store, crate::now());
+        tick(&cfg, &store, crate::now());
+        let reminders = (store.pending_outbox().unwrap().into_iter())
+            .filter(|o| o.text.contains("delete the card there"))
+            .count();
+        assert_eq!(reminders, 0);
+        store
+            .db_for_test()
+            .execute_batch("DROP TRIGGER no_told")
+            .unwrap();
+        tick(&cfg, &store, crate::now());
+        tick(&cfg, &store, crate::now());
+        let reminders = (store.pending_outbox().unwrap().into_iter())
+            .filter(|o| o.text.contains("delete the card there"))
+            .count();
+        assert_eq!(reminders, 1);
+    }
+
+    /// A close slower than the poll interval is still the one close at the issuer: while it
+    /// is in hand, no tick asks for another.
+    #[tokio::test]
+    async fn a_slow_close_is_asked_once() {
+        let dir = crate::test_dir("cards-close-slow");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        cfg.tick = std::time::Duration::from_millis(100);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        // 1.5 s at the issuer, past two and a half poll intervals (6 ticks of 100 ms).
+        Fake::script(&cfg, |s| {
+            s.close_delay = std::time::Duration::from_millis(1500)
+        });
+        ask_close(
+            &cfg,
+            &store,
+            store.card(id).unwrap().unwrap(),
+            "the owner said it is done",
+        );
+        for _ in 0..9 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tick(&cfg, &store, crate::now());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tick(&cfg, &store, crate::now());
+        let closes = Fake::script(&cfg, |s| {
+            s.log.iter().filter(|l| l.starts_with("close")).count()
+        });
+        assert_eq!(closes, 1);
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the

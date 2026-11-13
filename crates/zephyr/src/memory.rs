@@ -183,7 +183,7 @@ Besides your file and shell tools, this container gives you:
 - **vault** holds the owner's saved logins and tokens, used by name; you never see a value. It
   is there in the main conversation only, not in background tasks or jobs. `vault list` shows what
   is saved. To sign in, open the login page in agent-browser and `vault fill` the login with the
-  CSS selectors of its `user`, `password` and `totp` fields; it fills only on the login's own
+  CSS selectors or snapshot refs (`@e2`) of its `user`, `password` and `totp` fields; it fills only on the login's own
   site. For a command that needs a token, `exec` it with `secrets: ["NAME"]`: the token is set as
   that environment variable for that command only (e.g. a himalaya config with
   `auth.cmd = "printenv MAIL_PASSWORD"`). The first fill of a login, and each new program a token

@@ -329,6 +329,14 @@ fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String
     // R70: why can carry the agent's words (a program's name), so it is scrubbed too.
     let why = crate::facts::scrubbed(cfg, why.to_string());
     finish(store, a, "failed", &why);
+    // Nothing started, so nothing was paid: the window no longer counts what its `/ok` did.
+    let paid = store.payment_of(a.id);
+    if let Err(e) = paid.and_then(|row| row.map_or(Ok(()), |row| store.unpay(row))) {
+        eprintln!(
+            "zephyr: taking #{}'s payment out of the window failed: {e}",
+            a.id
+        );
+    }
     let (n, s) = (a.id, summary(cfg, a));
     let (agent, owner) = match by {
         By::Owner { .. } => (
@@ -485,6 +493,7 @@ pub fn held(cfg: &Config, store: &Store) -> String {
 /// told; a browser wait whose action ended is denied.
 pub fn tick(ctx: &Ctx, now: i64, held: bool) {
     let store = ctx.store;
+    store.retry_owed();
     // A store error counts as paused: nothing goes on a guess.
     let paused = store.pause_reason().map_or(true, |p| p.is_some());
     if held || paused {
@@ -524,40 +533,22 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
 /// slot taken it waits for the owner too, who is told so.
 fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     let store = ctx.store;
+    let (n, s) = (a.id, summary(ctx.cfg, a));
     if let Some(why) = crate::gate::due_check(ctx.cfg, store, a) {
-        match store.unschedule(a.id) {
-            Ok(true) => {
-                audit(ctx.cfg, store, a, "re-asked");
-                let (n, s) = (a.id, summary(ctx.cfg, a));
-                let text =
-                    format!("[zephyr] #{n} ({s}) came due, but {why}, so it waits for you again");
-                tell(store, a, &text);
-                let mut again = a.clone();
-                again.status = "pending".into();
-                tell(store, a, &crate::gate::card(&again, ctx.cfg, store));
-            }
-            Ok(false) => {}
-            Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
-        }
-        return;
+        let text = format!("[zephyr] #{n} ({s}) came due, but {why}, so it waits for you again");
+        let mut again = a.clone();
+        again.status = "pending".into();
+        let card = crate::gate::card(&again, ctx.cfg, store);
+        return re_ask(ctx.cfg, store, a, &[&text, &card]);
     }
     let full = a.kind == ActionKind::Run && !store.proc_slot_free().unwrap_or(false);
     if full {
-        match store.unschedule(a.id) {
-            Ok(true) => {
-                audit(ctx.cfg, store, a, "re-asked");
-                let (n, s) = (a.id, summary(ctx.cfg, a));
-                let text = format!(
-                    "[zephyr] #{n} ({s}) came due, but {} commands are running, so it waits for \
-                     you: /ok {n} when one ends, /no {n} drops it",
-                    crate::store::MAX_RUNNING_PROCS
-                );
-                tell(store, a, &text);
-            }
-            Ok(false) => {}
-            Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
-        }
-        return;
+        let text = format!(
+            "[zephyr] #{n} ({s}) came due, but {} commands are running, so it waits for you: \
+             /ok {n} when one ends, /no {n} drops it",
+            crate::store::MAX_RUNNING_PROCS
+        );
+        return re_ask(ctx.cfg, store, a, &[&text]);
     }
     match approve(ctx, a.id, false, By::Delay, now) {
         Ok(text) => tell(store, a, &text),
@@ -567,12 +558,43 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     }
 }
 
+/// Delayed action `a` waits for the owner again, who is then told `notices`: the change comes
+/// first, and a notice that cannot be written is owed to a later tick ([`tell`]).
+fn re_ask(cfg: &Config, store: &Store, a: &Action, notices: &[&str]) {
+    match store.unschedule(a.id) {
+        Ok(true) => {
+            audit(cfg, store, a, "re-asked");
+            notices.iter().for_each(|text| tell(store, a, text));
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
+    }
+}
+
+/// Moves the actions `change` returns, then audits each as `outcome` and tells its owner
+/// `notice`. The change is what keeps the owner safe (nothing delayed goes after `/stop`,
+/// nothing dead stays `running` after a start), so it never waits on the notice, which is owed
+/// to a later tick when it cannot be written ([`tell`]).
+fn moved(
+    cfg: &Config,
+    store: &Store,
+    outcome: &str,
+    change: impl FnOnce(&Store) -> rusqlite::Result<Vec<Action>>,
+    notice: impl Fn(&Action) -> String,
+) -> rusqlite::Result<()> {
+    for a in change(store)? {
+        audit(cfg, store, &a, outcome);
+        tell(store, &a, &notice(&a));
+    }
+    Ok(())
+}
+
 /// Delays due by `due_by` wait for the owner again, each card shown once more: at start, while
 /// paused, at `/resume`, and at `/stop` (`i64::MAX`, every delay).
 pub fn ask_again(cfg: &Config, store: &Store, due_by: i64) {
-    match store.ask_again(due_by) {
-        Ok(back) => ask(cfg, store, &back),
-        Err(e) => eprintln!("zephyr: holding delayed actions failed: {e}"),
+    let card = |a: &Action| crate::gate::card(a, cfg, store);
+    if let Err(e) = moved(cfg, store, "re-asked", |s| s.ask_again(due_by), card) {
+        eprintln!("zephyr: holding delayed actions failed: {e}");
     }
 }
 
@@ -605,47 +627,34 @@ pub fn stop(cfg: &Config, store: &Store, waits: &Waits) {
 /// owner again, who is shown its card once more; and an action that was running is `unknown`
 /// unless its command is still running.
 pub fn restore(cfg: &Config, store: &Store, now: i64) {
-    match store.end_waits(now) {
-        Ok(ended) => {
-            for a in ended {
-                audit(cfg, store, &a, "failed");
-                let text = format!(
-                    "[zephyr] #{} ({}) did not run: {RESTARTED}",
-                    a.id,
-                    summary(cfg, &a)
-                );
-                tell(store, &a, &text);
-            }
-        }
-        Err(e) => eprintln!("zephyr: ending the browser waits failed: {e}"),
+    let ended = |a: &Action| {
+        format!(
+            "[zephyr] #{} ({}) did not run: {RESTARTED}",
+            a.id,
+            summary(cfg, a)
+        )
+    };
+    if let Err(e) = moved(cfg, store, "failed", |s| s.end_waits(now), ended) {
+        eprintln!("zephyr: ending the browser waits failed: {e}");
     }
-    match store.restore_actions(now) {
-        Ok(back) => ask(cfg, store, &back),
-        Err(e) => eprintln!("zephyr: restoring held actions failed: {e}"),
+    let card = |a: &Action| crate::gate::card(a, cfg, store);
+    if let Err(e) = moved(cfg, store, "re-asked", |s| s.restore_actions(now), card) {
+        eprintln!("zephyr: restoring held actions failed: {e}");
     }
 }
 
 /// Why a browser action waiting at start did not run.
 const RESTARTED: &str = "zephyr restarted while the browser waited";
 
-/// Shows each action's card to whoever it waits for, again, and audits that it was asked again.
-fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
-    for a in actions {
-        audit(cfg, store, a, "re-asked");
-        tell(store, a, &crate::gate::card(a, cfg, store));
-    }
-}
-
 /// A notice about `a` for the owner of the run that asked (else the owner last answered). The
 /// gate socket tells this way of a browser action the owner let go that did not run. What it
 /// says shows `a`'s summary as [`summary`] gives it (R70).
+/// One that cannot be written now is owed, and a later tick writes it (`Store::owe_notice`).
 pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
-    if let Err(e) = told(store, a, text) {
-        eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
-    }
+    store.owe_notice(&a.origin.channel, &a.origin.sender, text);
 }
 
-/// [`tell`], its failure the caller's.
+/// [`tell`], its failure the caller's: for a change that must not land without its notice.
 pub(crate) fn told(store: &Store, a: &Action, text: &str) -> rusqlite::Result<()> {
     match a.origin.channel.is_empty() {
         true => store.notify_last_owner(text),
@@ -895,6 +904,55 @@ mod tests {
                 "[zephyr] #{r} (email to a@x.org) came due, but 8 commands are running, so it \
                  waits for you: /ok {r} when one ends, /no {r} drops it"
             )),
+            "{told:?}"
+        );
+    }
+
+    /// At `/stop` and at start the change is what keeps the owner safe, so it never waits on
+    /// the notice: with no notice writable, `/stop` still takes every delay out of the schedule
+    /// (no tick sends it), a start still ends a dead action, and the notices owed are written
+    /// on a later tick.
+    #[test]
+    fn stop_and_start_change_the_status_even_when_no_notice_can_be_written() {
+        let (cfg, store) = setup("actions-stop-owed", "[approvals]\nmessages = 'delay 5'\n");
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
+        };
+        let now = crate::now();
+        let later = hold(&store, ActionKind::Run, SEND, &[], Some(now + 60));
+        let ran = hold(&store, ActionKind::Run, SEND, &[], None);
+        assert!(store.take_action(ran, "running").unwrap().is_some());
+        let status = |id| store.action(id).unwrap().unwrap().status;
+        let db = store.db_for_test();
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        db.execute_batch(block).unwrap();
+        stop(&cfg, &store, &waits);
+        assert_eq!(
+            status(later),
+            "pending",
+            "a delay still scheduled after /stop"
+        );
+        tick(&ctx, now + 120, false);
+        assert_eq!(status(later), "pending", "the tick sent it after /stop");
+        restore(&cfg, &store, now);
+        assert_eq!(
+            status(ran),
+            "unknown",
+            "a dead action still running after a start"
+        );
+        assert!(told(&store).is_empty());
+        db.execute_batch("DROP TRIGGER no_outbox").unwrap();
+        tick(&ctx, now + 120, false);
+        let told = told(&store);
+        assert!(
+            told.iter().any(|t| t.contains(&format!("#{later}"))),
             "{told:?}"
         );
     }

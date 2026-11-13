@@ -61,6 +61,35 @@ fn override_text(day: &str, limits: &[String]) -> String {
 
 /// The `memory_commits` origin of a `/forget` commit (DESIGN §4.6).
 pub const FORGET_ORIGIN: &str = "you (/forget)";
+/// Notices whose change had already landed but which could not be written, each with the
+/// facts path of the store it is for: [`Store::retry_owed`], on the router's tick, writes them.
+/// shortcut: in memory, so a daemon restart loses what is still owed (`/held` and `/card` still
+/// show the actions and cards); upgrade to a table if notices are lost in practice.
+type Owed = (std::path::PathBuf, String, String, String);
+static OWED: std::sync::Mutex<Vec<Owed>> = std::sync::Mutex::new(Vec::new());
+
+/// The most notices owed at once; past it the oldest is dropped, with a log line.
+const MAX_OWED: usize = 256;
+
+/// Writes `owed` in order with `write`, and returns what is still owed: from the first that
+/// fails on, untried, since the next one would fail the same way.
+fn retry<T>(owed: Vec<T>, mut write: impl FnMut(&T) -> bool) -> Vec<T> {
+    let mut owed = owed.into_iter();
+    for o in owed.by_ref() {
+        if !write(&o) {
+            return std::iter::once(o).chain(owed).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// The largest amount a payment row holds, in minor units (10 billion in a two-decimal
+/// currency): a larger one is just huge, and many of them still sum within an `i64`.
+pub const MAX_MINOR: i64 = 1_000_000_000_000;
+
+fn huge(minor: i64) -> i64 {
+    minor.clamp(0, MAX_MINOR)
+}
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1721,6 +1750,56 @@ impl Store {
         last_owner_in(&self.db)
     }
 
+    /// A notice for the owner on `channel`, or the owner last answered when it is empty.
+    fn notice(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
+        match channel.is_empty() {
+            true => self.notify_last_owner(text),
+            false => self.notify(channel, recipient, text),
+        }
+    }
+
+    /// A notice for the owner on `channel` (empty: the owner last answered) about a change that
+    /// has landed whatever comes of the notice: one that cannot be written now is owed, and a
+    /// later tick writes it ([`Store::retry_owed`]).
+    pub fn owe_notice(&self, channel: &str, recipient: &str, text: &str) {
+        if let Err(e) = self.notice(channel, recipient, text) {
+            eprintln!("zephyr: a notice to the owner could not be written, tried again: {e}");
+            let mut owed = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            if owed.len() >= MAX_OWED {
+                owed.remove(0);
+                eprintln!("zephyr: too many notices owed; the oldest is dropped");
+            }
+            owed.push((
+                self.facts.clone(),
+                channel.into(),
+                recipient.into(),
+                text.into(),
+            ));
+        }
+    }
+
+    /// Writes the notices this store's folder owes; one that fails again stays owed.
+    pub fn retry_owed(&self) {
+        let mine: Vec<Owed> = {
+            let mut all = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest) = all.drain(..).partition(|o| o.0 == self.facts);
+            *all = rest;
+            mine
+        };
+        let left = retry(mine, |(_, channel, recipient, text)| {
+            self.notice(channel, recipient, text).is_ok()
+        });
+        if !left.is_empty() {
+            eprintln!(
+                "zephyr: {} notices to the owner still cannot be written; tried again on the next \
+                 tick",
+                left.len()
+            );
+            let mut all = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            all.splice(0..0, left);
+        }
+    }
+
     /// Writes a notice to `channel`/`recipient`.
     pub fn notify(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
         self.notify_file(channel, recipient, text, None)
@@ -1979,7 +2058,8 @@ impl Store {
     }
 
     /// One money effect that went or was approved (DESIGN §4.25), written as it is let go:
-    /// what the payment window counts. `minor` is `None` for an amount that was not read.
+    /// what the payment window counts. `minor` is `None` for an amount that was not read, and
+    /// held to at most [`MAX_MINOR`].
     pub fn add_payment(
         &self,
         at: i64,
@@ -1990,7 +2070,7 @@ impl Store {
     ) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT INTO payments(at, minor, currency, source, proposal) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![at, minor, currency, source, proposal],
+            params![at, minor.map(huge), currency, source, proposal],
         )?;
         Ok(())
     }
@@ -2020,7 +2100,7 @@ impl Store {
                 _ if count + 1 > effects => Paid::Over,
                 // A card charged an amount the window cannot count: not known to be within.
                 (Some(_), _) if self.unknown_charge_since(since)? => Paid::Over,
-                (Some(limit), Some(minor)) if sum + minor > limit => Paid::Over,
+                (Some(limit), Some(minor)) if sum.saturating_add(minor) > limit => Paid::Over,
                 (Some(_), None) => Paid::Unread,
                 _ => Paid::Recorded(0),
             };
@@ -2036,6 +2116,20 @@ impl Store {
         };
         self.db.execute_batch(end)?;
         decided
+    }
+
+    /// Takes payment row `id` out of the window: what it counted never started.
+    /// The card it was for lets go of it too, so a later payment that gets the same id (SQLite
+    /// reuses the highest) is never taken for that card's.
+    pub fn unpay(&self, id: i64) -> rusqlite::Result<()> {
+        self.atomically(|store| {
+            let card = "UPDATE cards SET payment = NULL WHERE payment = ?1";
+            store.db.execute(card, params![id])?;
+            store
+                .db
+                .execute("DELETE FROM payments WHERE id = ?1", params![id])?;
+            Ok(())
+        })
     }
 
     /// Puts an action `/ok` took back to waiting for the owner: its payment did not fit the
@@ -2054,7 +2148,7 @@ impl Store {
     pub fn payments_since(&self, since: i64, currency: &str) -> rusqlite::Result<(u32, i64, bool)> {
         self.db.query_row(
             "SELECT count(*),
-                    coalesce(sum(CASE WHEN currency = ?2 THEN minor END), 0),
+                    CAST(total(CASE WHEN currency = ?2 THEN minor END) AS INTEGER),
                     coalesce(max(minor IS NULL OR currency != ?2), 0)
              FROM payments WHERE at > ?1",
             params![since, currency],
@@ -2137,7 +2231,7 @@ impl Store {
             "UPDATE payments SET minor = CASE WHEN ?2 IS NULL THEN NULL ELSE max(minor, ?2) END,
                     source = CASE WHEN ?2 IS NULL THEN 'charge' ELSE source END
              WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND minor IS NOT NULL",
-            params![id, total],
+            params![id, total.map(huge)],
         )?;
         Ok(())
     }
@@ -4191,6 +4285,53 @@ mod tests {
             derived: None,
             sent_at: None,
         }
+    }
+
+    /// A card's payment row taken out is no longer the card's: a new payment that gets the same
+    /// id (SQLite reuses the highest) is never changed by that card's charge.
+    #[test]
+    fn an_unpaid_row_is_no_longer_its_cards() {
+        let dir = crate::test_dir("store-unpay-reuse");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        store
+            .add_payment(1, Some(1000), "CAD", "auto", None)
+            .unwrap();
+        let row = store.db.last_insert_rowid();
+        let card = NewCard {
+            payment: Some(row),
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&card).unwrap();
+        store.unpay(row).unwrap();
+        store
+            .add_payment(2, Some(500), "CAD", "auto", None)
+            .unwrap();
+        assert_eq!(store.db.last_insert_rowid(), row, "SQLite reused the id");
+        store.card_paid(id, Some(9000)).unwrap();
+        let minor = |id: i64| -> i64 {
+            let sql = "SELECT minor FROM payments WHERE id = ?1";
+            store.db.query_row(sql, params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(minor(row), 500, "the new payment is not the old card's");
+    }
+
+    /// A pass over the owed notices stops at the first that fails: the rest would fail the same
+    /// way, and stay owed in their order.
+    #[test]
+    fn a_retry_stops_at_the_first_notice_that_fails() {
+        let mut tried = 0;
+        let left = super::retry(vec![1, 2, 3], |_| {
+            tried += 1;
+            false
+        });
+        assert_eq!((tried, left), (1, vec![1, 2, 3]));
+        let left = super::retry(vec![1, 2, 3], |n| *n != 2);
+        assert_eq!(left, vec![2, 3]);
     }
 
     #[test]
