@@ -9,6 +9,8 @@
 # $RPI_BUMP_DIR (default target/rpi-<version>) so the ignored tests can run against it:
 #   ZEPHYR_REAL_RPI=1 RPI_BIN=target/rpi-<version>/rpi cargo test --workspace -- --ignored
 # Prose that says what rpi 0.N does is left alone: it was checked against that version.
+# rpi-bump.yml pushes only what these edits make of each file: keep `pinned` and ALLOWED in
+# .github/bump-check.py in step with every sed below.
 # With GITHUB_OUTPUT set it writes version=, old= and rpi= there; already current, it writes nothing.
 set -euo pipefail
 cd "$(dirname "$0")/.."

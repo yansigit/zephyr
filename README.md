@@ -1436,12 +1436,14 @@ and merges it when all of that passed; when anything failed the PR stays open wi
 and later runs leave it alone: a first job, with a read token and no repository code, sees the open
 PR and stops before anything is built. The bump and the tests (which run the new rpi binary and the
 new crates' build scripts) hold no token. A last job on a fresh GitHub-hosted runner, never this
-machine, takes their diff and checks it against its own checkout (`.github/bump-check.py`): only
-the files `bump-rpi.sh` edits, in them only the rpi version, from the pinned one to a newer one,
-with the sha256s the release itself publishes, fetched again; in `Cargo.lock` no crate but the
-`rpi-*` ones moved, and new ones only from crates.io; no control or non-ASCII character on a
-changed line. Only then does it apply the diff, push, and open and merge the PR. A bump that needs
-another crate moved fails that check and waits for a person. When GitHub will not start that job,
+machine, takes their diff to a fresh checkout of main (`.github/bump-check.py`): a first look at
+its bytes (only the files `bump-rpi.sh` edits, no control or non-ASCII character on a changed
+line), then `git apply`, then a check of what git actually wrote. Each of those files must be
+exactly what `bump-rpi.sh`'s edits make of its version on main, moving the pinned rpi to the
+gate's newer version with the sha256s the release itself publishes, fetched again; in `Cargo.lock`
+no crate but the `rpi-*` ones moved, and new ones only from crates.io. Only then does it push, and
+open and merge the PR. A bump that needs another crate moved fails that check and waits for a
+person. When GitHub will not start that job,
 the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
 The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
 General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and

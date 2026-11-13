@@ -3775,12 +3775,30 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             assert!(!words.contains(&"cargo"), "{push}");
             assert!(push.contains("\n    runs-on: ubuntu-latest\n"), "{push}");
             assert!(!push.contains("zephyr-local"), "{push}");
-            let check = push
-                .find(" .github/bump-check.py ")
-                .expect("an allowlist check");
-            let apply =
-                (push.find("git -c core.quotePath=true apply ")).expect("the patch is applied");
-            assert!(check < apply, "{push}");
+            // The checker from a copy outside the tree: the first gate, then git applies the
+            // patch, then what git wrote is checked, all before anything is pushed.
+            let at = |what: &str| push.find(what).unwrap_or_else(|| panic!("{what}: {push}"));
+            let order = [
+                "cp .github/bump-check.py \"$RUNNER_TEMP/bump-check.py\"",
+                "\"$RUNNER_TEMP/bump-check.py\" patch ",
+                "git -c core.quotePath=true apply --check ",
+                "git -c core.quotePath=true apply \"$RUNNER_TEMP",
+                "\"$RUNNER_TEMP/bump-check.py\" verify ",
+                "git push ",
+            ];
+            assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{push}");
+            // V is the gate's, and both jobs refuse any ref but main and check main out.
+            assert!(
+                push.contains("V: ${{ needs.gate.outputs.version }}"),
+                "{push}"
+            );
+            for job in [&build, &push] {
+                assert!(
+                    job.contains("[ \"$GITHUB_REF\" = refs/heads/main ] ||"),
+                    "{job}"
+                );
+                assert!(job.contains("ref: main\n"), "{job}");
+            }
             // The job before them reads, with gh alone: no checkout, no repository code, no cargo.
             let gate = job("  gate:");
             assert!(gate.contains("pull-requests: read"), "{gate}");
@@ -3807,108 +3825,248 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
     );
 }
 
-/// rpi-bump's push job applies the build's patch only when it moves the rpi pins and nothing else:
-/// a real bump (tests/fixtures/rpi-bump.patch and the Cargo.lock it was made on, from bump-rpi.sh,
-/// their versions swapped for 9.8.7 and 9.9.0 so a later bump does not rewrite them) passes, and
-/// each kind of smuggled change fails.
+/// rpi-bump's push job applies the build's patch with `git apply`, then checks what git wrote:
+/// only the pin move. A real bump (tests/fixtures/rpi-bump.patch from bump-rpi.sh, and the
+/// Cargo.lock it was made on, their versions swapped for 9.8.7 and 9.9.0 so a later bump does not
+/// rewrite them) passes; each smuggled change is refused, by the first gate or by what was written.
 #[test]
 fn the_bump_check_passes_only_a_pin_move() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixtures = root.join("crates/zephyr/tests/fixtures");
     let good = read(&fixtures.join("rpi-bump.patch"));
     let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
-    // The checker reads the Cargo.lock the patch applies to from the directory it runs in.
-    let dir = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("Cargo.lock"), &lock).unwrap();
+    let tmp = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (repo, home) = (tmp.join("repo"), tmp.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    // The repository the patch was made in, as far as the patch shows it: each file's hunks'
+    // old lines at their line numbers, filler between them (it never mentions the pin), and the
+    // whole Cargo.lock.
+    std::fs::create_dir_all(&repo).unwrap();
+    for section in good.split("diff --git a/").skip(1) {
+        let path = &section[..section.find(' ').unwrap()];
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        if path == "Cargo.lock" {
+            std::fs::write(&file, &lock).unwrap();
+            continue;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for hunk in section.split("\n@@ -").skip(1) {
+            let start: usize = hunk[..hunk.find([',', ' ']).unwrap()].parse().unwrap();
+            while lines.len() + 1 < start {
+                lines.push(format!("filler {}", lines.len() + 1));
+            }
+            for line in hunk.lines().skip(1) {
+                if let Some(old) = line.strip_prefix([' ', '-']) {
+                    lines.push(old.to_string());
+                }
+            }
+        }
+        lines.push("filler at the end".into());
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        if section
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.ends_with(" 100755"))
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+
     let sha = |arch: &str| {
         let line = format!("+ARG RPI_SHA256_{arch}=");
         let at = good.find(&line).unwrap() + line.len();
         good[at..at + 64].to_string()
     };
     let (amd64, arm64) = (sha("AMD64"), sha("ARM64"));
-    let run = |name: &str, patch: &str, args: [&str; 4]| {
-        let file = dir.join(name);
-        std::fs::write(&file, patch).unwrap();
+    let checker = root.join(".github/bump-check.py");
+    let python = |args: &[&str]| {
         let out = Command::new("python3")
             .arg("-I")
-            .arg(root.join(".github/bump-check.py"))
+            .arg(&checker)
             .args(args)
-            .arg(&file)
-            .current_dir(&dir)
+            .current_dir(&repo)
+            .env("HOME", &home)
             .output()
             .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        (out.status.success(), err)
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
     };
-    let check = |name: &str, patch: &str| run(name, patch, ["9.8.7", "9.9.0", &amd64, &arm64]);
-    assert_eq!(check("good", &good), (true, String::new()));
+    // Where a patch is refused: "gate", "apply" or "verify"; "" when it passes all three.
+    let try_patch = |name: &str, patch: &str, versions: [&str; 4]| -> (&'static str, String) {
+        git(&["checkout", "-q", "--", "."]);
+        git(&["clean", "-qfdx"]);
+        let file = tmp.join(format!("{name}.patch"));
+        std::fs::write(&file, patch).unwrap();
+        let file = file.to_str().unwrap();
+        let (ok, err) = python(&["patch", file]);
+        if !ok {
+            return ("gate", err);
+        }
+        let applied = Command::new("git")
+            .args(["-c", "core.quotePath=true", "apply", file])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        if !applied.status.success() {
+            return (
+                "apply",
+                String::from_utf8_lossy(&applied.stderr).to_string(),
+            );
+        }
+        let (ok, err) = python(&[["verify"].as_slice(), versions.as_slice()].concat());
+        if !ok {
+            return ("verify", err);
+        }
+        ("", err)
+    };
+    let pins = ["9.8.7", "9.9.0", &amd64, &arm64];
+    assert_eq!(try_patch("good", &good, pins), ("", String::new()));
 
     let pin = "+const RPI_PIN: &str = \"rpi 9.9.\";\n";
     let fake = "+    print(\"rpi 9.9.0\"); sys.exit(0)\n";
     assert!(good.contains(pin) && good.contains(fake));
-    // serde moved to another version and checksum: a hunk in Cargo.lock, in order among the others.
-    let serde = lock.lines().position(|l| l == "name = \"serde\"").unwrap();
-    let block: Vec<&str> = lock.lines().skip(serde + 1).take(3).collect();
-    assert!(block[0].starts_with("version = ") && block[2].starts_with("checksum = "));
-    let hunk = format!(
-        "@@ -{at},3 +{at},3 @@\n-{}\n+version = \"1.0.999\"\n {}\n-{}\n+checksum = \"{}\"\n",
-        block[0],
-        block[1],
-        block[2],
-        "0".repeat(64),
-        at = serde + 2
-    );
+    // A hunk spliced into Cargo.lock's section before the first one that starts after `line`.
     let section = good.find("diff --git a/Cargo.lock").unwrap();
     let start = |i: usize| -> usize {
         let header = &good[i + 4..];
         header[..header.find([',', ' ']).unwrap()].parse().unwrap()
     };
-    let next = (good[section..].match_indices("\n@@ -"))
-        .map(|(i, _)| section + i + 1)
-        .find(|&i| start(i) > serde + 2)
-        .unwrap();
-    let moved_serde = format!("{}{hunk}{}", &good[..next], &good[next..]);
+    let end = section + good[section..].find("\ndiff --git").unwrap() + 1;
+    let lock_hunk = |line: usize, hunk: &str| {
+        let next = (good[section..end].match_indices("\n@@ -"))
+            .map(|(i, _)| section + i + 1)
+            .find(|&i| start(i) > line)
+            .unwrap_or(end);
+        format!("{}{hunk}{}", &good[..next], &good[next..])
+    };
+    let lines: Vec<&str> = lock.lines().collect();
+    let serde = lines.iter().position(|l| *l == "name = \"serde\"").unwrap();
+    let (version, source, checksum) = (lines[serde + 1], lines[serde + 2], lines[serde + 3]);
+    assert!(version.starts_with("version = ") && checksum.starts_with("checksum = "));
+    let moved_serde = lock_hunk(
+        serde + 2,
+        &format!(
+            "@@ -{at},5 +{at},5 @@\n name = \"serde\"\n-{version}\n+version = \"1.0.999\"\n {source}\n-{checksum}\n+checksum = \"{}\"\n {}\n",
+            "0".repeat(64),
+            lines[serde + 4],
+            at = serde + 1
+        ),
+    );
+    // The reviewer's: a hunk whose header names the wrong place, which git applies where its
+    // context is, here a second checksum in serde's entry.
+    let misplaced = lock_hunk(
+        serde + 2,
+        &format!(
+            "@@ -2008,2 +1275,3 @@\n name = \"serde\"\n+checksum = \"{}\"\n {version}\n",
+            "0".repeat(64)
+        ),
+    );
+    // A second serde, from git, after the last package.
+    let n = lines.len();
+    let duplicate = lock_hunk(
+        n,
+        &format!(
+            "@@ -{},3 +{},8 @@\n {}\n {}\n {}\n+\n+[[package]]\n+name = \"serde\"\n+{version}\n+source = \"git+https://example.com/serde#0\"\n",
+            n - 2,
+            n - 2,
+            lines[n - 3],
+            lines[n - 2],
+            lines[n - 1]
+        ),
+    );
+    // The reviewer's: a `\ No newline` after a line of release.sh's hunk joins it to the next
+    // (lines 40 and 41), which here hides the fetch's `v=` in a comment.
+    let comment = "  # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.";
+    assert!(
+        good.contains(&format!("\n {comment}\n   v=$(sed")),
+        "the fixture's release.sh hunk moved"
+    );
+    let joined = good.replacen(
+        &format!("\n {comment}\n"),
+        &format!("\n-{comment}\n+{comment}\n\\ No newline at end of file\n"),
+        1,
+    );
     let cr_main = pin.replace(";\n", ";\r fn planted() { std::process::exit(7) }\n");
     let cr_fake = fake.replace("(0)\n", "(0)\r__import__('os').system('id')\n");
-    let bad = [
-        ("moved-serde", moved_serde),
-        ("cr-main", good.replacen(pin, &cr_main, 1)),
-        ("cr-fake-rpi", good.replacen(fake, &cr_fake, 1)),
+    let other_file = format!(
+        "{good}diff --git a/.github/ci.sh b/.github/ci.sh\nindex 1111111..2222222 100755\n--- a/.github/ci.sh\n+++ b/.github/ci.sh\n@@ -1 +1 @@\n-a\n+b\n"
+    );
+    let cases = [
+        // Refused by what git wrote, after the first gate let them through.
+        ("joined-lines", joined, "verify"),
+        ("misplaced-lock-hunk", misplaced, "verify"),
+        ("duplicate-git-serde", duplicate, "verify"),
+        ("moved-serde", moved_serde, "verify"),
+        (
+            "git-source",
+            good.replacen(
+                "+source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                "+source = \"git+https://example.com/rpi-tui#0\"",
+                1,
+            ),
+            "verify",
+        ),
+        (
+            "other-version",
+            good.replacen(pin, "+const RPI_PIN: &str = \"rpi 9.7.\";\n", 1),
+            "verify",
+        ),
+        // Refused by the first gate.
+        ("cr-main", good.replacen(pin, &cr_main, 1), "gate"),
+        ("cr-fake-rpi", good.replacen(fake, &cr_fake, 1), "gate"),
         (
             "non-ascii",
             good.replacen(pin, &pin.replace("9.9.", "9.9.\u{202e}"), 1),
+            "gate",
         ),
-        ("other-file", format!("{good}diff --git a/.github/ci.sh b/.github/ci.sh\nindex 1111111..2222222 100755\n--- a/.github/ci.sh\n+++ b/.github/ci.sh\n@@ -1 +1 @@\n-a\n+b\n")),
-        ("extra-line", good.replacen(pin, &format!("{pin}+fn planted() {{}}\n"), 1)),
-        ("git-source", good.replacen(
-            "+source = \"registry+https://github.com/rust-lang/crates.io-index\"",
-            "+source = \"git+https://example.com/rpi-tui#0\"",
-            1,
-        )),
-        ("other-version", good.replacen(pin, "+const RPI_PIN: &str = \"rpi 9.7.\";\n", 1)),
-        ("new-file", good.replacen(
-            "diff --git a/deploy/release.sh b/deploy/release.sh\n",
-            "diff --git a/deploy/release.sh b/deploy/release.sh\nnew file mode 100755\n",
-            1,
-        )),
+        ("other-file", other_file, "gate"),
+        (
+            "new-file",
+            good.replacen(
+                "diff --git a/deploy/release.sh b/deploy/release.sh\n",
+                "diff --git a/deploy/release.sh b/deploy/release.sh\nnew file mode 100755\n",
+                1,
+            ),
+            "gate",
+        ),
     ];
-    for (name, patch) in &bad {
+    for (name, patch, stage) in &cases {
         assert_ne!(patch, &good, "{name}");
-        let (ok, err) = check(name, patch);
-        assert!(!ok && err.starts_with("bump-check: "), "{name}: {err}");
+        let (at, err) = try_patch(name, patch, pins);
+        assert_eq!(at, *stage, "{name}: {err}");
+        assert!(err.starts_with("bump-check: "), "{name}: {err}");
     }
-    let (_, err) = check("moved-serde", &bad[0].1);
+    let (_, err) = try_patch("moved-serde", &cases[3].1, pins);
     assert!(
         err.contains("serde") && err.contains("waits for a person"),
         "{err}"
     );
-    // The release's own sha256s, which the push job fetches, must be the ones the patch pins.
-    let (ok, err) = run("good", &good, ["9.8.7", "9.9.0", &"1".repeat(64), &arm64]);
-    assert!(!ok && err.contains("sha256s"), "{err}");
-    let (ok, _) = run("good", &good, ["9.8.7", "9.9.0; x", &amd64, &arm64]);
-    assert!(!ok);
-    std::fs::remove_dir_all(&dir).unwrap();
+    // The release's own sha256s, which the push job fetches, must be the ones written.
+    let (at, err) = try_patch("good", &good, ["9.8.7", "9.9.0", &"1".repeat(64), &arm64]);
+    assert_eq!(at, "verify", "{err}");
+    let (at, _) = try_patch("good", &good, ["9.8.7", "9.9.0; x", &amd64, &arm64]);
+    assert_eq!(at, "verify");
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 #[test]

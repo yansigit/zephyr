@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""rpi-bump.yml's push job runs this on the patch the build job made, before it applies it, from the
-root of its own checkout:
-    .github/bump-check.py OLD NEW SHA256_AMD64 SHA256_ARM64 PATCH
-The build job ran code nobody reviewed (the new rpi binary, the new crates' build scripts), so its
-patch is untrusted. Passed, the patch only moves the rpi pins from OLD to NEW:
-- it touches only the files deploy/bump-rpi.sh edits (ALLOWED), each an existing text file, with
-  no new, deleted, renamed or binary file, and its hunk headers count its lines;
-- an added or removed line holds printable ASCII and tabs only: no carriage return, which would
-  read as a line break here but stays inside the line for `git apply`, nor any other control or
-  non-ASCII character;
-- in each hunk outside Cargo.lock the added lines are the removed lines, in order, but for the rpi
-  version (and its minor) on a line about rpi and the Dockerfile's two rpi sha256s, which must be
-  NEW, SHA256_AMD64 and SHA256_ARM64 (the caller fetches those from the release itself);
-- Cargo.lock, with the patch applied to this checkout's, keeps every package that is not an rpi-*
-  crate exactly as it was, and any package it gains or moves comes from crates.io with a checksum.
-Exits 1, naming the first problem, otherwise."""
+"""rpi-bump.yml's push job checks the build job's patch with this. The build ran code nobody
+reviewed (the new rpi binary, the new crates' build scripts), so the patch is untrusted.
+
+    bump-check.py patch PATCH
+        A first gate, before `git apply`: only the files deploy/bump-rpi.sh edits (ALLOWED), each
+        an existing text file, with no new, deleted, renamed or binary file and no mode change;
+        hunk headers that count their lines; changed lines of printable ASCII and tabs only (no
+        carriage return or other control character, nothing non-ASCII).
+
+    bump-check.py verify OLD NEW SHA256_AMD64 SHA256_ARM64
+        After `git apply`, run in that checkout: what git actually wrote is compared with the pin
+        move, so no trick in the patch's own semantics matters. Only files in ALLOWED changed, in
+        place, with their modes kept, and nothing new is in the tree. Each changed file but
+        Cargo.lock is byte for byte its HEAD version with, on the lines that mention rpi, OLD
+        replaced by NEW (and OLD's minor by NEW's), and the Dockerfile's two rpi sha256s replaced
+        by the release's own (the caller fetches them). Cargo.lock, parsed, keeps every package
+        that is not an rpi-* crate exactly as it was, keyed by (name, version, source) with no key
+        twice, and every package it gains, and every rpi-* one, comes from crates.io with a
+        checksum.
+
+Exits 1, naming the first problem, when the patch is anything else."""
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import tomllib
 
 ALLOWED = {
@@ -49,15 +57,15 @@ def fail(why):
     sys.exit(1)
 
 
-def parse(data):
-    """The patch's files as {path: [(old_start, old_len, [(tag, text)])]}, split on \\n only."""
+def gate(data):
+    """The byte-level first gate on the patch, split on \\n only, as git splits it."""
     try:
         lines = data.decode("utf-8").split("\n")
     except UnicodeDecodeError:
         fail("the patch is not UTF-8")
     if lines and lines[-1] == "":
         lines.pop()
-    files, i = {}, 0
+    seen, i = set(), 0
     while i < len(lines):
         m = re.fullmatch(r"diff --git a/([A-Za-z0-9._/-]+) b/([A-Za-z0-9._/-]+)", lines[i])
         if not m or m[1] != m[2]:
@@ -65,32 +73,30 @@ def parse(data):
         path = m[1]
         if path not in ALLOWED:
             fail(f"{path} is not a file bump-rpi.sh edits")
-        if path in files:
+        if path in seen:
             fail(f"{path} is in the patch twice")
+        seen.add(path)
         i += 1
         if i < len(lines) and re.fullmatch(r"index [0-9a-f]+\.\.[0-9a-f]+( 100644| 100755)?", lines[i]):
             i += 1
         if lines[i : i + 2] != [f"--- a/{path}", f"+++ b/{path}"]:
             fail(f"{path}: only a change to the file's text may be in the patch")
         i += 2
-        hunks = files[path] = []
         while i < len(lines) and not lines[i].startswith("diff --git "):
             m = HUNK.fullmatch(lines[i])
             if not m:
                 fail(f"{path}: not a hunk header: {lines[i]!r}")
-            old_start, new_start = int(m[1]), int(m[3])
             old_len, new_len = int(m[2] or 1), int(m[4] or 1)
             i += 1
-            body, olds, news = [], 0, 0
+            olds = news = 0
             while i < len(lines) and (olds < old_len or news < new_len or lines[i].startswith("\\")):
                 line = lines[i]
-                tag, text = line[:1], line[1:]
+                tag = line[:1]
                 if line == "\\ No newline at end of file":
                     pass
                 elif tag in " -+":
-                    if tag != " " and not all(c == "\t" or " " <= c <= "~" for c in text):
+                    if tag != " " and not all(c == "\t" or " " <= c <= "~" for c in line[1:]):
                         fail(f"{path}: a changed line holds a control or non-ASCII character: {line!r}")
-                    body.append((tag, text))
                     olds += tag != "+"
                     news += tag != "-"
                 else:
@@ -98,91 +104,122 @@ def parse(data):
                 i += 1
             if (olds, news) != (old_len, new_len):
                 fail(f"{path}: a hunk does not hold the lines its header counts")
-            hunks.append((old_start, old_len, body))
-    if not files:
+    if not seen:
         fail("the patch is empty")
-    return files
 
 
-def apply(text, hunks, path):
-    """The file with the hunks applied where their headers say, as `git apply` first tries."""
-    src, out, at = text.split("\n"), [], 0
-    for old_start, old_len, body in hunks:
-        start = old_start - 1 if old_len else old_start
-        if start < at:
-            fail(f"{path}: hunks out of order")
-        out += src[at:start]
-        at = start
-        for tag, line in body:
-            if tag != "+":
-                if at >= len(src) or src[at] != line:
-                    fail(f"{path}: the patch does not apply to this checkout's file")
-                at += 1
-            if tag != "-":
-                out.append(line)
-    return "\n".join(out + src[at:])
+def git(*args):
+    # No system or user config: nothing but the repository itself shapes what git reports.
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=tempfile.mkdtemp())
+    out = subprocess.run(["git", "-c", "core.quotePath=true", *args], env=env, capture_output=True)
+    if out.returncode:
+        fail(f"git {args[0]}: {out.stderr.decode(errors='replace').strip()}")
+    return out.stdout
+
+
+def pinned(text, path, old, new, amd64, arm64):
+    """What deploy/bump-rpi.sh's seds make of a file, rule for rule (keep the two in step): each
+    rule is (pattern, replacement, every match on the line or only the first, as sed's `g`)."""
+    minor = new.rsplit(".", 1)[0]
+    o = re.escape(old)
+    rules = []
+    if path == "deploy/Dockerfile":
+        rules += [(r"^ARG RPI_VERSION=.*", f"ARG RPI_VERSION={new}", False),
+                  (r"^ARG RPI_SHA256_AMD64=.*", f"ARG RPI_SHA256_AMD64={amd64}", False),
+                  (r"^ARG RPI_SHA256_ARM64=.*", f"ARG RPI_SHA256_ARM64={arm64}", False)]
+    if path == "crates/zephyr/src/main.rs":
+        rules.append((r'^const RPI_PIN: &str = "rpi [0-9.]*";', f'const RPI_PIN: &str = "rpi {minor}.";', False))
+    if path.startswith("crates/") and path.endswith("/Cargo.toml"):
+        rules.append((rf'^(rpi-[a-z-]+ = (\{{ version = )?)"={o}"', rf'\g<1>"={new}"', False))
+    if path == "crates/zephyr/tests/fake-rpi.py":
+        rules.append((rf'print\("rpi {o}"\)', f'print("rpi {new}")', False))
+    if path.startswith(("crates/", "deploy/")) or path == "CLAUDE.md":
+        rules.append((rf"rpi-{o}/bin/rpi", f"rpi-{new}/bin/rpi", True))
+    if path == "README.md":
+        rules.append((rf"the upstream `rpi` {o} release", f"the upstream `rpi` {new} release", False))
+    if path == "CLAUDE.md":
+        rules += [(r"rpi is pinned to [0-9.]*x", f"rpi is pinned to {minor}.x", False),
+                  (rf'"={o}"', f'"={new}"', True)]
+    out = []
+    for line in text.split("\n"):
+        for pattern, repl, every in rules:
+            # The replacements hold only checked versions and sha256s, so nothing in them escapes.
+            line = re.sub(pattern, repl, line, count=0 if every else 1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def packages(text, which):
+    try:
+        lock = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        fail(f"{which} Cargo.lock does not parse: {e}")
+    by = {}
+    for p in lock.get("package", []):
+        key = (p.get("name"), p.get("version"), p.get("source"))
+        if key in by:
+            fail(f"{which} Cargo.lock lists {key[0]} {key[1]} from {key[2]} twice")
+        by[key] = p
+    return {k: v for k, v in lock.items() if k != "package"}, by
 
 
 def check_lock(before, after):
-    try:
-        before, after = tomllib.loads(before), tomllib.loads(after)
-    except tomllib.TOMLDecodeError as e:
-        fail(f"Cargo.lock does not parse: {e}")
-    rest = lambda lock: {k: v for k, v in lock.items() if k != "package"}
-    if rest(before) != rest(after):
+    rest_was, was = packages(before, "the original")
+    rest_now, now = packages(after, "the written")
+    if rest_was != rest_now:
         fail("Cargo.lock: something besides its packages changed")
-    key = lambda p: (p.get("name"), p.get("version"))
-    was = {key(p): p for p in before.get("package", [])}
-    now = {key(p): p for p in after.get("package", [])}
-    for k, p in was.items():
-        if not str(k[0]).startswith("rpi-") and now.get(k) != p:
-            fail(f"Cargo.lock: {k[0]} {k[1]} is moved or changed, and only the rpi crates may move; "
+    crates_io = lambda p: p.get("source") == REGISTRY and SHA.fullmatch(str(p.get("checksum", "")))
+    for key, p in was.items():
+        if not str(key[0]).startswith("rpi-") and now.get(key) != p:
+            fail(f"Cargo.lock: {key[0]} {key[1]} is moved or changed, and only the rpi crates may move; "
                  "this bump waits for a person")
-    for k, p in now.items():
-        if was.get(k) != p and not (p.get("source") == REGISTRY and SHA.fullmatch(p.get("checksum", ""))):
-            fail(f"Cargo.lock: {k[0]} {k[1]} does not come from crates.io with a checksum")
+    for key, p in now.items():
+        if (str(key[0]).startswith("rpi-") or key not in was) and not crates_io(p):
+            fail(f"Cargo.lock: {key[0]} {key[1]} does not come from crates.io with a checksum")
 
 
-def check(old, new, amd64, arm64, data, root="."):
+def verify(old, new, amd64, arm64):
     if not (VERSION.fullmatch(old) and VERSION.fullmatch(new)):
         fail(f"not versions: {old!r} {new!r}")
     if not (SHA.fullmatch(amd64) and SHA.fullmatch(arm64)):
         fail("not sha256s")
-    marks = [(old, "\0V"), (new, "\0V"), (old.rsplit(".", 1)[0] + ".", "\0M"), (new.rsplit(".", 1)[0] + ".", "\0M")]
-    files = parse(data)
-    if "deploy/Dockerfile" not in files:
+    if git("ls-files", "--others", "-z"):
+        fail("the patch left a file that is not in the repository")
+    raw = git("diff", "--raw", "-z", "--no-renames", "HEAD").split(b"\0")
+    changed = []
+    for meta, path in zip(raw[0::2], raw[1::2]):
+        m = re.fullmatch(rb":(100644|100755) (100644|100755) [0-9a-f]+ [0-9a-f]+ M", meta)
+        path = path.decode("utf-8", errors="replace")
+        if not m or m[1] != m[2]:
+            fail(f"{path}: not a change to the file's text: {meta.decode(errors='replace')}")
+        if path not in ALLOWED:
+            fail(f"{path} is not a file bump-rpi.sh edits")
+        changed.append(path)
+    if "deploy/Dockerfile" not in changed:
         fail("the patch does not move deploy/Dockerfile's RPI_VERSION")
-    for path, hunks in files.items():
+    # Every file bump-rpi.sh edits, changed or not, must now be the pin move of its HEAD version.
+    tracked = set(git("ls-files", "-z").decode("utf-8").split("\0"))
+    for path in sorted(ALLOWED & tracked):
+        before = git("show", f"HEAD:{path}").decode("utf-8")
+        with open(path, "rb") as f:
+            written = f.read()
+        try:
+            written = written.decode("utf-8")
+        except UnicodeDecodeError:
+            fail(f"{path}: what was written is not UTF-8")
         if path == "Cargo.lock":
-            with open(f"{root}/Cargo.lock", encoding="utf-8") as f:
-                lock = f.read()
-            check_lock(lock, apply(lock, hunks, path))
-            continue
-
-        # What bump-rpi.sh's seds may change: the version (and its minor) on a line about rpi, and
-        # the Dockerfile's two rpi sha256s. Everything else stays byte for byte.
-        def plain(line):
-            if "rpi" in line.lower():
-                for value, mark in marks:
-                    line = line.replace(value, mark)
-            if path == "deploy/Dockerfile":
-                line = re.sub(r"^(ARG RPI_SHA256_(AMD64|ARM64)=)[0-9a-f]{64}$", "\\1\0H", line)
-            return line
-
-        for _, _, body in hunks:
-            removed = [plain(t) for tag, t in body if tag == "-"]
-            added = [plain(t) for tag, t in body if tag == "+"]
-            if removed != added:
-                fail(f"{path}: a change other than the rpi version or its sha256s: {added or removed}")
-    want = {f"ARG RPI_VERSION={new}", f"ARG RPI_SHA256_AMD64={amd64}", f"ARG RPI_SHA256_ARM64={arm64}"}
-    added = {t for _, _, body in files["deploy/Dockerfile"] for tag, t in body if tag == "+"}
-    if added != want:
-        fail(f"deploy/Dockerfile: the new pins are not rpi {new} and its release's sha256s: {sorted(added)}")
+            check_lock(before, written)
+        elif written != pinned(before, path, old, new, amd64, arm64):
+            fail(f"{path}: what was written is not the move from rpi {old} to {new}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        fail("usage: bump-check.py OLD NEW SHA256_AMD64 SHA256_ARM64 PATCH")
-    with open(sys.argv[5], "rb") as f:
-        check(*sys.argv[1:5], f.read())
-    print(f"bump-check: the patch only moves rpi {sys.argv[1]} to {sys.argv[2]}")
+    if len(sys.argv) == 3 and sys.argv[1] == "patch":
+        with open(sys.argv[2], "rb") as f:
+            gate(f.read())
+        print("bump-check: the patch passes the first gate")
+    elif len(sys.argv) == 6 and sys.argv[1] == "verify":
+        verify(*sys.argv[2:])
+        print(f"bump-check: what was written only moves rpi {sys.argv[2]} to {sys.argv[3]}")
+    else:
+        fail("usage: bump-check.py patch PATCH | verify OLD NEW SHA256_AMD64 SHA256_ARM64")
