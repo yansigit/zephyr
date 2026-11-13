@@ -1991,6 +1991,69 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
         .success());
 }
 
+/// What `init` and `login` are given is checked before anything is written or signed in: a
+/// model not PROVIDER/MODEL, a provider zephyr does not know. An account already in the file
+/// keeps its name, and an error never repeats a pasted value.
+#[test]
+fn init_and_login_check_what_they_are_given_first() {
+    let env = Env::new("check-first");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr(&["login", "anthropic", "--model", "sonnet"]);
+    assert!(!out.status.success(), "{out:?}");
+    let accounts = std::fs::read_dir(env.data().join("accounts")).map_or(0, |d| d.count());
+    assert_eq!(accounts, 0, "no account folder");
+    assert!(
+        !env.calls().iter().any(|c| c.contains(&"auth".to_string())),
+        "no sign-in"
+    );
+
+    let host = || std::fs::read_to_string(env.daemon().join("host.toml")).unwrap();
+    let before = (host(), env.config());
+    let projects = env.dir.join("elsewhere");
+    std::fs::create_dir_all(&projects).unwrap();
+    let projects = projects.display().to_string();
+    let init = |account: &str| {
+        env.zephyr(&[
+            "init",
+            "--non-interactive",
+            "--no-start",
+            "--projects",
+            &projects,
+            "--network",
+            "host",
+            "--account",
+            account,
+        ])
+    };
+    for account in [
+        "a=nomodel",
+        "a=nope/model",
+        CLAUDE_TOKEN,
+        &format!("{CLAUDE_TOKEN}=claude-code/claude-sonnet-5"),
+    ] {
+        let out = init(account);
+        assert!(!out.status.success(), "{account}: {out:?}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!said.contains(CLAUDE_TOKEN), "{said}");
+        assert_eq!((host(), env.config()), before, "{account}: nothing written");
+    }
+
+    // A name from before the daemon's rule (as `/login` names one today) is still that account's.
+    let text = env.config().replace(
+        "[owners]",
+        "[[account]]\nname = \"claude_max.2\"\nmodel = \"claude-code/claude-sonnet-5\"\n\n[owners]",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), text).unwrap();
+    let out = init("claude_max.2=claude-code/claude-opus-5");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        env.config().contains("claude-code/claude-opus-5"),
+        "{}",
+        env.config()
+    );
+}
+
 /// An account name the daemon would refuse is refused before anything is signed in or written.
 #[test]
 fn login_and_init_refuse_a_bad_account_name_and_write_nothing() {

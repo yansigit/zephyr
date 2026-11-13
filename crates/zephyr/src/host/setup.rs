@@ -45,10 +45,30 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     {
         bail!("--network must be bridge or host");
     }
-    // As the daemon's `/login` names an account, before any file is written.
+    // What it is given is checked before any file is written. A new account is named as the
+    // daemon's `/login` names one; an error never repeats the value, which may be a pasted token.
+    let known: Vec<String> = (h.data.load().ok().iter())
+        .flat_map(|doc| conf::accounts(doc).into_iter().map(|(n, _)| n))
+        .collect();
+    let mut accounts = Vec::new();
     for spec in &account_flags {
-        let name = spec.split_once('=').map_or(spec.as_str(), |(n, _)| n);
-        crate::auth::check_account(name).with_context(|| format!("--account {spec}"))?;
+        let (name, model) = (spec.split_once('='))
+            .filter(|(n, m)| !n.is_empty() && zephyr_policy::tools::model_shape(m))
+            .context("--account: want NAME=PROVIDER/MODEL")?;
+        if !known.iter().any(|n| n == name) {
+            crate::auth::check_account(name).context("--account")?;
+        }
+        known_provider(provider_of(model)).context("--account")?;
+        accounts.push((name, model));
+    }
+    for p in &providers {
+        known_provider(p)?;
+    }
+    if let Some(m) = &model {
+        if !zephyr_policy::tools::model_shape(m) {
+            bail!("--model: want PROVIDER/MODEL");
+        }
+        known_provider(provider_of(m)).context("--model")?;
     }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
@@ -84,16 +104,10 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
 
     let mut doc = h.data.load()?;
     h.data.add_image_extensions(&mut doc)?;
-    for spec in &account_flags {
-        let (name, model) = spec
-            .split_once('=')
-            .filter(|(n, m)| !n.is_empty() && m.contains('/'))
-            .with_context(|| format!("--account {spec}: want NAME=PROVIDER/MODEL"))?;
-        known_provider(provider_of(model))?;
+    for (name, model) in accounts {
         conf::upsert_account(&mut doc, name, model);
     }
     for p in &providers {
-        known_provider(p)?;
         if conf::accounts(&doc)
             .iter()
             .any(|(_, m)| provider_of(m) == p)
@@ -449,6 +463,11 @@ fn login(
     verify: bool,
 ) -> anyhow::Result<()> {
     known_provider(provider)?;
+    // Before a folder is made or a sign-in started.
+    let shaped = |m: &String| zephyr_policy::tools::model_shape(m) && provider_of(m) == provider;
+    if !model.iter().all(shaped) {
+        bail!("--model: want {provider}/MODEL");
+    }
     h.need_running()?;
     let doc = h.data.load()?;
     let name = account.unwrap_or_else(|| next_name(&doc, provider));
