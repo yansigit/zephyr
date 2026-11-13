@@ -441,8 +441,9 @@ async fn a_local_turn_with_the_real_voice() {
     let mut cfg = config(&gen, 0, "");
     cfg.voice_dir = voice;
     let mut script = "stream\nanswer\nwait 4\n".to_string();
+    let mouth = zephyr::voice::Call::new(&cfg, "en");
     for (i, text) in them.iter().enumerate() {
-        let mut ulaw = zephyr::voice::say_call(&cfg, text, "en").await.unwrap();
+        let mut ulaw = mouth.say(text).await.unwrap();
         ulaw.extend([0xff; 8000]);
         let file = telnyx.dir.join(format!("them{i}.ulaw"));
         std::fs::write(&file, ulaw).unwrap();
