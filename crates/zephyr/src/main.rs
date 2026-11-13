@@ -518,7 +518,17 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     let up = tokio::net::UnixStream::connect(cfg.socket_path())
         .await
         .is_ok();
-    let beat = heartbeat_age(&cfg.state_dir().join(HEARTBEAT));
+    let path = cfg.state_dir().join(HEARTBEAT);
+    let file = std::fs::read_to_string(&path).unwrap_or_default();
+    let beat = heartbeat_age(&path);
+    // Its time may look old only because the clock jumped, and a read may catch nothing: hung
+    // when the line, as `supervise` judges it, has not changed over a tick either. Before the
+    // store, whose lock may hold this up past the HEALTHCHECK's timeout.
+    let hung = up && beat.is_none_or(|s| s >= STALE.as_secs()) && {
+        tokio::time::sleep(cfg.tick + Duration::from_secs(1)).await;
+        let again = std::fs::read_to_string(&path).unwrap_or_default();
+        again.is_empty() || again == file
+    };
     println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("daemon: {}", if up { "running" } else { "not reachable" });
     println!(
@@ -543,7 +553,6 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     println!("{}", zephyr::cards::status(cfg));
     println!("{}", zephyr::calls::status(cfg));
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
-    let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
     match file.split_whitespace().collect::<Vec<_>>()[..] {
         [_, up, failures] => println!(
             "main: {}, {failures} failed starts in a row",
@@ -571,14 +580,8 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     if !up {
         anyhow::bail!("the daemon is not running");
     }
-    if beat.is_none_or(|s| s >= STALE.as_secs()) {
-        // Its time may be old only because the clock jumped: hung when the line, as `supervise`
-        // judges it, does not change over a tick either.
-        tokio::time::sleep(cfg.tick + Duration::from_secs(1)).await;
-        let again = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
-        if file.is_empty() || again == file {
-            anyhow::bail!("the daemon is hung: no heartbeat for {}s", STALE.as_secs());
-        }
+    if hung {
+        anyhow::bail!("the daemon is hung: no heartbeat for {}s", STALE.as_secs());
     }
     Ok(())
 }

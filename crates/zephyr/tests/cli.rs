@@ -281,6 +281,35 @@ fn status_calls_an_old_heartbeat_that_still_changes_healthy() {
     assert!(out.status.success(), "{out:?}");
 }
 
+/// An empty read of the heartbeat (a write caught midway, before the router wrote atomically)
+/// is read again, not taken for a hang.
+#[test]
+fn status_reads_an_empty_heartbeat_again() {
+    let (home, cfg) = setup("status-empty", "");
+    let running = daemon(&cfg, &home);
+    let beat = home.join("heartbeat");
+    let start = Instant::now();
+    while !beat.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no heartbeat");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pid = running.0.id() as i32;
+    // SAFETY: plain syscalls to our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    std::fs::write(&beat, "").unwrap();
+    let writer = {
+        let beat = beat.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            std::fs::write(&beat, format!("{} 1 0\n", zephyr::now())).unwrap();
+        })
+    };
+    let out = zephyr(&cfg, &["status"]);
+    writer.join().unwrap();
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(out.status.success(), "{out:?}");
+}
+
 #[test]
 fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
     let (home, cfg) = setup("status-ops", "");

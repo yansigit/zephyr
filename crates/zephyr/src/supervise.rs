@@ -46,6 +46,15 @@ pub const HEARTBEAT: &str = "heartbeat";
 /// longest a tick may legitimately wait: an auth check is up to 60 s per account, one after another.
 pub const STALE: Duration = Duration::from_secs(300);
 
+/// The router's tick writes `line` to the heartbeat at `path`: to a file beside it, then renamed
+/// over it, so `supervise` and `zephyr status` never read a write caught midway.
+pub fn write_heartbeat(path: &Path, line: &str) {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, line).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 /// Seconds since the daemon last wrote `path`; `None` when it is missing or unreadable.
 pub fn heartbeat_age(path: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -378,6 +387,22 @@ mod tests {
             .expect("waited out the backoff");
         assert_eq!(code, 0, "asked to stop with nothing running");
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_heartbeat_is_replaced_whole_never_rewritten_in_place() {
+        let dir = crate::test_dir("supervise-beat-write");
+        let path = dir.join(HEARTBEAT);
+        write_heartbeat(&path, "1 1 0\n");
+        // A reader that opened the old file still reads it whole: a new file took its name.
+        let mut old = std::fs::File::open(&path).unwrap();
+        write_heartbeat(&path, "2 1 0\n");
+        let mut seen = String::new();
+        std::io::Read::read_to_string(&mut old, &mut seen).unwrap();
+        assert_eq!(seen, "1 1 0\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "2 1 0\n");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "no temporary file left");
     }
 
     #[test]

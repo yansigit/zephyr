@@ -833,7 +833,7 @@ impl<'a> Router<'a> {
                     let beat = self.cfg.state_dir().join(crate::supervise::HEARTBEAT);
                     let up = self.child.is_some() as u8;
                     let line = format!("{} {up} {}\n", crate::now(), self.spawn_failures);
-                    let _ = std::fs::write(beat, line);
+                    crate::supervise::write_heartbeat(&beat, &line);
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
