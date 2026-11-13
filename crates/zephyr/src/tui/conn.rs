@@ -480,7 +480,7 @@ async fn session(
                 let Some(line) = line? else {
                     return Err(Fail::Down("zephyr closed the connection".into()));
                 };
-                let Ok(mut v) = serde_json::from_str::<Value>(&line) else { continue };
+                let Some(mut v) = parse(&line) else { continue };
                 let msg = if v["method"] == "event" {
                     Msg::Event(v["params"]["event"].take())
                 } else {
@@ -780,6 +780,30 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
     })
 }
 
+/// One line from the daemon, every string in it (keys too) through [`super::view::safe`]: the
+/// one place the agent's and the daemon's text is cleaned, so every event, answer and the
+/// handshake reach the widgets, the copied code blocks and `/copy` already clean.
+fn parse(line: &str) -> Option<Value> {
+    fn clean(v: &mut Value) {
+        match v {
+            Value::String(s) => *s = super::view::safe(s),
+            Value::Array(a) => a.iter_mut().for_each(clean),
+            Value::Object(m) => {
+                *m = (std::mem::take(m).into_iter())
+                    .map(|(k, mut v)| {
+                        clean(&mut v);
+                        (super::view::safe(&k), v)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    let mut v = serde_json::from_str(line).ok()?;
+    clean(&mut v);
+    Some(v)
+}
+
 /// A JSON-RPC error answer becomes fatal with `what`; a lost connection stays retryable.
 fn fatal(e: Fail, what: &str) -> Fail {
     match e {
@@ -809,7 +833,7 @@ impl Rpc<'_> {
             let Some(line) = self.lines.next_line().await? else {
                 return Err(Fail::Down("zephyr closed the connection".into()));
             };
-            let Ok(mut v) = serde_json::from_str::<Value>(&line) else {
+            let Some(mut v) = parse(&line) else {
                 continue;
             };
             if v["id"] != id {
@@ -1348,6 +1372,76 @@ mod tests {
                    "allow": ["a.example.com"]})
         );
         assert_eq!(asked[2]["params"], json!({"name": "gone"}));
+    }
+
+    /// The agent's text reaches the owner's terminal only cleaned: an OSC 52 that would set the
+    /// clipboard, a screen clear, a C1 control and a bidi override never get past `conn`, in an
+    /// event, in the handshake's messages or in an answer.
+    #[tokio::test]
+    async fn escapes_and_bidi_controls_never_reach_the_view() {
+        const EVIL: &str = "\x1b]52;c;cm0gLXJmIH4=\x07hi \u{202e}evil\x1b[2J\u{9b}31m\r\nok\tdone";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            handshake(&mut lines, &mut w, "tok", EVIL).await.unwrap();
+            let message = json!({"role": "assistant", "content": [
+                {"type": "text", "text": EVIL}, {"type": "thinking", "thinking": EVIL}]});
+            let events = [
+                json!({"type": "message_end", "message": message}),
+                json!({"type": "tool_execution_start", "toolCallId": "t1", "toolName": EVIL,
+                       "args": {"command": EVIL}}),
+                json!({"type": "agent_settled", "error": EVIL}),
+            ];
+            for event in events {
+                let ev = json!({"jsonrpc": "2.0", "method": "event",
+                                "params": {"subscriptionId": 1, "event": event}});
+                w.write_all(format!("{ev}\n").as_bytes()).await.unwrap();
+            }
+            let req: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = json!({"jsonrpc": "2.0", "id": req["id"], "error": {"message": EVIL}});
+            w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+            lines.next_line().await.ok();
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ptx, prx) = mpsc::unbounded_channel();
+        tokio::spawn(run(addr, "tok".into(), tx, prx));
+        let bad = |s: &str| {
+            s.contains("\x1b]") || s.contains("\x1b[2J") || s.contains(['\u{202e}', '\u{9b}', '\r'])
+        };
+        let Some(Msg::Up { snapshot, .. }) = rx.recv().await else {
+            panic!("no Up")
+        };
+        let model = snapshot.model.unwrap_or_default();
+        assert!(!bad(&model) && model.contains("hi evil"), "{model:?}");
+        let mut view =
+            super::super::view::View::new(super::super::theme::DARK, jiff::tz::TimeZone::UTC);
+        for _ in 0..3 {
+            let Some(Msg::Event(ev)) = rx.recv().await else {
+                panic!("no event")
+            };
+            assert!(
+                !bad(&ev.to_string()) && ev.to_string().contains("ok\\tdone"),
+                "{ev}"
+            );
+            view.apply(&ev);
+        }
+        let drawn = rpi_tui::Component::render(&*view.root, 100).join("\n");
+        assert!(!bad(&drawn), "{drawn:?}");
+        assert!(drawn.contains("evil"), "{drawn:?}");
+        ptx.send(Ask::SettingsSet {
+            key: "k".into(),
+            value: "v".into(),
+            until: None,
+        })
+        .unwrap();
+        let Some(Msg::SettingResult(v)) = rx.recv().await else {
+            panic!("no answer")
+        };
+        assert!(!bad(&v.to_string()), "{v}");
     }
 
     #[tokio::test]

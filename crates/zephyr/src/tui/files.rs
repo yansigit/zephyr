@@ -35,7 +35,8 @@ fn read_capped(path: &Path, cap: u64) -> Option<String> {
     }
     let mut bytes = Vec::new();
     file.take(cap).read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    // The agent's text, bound for the composer and the `/p` card: cleaned as `conn` cleans.
+    Some(super::view::safe(&String::from_utf8_lossy(&bytes)))
 }
 
 /// The words of `text`, split at whitespace that is not escaped with `\`.
@@ -114,7 +115,9 @@ pub fn complete(before: &str, home: &Path, projects: Option<&Path>) -> Vec<Choic
         list.flatten()
             .take(ENTRIES)
             .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
+                // A name holding an escape or a control is not listed: it would reach the terminal.
+                let name =
+                    (e.file_name().into_string().ok()).filter(|n| super::view::safe(n) == *n)?;
                 let hidden = name.starts_with('.') && !prefix.starts_with('.');
                 let wanted = name.to_lowercase().starts_with(&prefix);
                 (wanted && !hidden && !SKIP.contains(&name.as_str()))
@@ -232,7 +235,7 @@ pub fn prompts(home: &Path) -> Vec<(String, String)> {
     };
     let mut out: Vec<(String, String)> = (list.flatten())
         .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
+            let name = (e.file_name().into_string().ok()).filter(|n| super::view::safe(n) == *n)?;
             let name = name.strip_suffix(".md").filter(|n| !n.starts_with('.'))?;
             let text = read_capped(&e.path(), FIRST_LINE_BYTES)?;
             let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");

@@ -425,17 +425,64 @@ impl View {
     }
 }
 
-/// Text from tools and jobs, safe to draw: no escape sequences, `\r` or tabs, which would
-/// shift the layout or reach the terminal. As upstream `tool_execution::normalized_output_lines`.
-/// The sign-in panel's own output goes through it too, since a pty redraws with `\r`.
+/// Text from the daemon, and so from the agent, safe to reach the terminal: no escape sequence
+/// (CSI, OSC such as 52's clipboard write, DCS and the rest), no C0 or C1 control but `\n` and
+/// `\t` (`\r` becomes a line break, as a pty's redraw means), and no character that turns the
+/// direction of what follows (the embeddings, overrides and isolates the plugin refuses in rule
+/// text, and the marks), so nothing can paint over the screen or pass for other text. `conn`
+/// runs every string the daemon sends through it before any widget, copy or `/copy` sees it.
+pub(super) fn safe(text: &str) -> String {
+    let turns = |c: char| {
+        matches!(c,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            | '\u{200e}' | '\u{200f}' | '\u{061c}')
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: up to its final byte.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM, APC: up to BEL or ST.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                // Intermediate bytes, then one final byte (`ESC ( B`, `ESC 7`, `ESC c`).
+                Some(c) if ('\x20'..='\x2f').contains(&c) => {
+                    while chars.next_if(|c| ('\x20'..='\x2f').contains(c)).is_some() {}
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => out.push('\n'),
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() || turns(c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Text to draw: [`safe`], with tabs as four spaces so the layout does not shift. As upstream
+/// `tool_execution::normalized_output_lines`.
 pub(super) fn clean(text: &str) -> String {
-    let text = rpi_tui::strip_ansi(text)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
-    let text = text.replace('\t', "    ");
-    text.chars()
-        .filter(|&c| c == '\n' || !c.is_control())
-        .collect()
+    safe(text).replace('\t', "    ")
 }
 
 fn kind(m: &Value) -> &str {

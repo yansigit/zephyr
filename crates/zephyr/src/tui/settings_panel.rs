@@ -458,7 +458,7 @@ impl SettingsPanel {
         let mut list: Vec<Proposal> =
             serde_json::from_value(v["proposals"].clone()).unwrap_or_default();
         for pr in &mut list {
-            pr.card = tidy(&pr.card);
+            pr.card = clean(&pr.card);
             pr.kind = line(&pr.kind);
             pr.key = pr.key.as_deref().map(line);
             pr.class = pr.class.as_deref().map(line);
@@ -689,19 +689,6 @@ impl SettingsPanel {
     }
 }
 
-/// Text from the daemon, safe to draw: [`clean`]'s cleaning (no escape sequences or control
-/// characters), and no characters that turn the direction of what follows, so a value the agent
-/// once had approved cannot paint over the panel or pass for other text. Lines are kept.
-fn tidy(text: &str) -> String {
-    // The embeddings, overrides and isolates the plugin refuses in rule text, and the marks.
-    let turns = |c: char| {
-        matches!(c,
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            | '\u{200e}' | '\u{200f}' | '\u{061c}')
-    };
-    clean(text).chars().filter(|&c| !turns(c)).collect()
-}
-
 /// What an Activity or Grants answer says instead of rows: an old daemon's, or why not.
 fn record_note(v: &Value) -> Option<String> {
     match (v["old"].as_bool(), v.get("error")) {
@@ -714,14 +701,14 @@ fn record_note(v: &Value) -> Option<String> {
     }
 }
 
-/// [`tidy`] on one line: a label, a value, a source.
+/// [`clean`] on one line: a label, a value, a source.
 fn line(text: &str) -> String {
-    tidy(text).replace('\n', " ")
+    clean(text).replace('\n', " ")
 }
 
 /// The daemon's reply without its `[zephyr] ` prefixes, cleaned like the transcript's text.
 fn unprefixed(text: &str) -> String {
-    let lines: Vec<String> = (tidy(text).lines())
+    let lines: Vec<String> = (clean(text).lines())
         .map(|l| l.strip_prefix("[zephyr] ").unwrap_or(l).to_string())
         .collect();
     lines.join("\n")
@@ -1156,7 +1143,7 @@ fn record_cells(
 
 /// The text a card shows, on one line: the agent shaped it, so nothing in it moves the cursor.
 fn one_line(text: &str) -> String {
-    tidy(text).split_whitespace().collect::<Vec<_>>().join(" ")
+    clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What the chosen setting is, what it takes and who may change it.
@@ -1254,7 +1241,7 @@ fn card_rows(
     let inner = width.saturating_sub(4).max(1);
     let card = match pr.action() {
         true => unprefixed(&pr.card),
-        false => tidy(&pr.card),
+        false => clean(&pr.card),
     };
     for text in card.lines() {
         out.extend(hanging(text, inner).iter().map(|l| Row::Line(p.text.fg(l))));
