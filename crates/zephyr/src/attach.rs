@@ -8,6 +8,8 @@
 //! {sessionId, command}` per prompt (the text is the command's `content`) and `stop_session` on
 //! exit, and renders `{"method":"event","params":{"subscriptionId","event":<--mode rpc line>}}`.
 //! Here prompts go through the inbox as channel `tui`, and `stop_session` only detaches.
+//! Zephyr's TUI authenticates with `zephyr.challenge` and `zephyr.prove` instead, so it never
+//! sends the token (DESIGN §4.3.1).
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
 //! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
 //! sign a provider in on the live gateway (`crate::auth`), and `zephyr.vault_list`/`_put`/`_rm`/
@@ -28,6 +30,7 @@ use crate::rpc::{message_text, MAIN_SESSION};
 use crate::web::passkey::{self, Signed};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -77,6 +80,52 @@ const UNAUTHORIZED: i64 = -32001;
 const MAX_CONNS: usize = 32;
 /// How long a connection has to authenticate before it is closed.
 const AUTH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What each side of `zephyr.challenge`/`zephyr.prove` signs before the two nonces (DESIGN
+/// §4.3.1), so neither proof can stand for the other.
+pub const BY_DAEMON: &[u8] = b"zephyr attach v1: the daemon\0";
+pub const BY_CLIENT: &[u8] = b"zephyr attach v1: the client\0";
+/// A nonce's length, in bytes.
+pub const NONCE: usize = 32;
+
+/// The client's nonce and the daemon's.
+pub type Nonces<'a> = (&'a [u8], &'a [u8]);
+
+/// A connection's two ends as each side sees them: the client's address and the daemon's.
+/// The daemon reads them as its peer and its local address, the TUI as its local and its
+/// peer, so a proof made on one connection never verifies on another (a relay's).
+pub type Ends = (SocketAddr, SocketAddr);
+
+/// What a proof signs: `by`, both nonces and both ends, an IPv4-mapped address as IPv4.
+fn signed(by: &[u8], (client, daemon): Nonces, ends: Ends) -> Vec<u8> {
+    let end = |a: SocketAddr| SocketAddr::new(a.ip().to_canonical(), a.port());
+    let ends = format!("{}\0{}", end(ends.0), end(ends.1));
+    [by, client, daemon, ends.as_bytes()].concat()
+}
+
+/// HMAC-SHA256, keyed by the attach token, over `by`, both nonces and the connection's `ends`:
+/// the proof that `by` holds the token on this connection, which never itself crosses it.
+pub fn proof(token: &str, by: &[u8], nonces: Nonces, ends: Ends) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let tag = ring::hmac::sign(&key, &signed(by, nonces, ends));
+    data_encoding::HEXLOWER.encode(tag.as_ref())
+}
+
+/// Whether `given` (hex) is [`proof`]'s, compared in constant time.
+pub fn proven(token: &str, by: &[u8], nonces: Nonces, ends: Ends, given: &str) -> bool {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes());
+    let signed = signed(by, nonces, ends);
+    let given = data_encoding::HEXLOWER.decode(given.as_bytes());
+    given.is_ok_and(|g| ring::hmac::verify(&key, &signed, &g).is_ok())
+}
+
+/// A fresh nonce, and the hex a side sends of it.
+pub fn nonce() -> ([u8; NONCE], String) {
+    let mut n = [0; NONCE];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut n)
+        .expect("the system's random source");
+    (n, data_encoding::HEXLOWER.encode(&n))
+}
 
 /// What a connection asks of the router.
 pub enum AttachRequest {
@@ -151,6 +200,8 @@ pub struct Expect {
 pub enum Origin {
     Tui {
         token: Arc<str>,
+        /// The connection's ends, its peer's and ours, which the TUI's proofs are over.
+        ends: Option<Ends>,
     },
     Web {
         session: [u8; 32],
@@ -164,19 +215,21 @@ pub async fn serve_stream<S>(stream: S, origin: Origin, handles: Handles)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (token, web) = match origin {
-        Origin::Tui { token } => (token, None),
+    let (token, ends, web) = match origin {
+        Origin::Tui { token, ends } => (token, ends, None),
         Origin::Web {
             session,
             passkey,
             hub,
-        } => ("".into(), Some((session, passkey, hub))),
+        } => ("".into(), None, Some((session, passkey, hub))),
     };
     let conn = Conn {
         token,
+        ends,
         channel: if web.is_some() { WEB } else { CHANNEL },
         // The cookie was checked at the upgrade.
         authed: web.is_some(),
+        challenge: None,
         web,
         snap: handles.snap,
         cfgs: handles.cfgs,
@@ -240,12 +293,13 @@ pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let Ok(slot) = slots.clone().try_acquire_owned() else {
                     continue; // dropped, so closed at once
                 };
                 let origin = Origin::Tui {
                     token: token.clone(),
+                    ends: stream.local_addr().ok().map(|ours| (peer, ours)),
                 };
                 let handles = handles.clone();
                 tokio::spawn(async move {
@@ -260,6 +314,8 @@ pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
 
 struct Conn {
     token: Arc<str>,
+    /// A TUI connection's ends ([`Ends`]); `None` for the web app's, which has no challenge.
+    ends: Option<Ends>,
     /// The inbox channel this client's messages and decisions are on: `tui` or `web`.
     channel: &'static str,
     /// A web app's socket: its session's hash, its passkey's row and the listener's hub.
@@ -270,6 +326,8 @@ struct Conn {
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
     authed: bool,
+    /// The nonces of a `zephyr.challenge` answered on this connection: the client's and ours.
+    challenge: Option<([u8; NONCE], [u8; NONCE])>,
     live: Option<broadcast::Receiver<Value>>,
     /// Subscribed with `zephyr.subscribe`: raw events plus `zephyr_status`.
     zephyr: bool,
@@ -391,6 +449,37 @@ impl Conn {
             // Constant time, so the token can't be guessed byte by byte.
             if !bool::from(given.as_bytes().ct_eq(self.token.as_bytes())) {
                 return (vec![error(id, UNAUTHORIZED, "invalid token")], true);
+            }
+            self.authed = true;
+            return (vec![ok(id, json!({"authenticated": true}))], false);
+        }
+        // The TUI's way in (DESIGN §4.3.1): the daemon proves it holds the token first, over
+        // the client's nonce and its own, and the client then proves it does; the token never
+        // crosses the socket, so a program holding the port while the daemon is down learns
+        // nothing from a TUI that connects to it.
+        if method == "zephyr.challenge" {
+            let client = params["nonce"].as_str().unwrap_or_default();
+            let client = data_encoding::HEXLOWER.decode(client.as_bytes());
+            let Some(client) = client.ok().and_then(|c| <[u8; NONCE]>::try_from(c).ok()) else {
+                return (
+                    vec![error(id, -32602, "nonce must be 32 bytes of hex")],
+                    true,
+                );
+            };
+            let Some(ends) = self.ends else {
+                return (vec![error(id, UNAUTHORIZED, "no attach token here")], true);
+            };
+            let (daemon, hex) = nonce();
+            self.challenge = Some((client, daemon));
+            let proof = proof(&self.token, BY_DAEMON, (&client, &daemon), ends);
+            return (vec![ok(id, json!({"nonce": hex, "proof": proof}))], false);
+        }
+        if method == "zephyr.prove" {
+            let given = params["proof"].as_str().unwrap_or_default();
+            let proven = (self.challenge.take().zip(self.ends))
+                .is_some_and(|((c, d), e)| proven(&self.token, BY_CLIENT, (&c, &d), e, given));
+            if !proven {
+                return (vec![error(id, UNAUTHORIZED, "invalid proof")], true);
             }
             self.authed = true;
             return (vec![ok(id, json!({"authenticated": true}))], false);

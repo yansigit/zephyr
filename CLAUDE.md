@@ -254,7 +254,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `/calls/<token>` and `/calls/events`, only under the floor) and one task per call: the
   `--no-tools` child `call-<id>`, the opening line at `call.answered`, speech by `calls.speech`
   (`provider`, the default: Telnyx's `transcription_start` and `speak`, text only; `local`:
-  whisper in and Piper out through `voice::hear_call`/`say_call` over the media socket), each
+  whisper in and Piper out through `voice::Call` (one warm whisper/Piper pair per call, a one-shot run if it dies) over the media socket), each
   sentence checked with `facts::found` as it will be spoken (`voice::speakable` first), the cap
   absolute, the call's session file removed at its end, `call_lines`, and the report row `call-<id>` with `derived = 'call'`. The `call` tool is
   main's alone and always held (`gate::Call::phone`, `ActionKind::Call`, schema v21); `/ok` starts

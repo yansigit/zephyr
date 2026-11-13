@@ -170,7 +170,7 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `/ok N [once]` / `/no N` | Approve or drop proposal or held action #N. `/ok N` runs exactly what its card showed; under `ask-new` it also remembers the new recipients, and `/ok N once` approves without remembering them |
 | `/cancel N` | Stop an action waiting out its delay (`sending at 14:05 unless /cancel 7`) before it goes |
 | `/facts [rm NAME \| allow NAME TARGET \| disallow NAME TARGET]` | From any channel: your private facts' names, kinds and allowed targets, never a value. `rm` and `allow` loosen the check, so only a strong channel may; a value is entered only in `zephyr attach` or with `zephyr facts add` |
-| `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
+| `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. It never sends the attach token: the daemon has to prove it holds it first, so if something else holds the attach port the UI stops and says so. `--stock` runs the stock `rpi --connect` client instead, which does send the token to whatever answers: use it only while zephyr is up |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
@@ -1032,7 +1032,7 @@ that the agent's tools are set up to trust (`zephyr doctor` lists the hosts and 
 program that brings its own roots or pins certificates fails there at once, and nothing leaks.
 For such a program mark the token `raw`, or bind it to a host that program does not use. If one
 that used to work fails after a long uptime, restart with `zephyr up`: the CA is renewed only
-when the container starts. Never bind a token to a model provider's host: the agent's own
+when the container starts, and zephyr tells you once a day in its last 30 days. Never bind a token to a model provider's host: the agent's own
 connection to the provider would stop.
 
 Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name
@@ -1150,18 +1150,21 @@ zephyr config set cards.provider manual                 # or link
   approval mode, so a purchase split into several small ones is caught. A payment whose amount
   zephyr could not read is not counted against the amount: it waits for an ordinary `/ok`, as
   before. An install from before this version is told of the window once.
-- A checkout that writes its total with a bare `$` is read as US dollars. With cards in another
-  dollar, its Pay click is then asked about again rather than let through on the card.
+- `CDN$`, `CA$` and `C$` are Canadian dollars, and `$45 USD` is US dollars. A total written with a
+  bare `$` is read as US dollars when your `approvals.currency` is USD, and as Canadian dollars
+  when it is CAD and the shop's address ends in `.ca`. Anywhere else (a `.com` shop under CAD,
+  for one) a bare `$` total counts as unread, so its Pay click is asked about rather than let
+  through on the card.
 
 ## The agent's network
 
 The container runs on a Docker network of its own, and the agent has no direct route out of it. Its
 programs reach the internet only through a proxy in the daemon (`HTTP_PROXY` and friends are set
 for them): any public address on ports 80 and 443, and nothing else. Your machine's localhost, your
-LAN, your tailnet, cloud metadata addresses and every other port (SSH, SMTP, IMAP, databases) are
-refused at once, and the agent gets no DNS of its own. `git`, `curl`, `pip`, `npm`, `gh` and the
-browsers work as before; `ssh` and mail clients fail until you allow their destination, and `ping`
-never works.
+LAN, your tailnet, cloud metadata addresses (Azure's WireServer too) and every other port (SSH,
+SMTP, IMAP, databases) are refused at once, and the agent gets no DNS of its own. `git`, `curl`,
+`pip`, `npm`, `gh` and the browsers work as before; `ssh` and mail clients fail until you allow
+their destination, and `ping` never works.
 
 - **Allowing more.** `/set network.allow HOST:PORT, HOST:PORT` lists exact destinations beyond
   that, e.g. `imap.gmail.com:993, github.com:22, homeassistant.lan:8123` (see

@@ -155,26 +155,40 @@ pub fn interactive(home: &Path, shell: &str) -> std::io::Result<std::process::Ex
 
 /// Ctrl+G: the draft in `editor` (`$VISUAL`, `$EDITOR`, a command line run by `sh`) as the agent,
 /// on this terminal, handed over as for [`interactive`]. The edited text, or `None` when the
-/// editor failed and the draft should stay. The file is the agent's and is gone afterwards.
+/// editor failed and the draft should stay. The file is the agent's: made new (`O_EXCL`, no
+/// link followed) in a fresh 0700 folder with a random name, read back only as a regular file
+/// (`files::read_capped`, so a FIFO put in its place never stalls the TUI), and gone afterwards
+/// with its folder.
 pub fn edit(home: &Path, editor: &str, draft: &str) -> std::io::Result<Option<String>> {
-    let dir = home.join(".cache");
-    let path = dir.join(format!("zephyr-edit-{}.md", std::process::id()));
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let cache = home.join(".cache");
+    let dir = cache.join(format!("zephyr-edit-{}", crate::attach::nonce().1));
+    let path = dir.join("draft.md");
     {
         let _fs = crate::agent::fs();
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, draft)?;
+        std::fs::create_dir_all(&cache)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        let mut file = (std::fs::OpenOptions::new().write(true).create_new(true))
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        file.write_all(draft.as_bytes())?;
     }
     let script = format!("{editor} \"$1\"");
     let file = path.to_string_lossy();
     let ran = foreground(agent(home, "sh", &["-c", &script, "sh", &file]));
     let _fs = crate::agent::fs();
-    let edited = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
-    match ran?.success() {
-        true => Ok(Some(edited?.trim_end_matches('\n').to_string())),
-        false => Ok(None),
+    let edited = super::files::read_capped(&path, DRAFT_BYTES);
+    let _ = std::fs::remove_dir_all(&dir);
+    match (ran?.success(), edited) {
+        (true, Some(text)) => Ok(Some(text.trim_end_matches('\n').to_string())),
+        _ => Ok(None),
     }
 }
+
+/// The most of an edited draft read back.
+const DRAFT_BYTES: u64 = 1 << 20;
 
 /// Runs `cmd` on the terminal until it exits. Ctrl+C and Ctrl+\ there reach the TUI too; it
 /// catches them with a handler that does nothing, rather than ignoring them, because an ignored
@@ -287,6 +301,28 @@ mod tests {
         );
         assert_eq!(edit(&home, "false", "kept").unwrap(), None);
         // The file goes either way.
+        let left = std::fs::read_dir(home.join(".cache")).unwrap().count();
+        assert_eq!(left, 0);
+    }
+
+    /// The draft's file is the agent's to write, so what the TUI reads back is only a regular
+    /// file, read without waiting: an editor (or anything of the agent's) that puts a FIFO in
+    /// its place keeps the draft as it was, and never stalls the TUI.
+    #[test]
+    fn a_draft_file_turned_into_a_fifo_never_stalls_the_tui() {
+        let home = crate::test_dir("shell-edit-fifo");
+        let script = home.join("ed.sh");
+        std::fs::write(&script, "rm -f \"$1\" && mkfifo \"$1\"\n").unwrap();
+        let editor = format!("sh {}", script.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = home.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(edit(&at, &editor, "the draft").map_err(|e| e.to_string()));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Ctrl+G blocked on a FIFO");
+        assert_eq!(got, Ok(None), "the draft stays as it was");
         let left = std::fs::read_dir(home.join(".cache")).unwrap().count();
         assert_eq!(left, 0);
     }

@@ -522,7 +522,8 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     // A card's number is in this page's fields (DESIGN §4.25): the page is not read back.
     let (reads, snap) = (reads_back(&argv.rest), snapshots(&argv.rest));
     if reads || snap {
-        if let Some(text) = card_filled(env, &page, reads, snap) {
+        let batch = argv.rest.first().is_some_and(|c| c == "batch");
+        if let Some(text) = card_filled(env, &page, reads, snap, batch) {
             return (Next::Refuse(text), None);
         }
     }
@@ -921,6 +922,11 @@ fn what(rest: &[String]) -> Act {
                 .find(|a| !matches!(a.as_str(), "--new-tab" | "--human"));
             sel.map_or(Act::Pass, |s| Act::Click(Target::Selector(s.clone())))
         }
+        // 0.41 clicks the element for these: `check` (twice, when it stays unchecked) and
+        // `download <sel> <path>` (`handle_download`).
+        "check" | "download" => args
+            .first()
+            .map_or(Act::Pass, |s| Act::Click(Target::Selector(s.clone()))),
         // A key going up can send too (a page's own handler); keydown and keyup send the key
         // as named (0.41), press reads `\n` and chords as Enter.
         "press" | "key" | "keydown" | "keyup" => match args.first().and_then(|k| key_of(k)) {
@@ -989,6 +995,8 @@ fn reads_back(rest: &[String]) -> bool {
         | "connect" | "console" => true,
         "get" => matches!(sub, Some("value" | "html" | "attr" | "cdp-url")),
         "diff" => sub == Some("screenshot"),
+        // It moves the address and not the page, so `card_filled`'s page line no longer finds it.
+        "pushstate" => true,
         "batch" => args.iter().any(|c| {
             let words = shell_words_split(c);
             reads_back(&words) || reads_back(&split(&words).rest)
@@ -997,10 +1005,12 @@ fn reads_back(rest: &[String]) -> bool {
     }
 }
 
-/// Whether `rest` is a `snapshot`, or a `batch` holding one: it prints the fields' values.
+/// Whether `rest` is a `snapshot` (or `diff snapshot`, which takes one), or a `batch` holding
+/// one: it prints the fields' values.
 fn snapshots(rest: &[String]) -> bool {
     match rest.split_first() {
         Some((cmd, _)) if cmd == "snapshot" => true,
+        Some((cmd, args)) if cmd == "diff" => args.first().is_some_and(|s| s == "snapshot"),
         Some((cmd, args)) if cmd == "batch" => args.iter().any(|c| {
             let words = shell_words_split(c);
             snapshots(&words) || snapshots(&split(&words).rest)
@@ -1013,8 +1023,11 @@ fn snapshots(rest: &[String]) -> bool {
 /// `cards-filled`, beside the gate socket and written by `cards::live`, lists a line per card
 /// whose number zephyr still keeps: the origin it was typed into and the page, tab separated.
 /// A read-back is refused on that origin; a `snapshot` on that page (its `#…` aside) until it
-/// moves on. No file is no card; one that cannot be read refuses.
-fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool) -> Option<String> {
+/// moves on. A `batch` is judged by the page before it runs, and a command in it can move the
+/// page in ways no list catches (`back`, `eval history.back()`, `press Alt+ArrowLeft`), so
+/// while any card is listed every batch that reads back or snapshots is refused. No file is no
+/// card; one that cannot be read refuses.
+fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool, batch: bool) -> Option<String> {
     let flag = public(env).join(crate::cards::FILLED_FILE);
     let listed = match std::fs::read_to_string(&flag) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -1023,6 +1036,13 @@ fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool) -> Option<String
     };
     if listed.trim().is_empty() {
         return None;
+    }
+    if batch {
+        return Some(
+            "not run: a virtual card is filled, and a batch could move to the card's page before \
+             it reads a page back; run the read as a command of its own"
+                .into(),
+        );
     }
     let url = page.url();
     let Some(origin) = crate::vault::origin(&url).map(|o| o.ascii_serialization()) else {
@@ -1177,7 +1197,7 @@ fn find(args: &[String]) -> Act {
         )
     };
     match action {
-        "click" => Act::Click(target),
+        "click" | "check" => Act::Click(target),
         "fill" => typing("fill", fill, None),
         _ => Act::Pass,
     }
@@ -2279,10 +2299,12 @@ const CODES: &[&str] = &[
     "BRL", "MXN", "SEK", "NOK", "DKK", "PLN", "CZK", "TRY", "ZAR", "TWD", "THB",
 ];
 
-/// The currency written right before (`$`, `US$`, `€`, `EUR`) or right after (`원`, `€`, `EUR`)
-/// a number; empty when none is, or when the sign names more than one (`¥`).
+/// The currency written right before (`US$`, `€`, `EUR`) or right after (`원`, `€`, `EUR`)
+/// a number; empty when none is, or when the sign names more than one (`¥`). A bare `$` with no
+/// code after the number is `$`: which dollar it is, the gate reads from `approvals.currency`.
 fn currency(before: &str, after: &str) -> String {
     const SIGNS: &[(&str, &str)] = &[
+        ("CDN$", "CAD"),
         ("US$", "USD"),
         ("CA$", "CAD"),
         ("AU$", "AUD"),
@@ -2293,7 +2315,7 @@ fn currency(before: &str, after: &str) -> String {
         ("A$", "AUD"),
         ("S$", "SGD"),
         ("R$", "BRL"),
-        ("$", "USD"),
+        ("$", "$"),
         ("€", "EUR"),
         ("£", "GBP"),
         ("₩", "KRW"),
@@ -2302,15 +2324,19 @@ fn currency(before: &str, after: &str) -> String {
         ("￥", ""),
     ];
     let (before, after) = (before.to_uppercase(), after.to_uppercase());
-    if let Some((_, code)) = SIGNS.iter().find(|(s, _)| before.ends_with(s)) {
-        return code.to_string();
-    }
     let word = |w: Option<&str>| {
         let w = w
             .unwrap_or_default()
             .trim_matches(|c: char| !c.is_alphanumeric());
         CODES.contains(&w).then(|| w.to_string())
     };
+    if let Some((_, code)) = SIGNS.iter().find(|(s, _)| before.ends_with(s)) {
+        // `$45.00 CAD`: the code says which dollar.
+        return match *code {
+            "$" => word(after.split_whitespace().next()).unwrap_or_else(|| "$".into()),
+            code => code.to_string(),
+        };
+    }
     if let Some(code) = word(before.split_whitespace().next_back()) {
         return code;
     }
@@ -2818,6 +2844,10 @@ cat "$d/$f.json"
             &["dblclick", "#x"],
             &["tap", "@e2"],
             &["find", "role", "button", "click", "--name", "Go"],
+            // 0.41 clicks for these too (`interaction::check`, `handle_download`).
+            &["check", "@e7"],
+            &["download", "@e7", "/tmp/x"],
+            &["find", "text", "Pay", "check"],
             &["press", "Enter"],
             &["key", "Space"],
             &["type", "@e1", "hi\n"],
@@ -3050,7 +3080,7 @@ cat "$d/$f.json"
                 Next::Refuse(text) => assert!(
                     text.starts_with(
                         "not run: a virtual card is filled on https://mail.example.com;"
-                    ),
+                    ) || (args[0] == "batch" && text.contains("a batch could move")),
                     "{args:?}: {text}"
                 ),
                 Next::Exec => panic!("{args:?} ran"),
@@ -3087,7 +3117,8 @@ cat "$d/$f.json"
         for args in [&["snapshot", "-i"][..], &["batch", "snapshot -i"]] {
             match t.run(args) {
                 Next::Refuse(text) => assert!(
-                    text.starts_with("not run: a virtual card was just typed into this page"),
+                    text.starts_with("not run: a virtual card was just typed into this page")
+                        || (args[0] == "batch" && text.contains("a batch could move")),
                     "{args:?}: {text}"
                 ),
                 Next::Exec => panic!("{args:?} ran"),
@@ -3100,6 +3131,63 @@ cat "$d/$f.json"
         t.page("https://mail.example.com/done", COMPOSE, "");
         assert_eq!(t.run(&["snapshot", "-i"]), Next::Exec);
         assert!(matches!(t.run(&["eval", "1"]), Next::Refuse(_)));
+    }
+
+    /// `diff snapshot` takes a full snapshot and prints what changed: the card's fields too.
+    #[test]
+    fn a_diff_snapshot_of_the_page_a_card_was_just_typed_into_is_refused() {
+        let t = T::new("bg-card-diff");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        std::fs::write(&flag, format!("https://mail.example.com\t{MAIL}\n")).unwrap();
+        for args in [&["diff", "snapshot"][..], &["batch", "diff snapshot"]] {
+            assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?} ran");
+        }
+    }
+
+    /// `pushstate` moves the address without leaving the page, so the page's own line in the
+    /// flag would no longer name it: on a card's origin it is refused as a read-back.
+    #[test]
+    fn a_pushstate_on_a_cards_origin_is_refused() {
+        let t = T::new("bg-card-push");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        assert_eq!(t.run(&["pushstate", "/pay?x"]), Next::Exec);
+        std::fs::write(&flag, format!("https://mail.example.com\t{MAIL}\n")).unwrap();
+        assert!(matches!(t.run(&["pushstate", "/pay?x"]), Next::Refuse(_)));
+        std::fs::write(&flag, "https://other.example\n").unwrap();
+        assert_eq!(t.run(&["pushstate", "/pay?x"]), Next::Exec);
+    }
+
+    /// A batch is judged by the page before it runs, and a command in it can move the page in
+    /// ways the wrapper cannot list (`back`, `eval history.back()`, `press Alt+ArrowLeft`, a
+    /// link's Enter): while any card is filled anywhere, every batch that reads a page back or
+    /// snapshots it is refused, whatever page it starts on.
+    #[test]
+    fn a_batch_that_reads_back_is_refused_while_a_card_is_filled() {
+        let t = T::new("bg-card-batch");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        let cases: [&[&str]; 7] = [
+            &["batch", "back", "get value #cc"],
+            &["batch", "open https://shop.example/pay", "snapshot"],
+            &["batch", "tab 2", "eval 1"],
+            &["batch", "pushstate /x", "diff snapshot"],
+            &["batch", "eval history.back()", "get value #cc"],
+            &["batch", "press Alt+ArrowLeft", "get value #cc"],
+            &["batch", "get value @e1"],
+        ];
+        for args in cases {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        std::fs::write(&flag, "https://shop.example\thttps://shop.example/pay\n").unwrap();
+        for args in cases {
+            assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?} ran");
+        }
+        // A batch that reads nothing back still runs, and so does a read alone off the card's
+        // origin.
+        assert_eq!(t.run(&["batch", "back", "get text @e1"]), Next::Exec);
+        assert_eq!(t.run(&["get", "value", "@e1"]), Next::Exec);
     }
 
     #[test]
@@ -3894,7 +3982,7 @@ cat "$d/$f.json"
             b["title"], "Checkout",
             "a payment: its title and total are read"
         );
-        assert_eq!(b["amount"], json!({"value": 54.2, "currency": "USD"}));
+        assert_eq!(b["amount"], json!({"value": 54.2, "currency": "$"}));
         answer(&mut conn, json!({"verdict": "allow"}));
         assert_eq!(waiting.join().unwrap(), Next::Exec);
         // A line break typed there does the same: the field found by its selector, or by name.
@@ -4324,9 +4412,9 @@ console.log(JSON.stringify(out));
             })
         };
         for (tree, want) in [
-            ("- StaticText \"Order total: $54.20\"", amount(54.2, "USD")),
-            ("- cell \"Subtotal\"\n- cell \"$50.00\"\n- cell \"Total\"\n- cell \"$54.20\"", amount(54.2, "USD")),
-            ("- StaticText \"Total savings: $5\"\n- StaticText \"Order total\"\n- StaticText \"$1,054.20\"", amount(1054.2, "USD")),
+            ("- StaticText \"Order total: $54.20\"", amount(54.2, "$")),
+            ("- cell \"Subtotal\"\n- cell \"$50.00\"\n- cell \"Total\"\n- cell \"$54.20\"", amount(54.2, "$")),
+            ("- StaticText \"Total savings: $5\"\n- StaticText \"Order total\"\n- StaticText \"$1,054.20\"", amount(1054.2, "$")),
             ("- StaticText \"Amount due\"\n- StaticText \"54,20 €\"", amount(54.2, "EUR")),
             ("- StaticText \"Grand total EUR 1.234,50\"", amount(1234.5, "EUR")),
             ("- StaticText \"총 결제금액\"\n- StaticText \"54,200원\"", amount(54200.0, "KRW")),
@@ -4334,6 +4422,12 @@ console.log(JSON.stringify(out));
             ("- StaticText \"Total: 3 items\"", amount(3.0, "")),
             ("- StaticText \"Total\"\n- StaticText \"¥5,000\"", amount(5000.0, "")),
             ("- StaticText \"Total\"\n- StaticText \"CA$20\"", amount(20.0, "CAD")),
+            // Canada's other ways to write its dollar; a bare `$` is the gate's to read
+            // (`approvals.currency`), unless a code follows the number.
+            ("- StaticText \"Total: CDN$ 45.00\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: C$45.00\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: $45.00 CAD\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: $45.00 USD\"", amount(45.0, "USD")),
             ("- StaticText \"Total $10\"\n- StaticText \"Total €20\"", None),
             // I5: a space, a no-break space, a narrow or thin one, or an apostrophe groups
             // thousands, before exactly three digits.
@@ -4343,7 +4437,7 @@ console.log(JSON.stringify(out));
             ("- StaticText \"Total\"\n- StaticText \"12\u{2009}345\u{2009}678 ₩\"", amount(12_345_678.0, "KRW")),
             ("- StaticText \"Total CHF 1'234.50\"", amount(1234.5, "CHF")),
             ("- StaticText \"Total CHF 1’234.50\"", amount(1234.5, "CHF")),
-            ("- StaticText \"Total\"\n- StaticText \"$ 1 054.20\"", amount(1054.2, "USD")),
+            ("- StaticText \"Total\"\n- StaticText \"$ 1 054.20\"", amount(1054.2, "$")),
             // A total that cannot be read one way only is no total: over any cap.
             ("- StaticText \"Total 1 23,50 €\"", None),
             ("- StaticText \"Total 12 3456 €\"", None),

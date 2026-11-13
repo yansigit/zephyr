@@ -97,11 +97,24 @@ pub struct PageAmount {
 
 impl PageAmount {
     /// As a payment's amount: `None` for a value no total can be. R21: an empty currency stays
-    /// empty, so a cap counts it as unknown, never as `approvals.currency`.
-    fn amount(&self) -> Option<Amount> {
-        (self.value.is_finite() && self.value >= 0.0).then(|| Amount {
+    /// empty, so a cap counts it as unknown, never as `approvals.currency`. A bare `$` is USD
+    /// under a USD `home` (`approvals.currency`), CAD under a CAD one on a `.ca` page (`url`,
+    /// the top document's), and unknown otherwise.
+    fn amount(&self, home: &str, url: &str) -> Option<Amount> {
+        // `$` alone says only "some dollar". USD's own is the likeliest anywhere; CAD's only on
+        // a `.ca` site (a US shop's `$` must not pass a CAD cap); any other reading is unknown.
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase));
+        let canadian = host.is_some_and(|h| h.trim_end_matches('.').ends_with(".ca"));
+        let currency = match self.currency.trim().to_uppercase() {
+            c if c == "$" && (home == "USD" || (home == "CAD" && canadian)) => home.to_string(),
+            c if c == "$" => String::new(),
+            c => c,
+        };
+        (self.value.is_finite() && self.value >= 0.0).then_some(Amount {
             value: self.value,
-            currency: self.currency.trim().to_uppercase(),
+            currency,
         })
     }
 }
@@ -651,7 +664,7 @@ impl Call {
     /// every connector call, and the browser's typed values).
     fn of(cfg: &Config, req: &Request, scrub: Option<&Scrub>) -> Option<Call> {
         if let Some(b) = &req.browser {
-            return Call::browser(req, b, scrub);
+            return Call::browser(req, b, scrub, &approvals::currency(cfg));
         }
         if req.tool == "card" {
             return Call::card(cfg, req);
@@ -784,7 +797,7 @@ impl Call {
     /// A click or key press the wrapper caught, classified by `browser_class`, or typing, which
     /// only the facts check looks at. Its target is the page's origin. Any action but typing on
     /// a control with no role is one the gate could not read: held, never let through (I3).
-    fn browser(req: &Request, b: &Browser, scrub: Option<&Scrub>) -> Option<Call> {
+    fn browser(req: &Request, b: &Browser, scrub: Option<&Scrub>, home: &str) -> Option<Call> {
         let origin = origin_of(&b.origin);
         let typing = matches!(b.action.as_str(), "fill" | "type");
         let unread = !typing && b.role.trim().is_empty();
@@ -823,7 +836,7 @@ impl Call {
                 targets: vec![origin.clone()],
                 summary: summary.clone(),
                 // The page's labelled total, which a money cap compares (A5's carry-over).
-                amount: b.amount.as_ref().and_then(PageAmount::amount),
+                amount: b.amount.as_ref().and_then(|a| a.amount(home, &b.url)),
                 replay: policy::Replay::Wait,
                 only_sends: false,
             }),
@@ -2350,7 +2363,7 @@ fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
             run_lines(cfg, a, class, &targets, command, &clean)
         }
         ActionKind::Pass => pass_lines(a, class, &targets, &scrub),
-        ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &scrub),
+        ActionKind::Wait => wait_lines(cfg, class, &targets, browser.as_ref(), &scrub),
         ActionKind::Card => card_lines(cfg, a, &scrub),
         ActionKind::Call => call_lines(cfg, a, &scrub),
     });
@@ -2704,6 +2717,7 @@ fn amount(m: &Amount) -> String {
 /// is the request decoded; each of its fields is scrubbed on its own (C2), and what was typed is
 /// not shown at all when a fact is split across its entries.
 fn wait_lines(
+    cfg: &Config,
     class: Option<Class>,
     targets: &[String],
     browser: Option<&Browser>,
@@ -2753,10 +2767,13 @@ fn wait_lines(
         }
     }
     if class == Some(Class::Money) {
-        lines.push(match b.amount.as_ref().and_then(PageAmount::amount) {
-            None => "amount: could not be read".into(),
-            Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
-        });
+        let home = approvals::currency(cfg);
+        lines.push(
+            match b.amount.as_ref().and_then(|a| a.amount(&home, &b.url)) {
+                None => "amount: could not be read".into(),
+                Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
+            },
+        );
     }
     lines
 }
@@ -5792,6 +5809,38 @@ mod tests {
         }
         let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now + 9));
         assert!(h.store.action_strong(id).unwrap());
+    }
+
+    /// A page's bare `$` is USD under a USD `approvals.currency`; CAD under a CAD one only on a
+    /// `.ca` site (a US shop's `$` is US dollars, and must not pass a CAD cap); anything else is
+    /// no currency, held as unknown. A named currency stays as named.
+    #[test]
+    fn a_bare_dollar_is_read_only_where_it_can_mean_one_dollar() {
+        let page = |currency: &str| PageAmount {
+            value: 45.0,
+            currency: currency.into(),
+        };
+        let read = |currency: &str, home: &str, url: &str| {
+            page(currency).amount(home, url).unwrap().currency
+        };
+        let (us, ca) = (
+            "https://www.amazon.com/checkout",
+            "https://www.amazon.ca/checkout",
+        );
+        assert_eq!(read("$", "USD", us), "USD");
+        assert_eq!(read("$", "USD", ca), "USD");
+        assert_eq!(read("$", "CAD", ca), "CAD");
+        assert_eq!(read("$", "CAD", "https://shop.example.CA./pay"), "CAD");
+        assert_eq!(
+            read("$", "CAD", us),
+            "",
+            "a US shop's dollar under a CAD cap"
+        );
+        assert_eq!(read("$", "CAD", "https://ca.example.com/pay"), "");
+        assert_eq!(read("$", "AUD", "https://shop.com.au/pay"), "");
+        assert_eq!(read("$", "EUR", ca), "");
+        assert_eq!(read("USD", "CAD", ca), "USD");
+        assert_eq!(read("", "CAD", ca), "");
     }
 
     /// A connector's amount is a total only when it is finite and not negative: -1000 does

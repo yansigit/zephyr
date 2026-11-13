@@ -367,18 +367,45 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
             if scene == "down" && n > 0 {
                 return;
             }
+            // The connection's ends as the daemon reads them: its peer, then itself.
+            let ends = (stream.peer_addr().unwrap(), stream.local_addr().unwrap());
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             // A setting changed on this connection.
             let mut changed = false;
             // A grant was taken back on this connection.
             let mut revoked = false;
+            // The nonces of this connection's `zephyr.challenge`: the TUI's and ours.
+            let mut nonces = None;
             let frame = |v: Value| format!("{v}\n");
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let id = req["id"].clone();
                 let result = match req["method"].as_str().unwrap() {
-                    "authenticate" if req["params"]["token"] == TOKEN => {
+                    "zephyr.challenge" => {
+                        let hex = req["params"]["nonce"].as_str().unwrap();
+                        let tui = data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap();
+                        let (ours, hex) = zephyr::attach::nonce();
+                        let proof = zephyr::attach::proof(
+                            TOKEN,
+                            zephyr::attach::BY_DAEMON,
+                            (&tui, &ours),
+                            ends,
+                        );
+                        nonces = Some((tui, ours));
+                        json!({"nonce": hex, "proof": proof})
+                    }
+                    "zephyr.prove" => {
+                        let (tui, ours) = nonces.take().unwrap();
+                        let given = req["params"]["proof"].as_str().unwrap();
+                        let by = zephyr::attach::BY_CLIENT;
+                        assert!(zephyr::attach::proven(
+                            TOKEN,
+                            by,
+                            (&tui, &ours),
+                            ends,
+                            given
+                        ));
                         json!({"authenticated": true})
                     }
                     "zephyr.hello" => snapshot(scene),
