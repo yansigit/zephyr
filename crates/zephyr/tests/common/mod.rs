@@ -60,30 +60,9 @@ pub fn prompts(home: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Writes `text` to `path` as an executable script, from a child process, as the library's
-/// `crate::test_exe` does. Not written here: another test's thread can fork while this process
-/// holds the file open for writing, and until that fork execs, running the file fails with
-/// ETXTBSY ("Text file busy").
-pub fn test_exe(path: &Path, text: &str) {
-    use std::io::Write;
-    let mut child = std::process::Command::new("/bin/sh")
-        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(text.as_bytes())
-        .unwrap();
-    assert!(
-        child.wait().unwrap().success(),
-        "writing {}",
-        path.display()
-    );
-}
+/// The library's own: it writes the script from a child, so a fork never makes it busy.
+#[allow(unused_imports)]
+pub use zephyr::test_exe;
 
 /// Cancels, as the test process exits, every login it started and left running (a test that
 /// panicked, or ended mid-sign-in). A login lives in a static registry, which nothing drops, so
