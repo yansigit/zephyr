@@ -9,7 +9,8 @@
 # one of them is private; the build works without it when both are public.
 # Where it runs follows variable ZEPHYR_CI as ci.yml does (.github/ci.sh plan, README "CI"): on
 # GitHub-hosted, unless that is `local` or GitHub refused a hosted job in the last hours; then on
-# zephyr-local (deploy/runner/start.sh), which builds on its zephyr-buildkitd without the smoke test.
+# zephyr-local (deploy/runner/start.sh), which builds on its zephyr-buildkitd without the smoke test;
+# `-f local=true` builds there whatever ZEPHYR_CI says.
 name: image
 on:
   push:
@@ -22,6 +23,10 @@ on:
         type: choice
         default: full
         options: [full, none]
+      local:
+        description: "build on zephyr-local whatever ZEPHYR_CI says"
+        type: boolean
+        default: false
 permissions:
   contents: read
   packages: write
@@ -43,7 +48,7 @@ jobs:
           ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
   image:
     needs: plan
-    runs-on: ${{ needs.plan.outputs.runner }}
+    runs-on: ${{ inputs.local && 'zephyr-local' || needs.plan.outputs.runner }}
     # A hung build fails after 90 minutes instead of burning GitHub's 6-hour limit in minutes; a cold
     # build (no cache, as after a base image moves) takes about an hour on a hosted runner.
     timeout-minutes: 90
@@ -75,11 +80,27 @@ jobs:
           # The last step removes $DOCKER_CONFIG, which holds the builder's record, before the
           # actions' own cleanup would run; and the runner is thrown away.
           cleanup: false
+      # zephyr-buildkitd answers only this client certificate (mTLS, deploy/runner/start.sh), which
+      # no other workflow is given: a test job on zephyr-local reaches the daemon but cannot use it.
+      - if: runner.environment == 'self-hosted'
+        env:
+          CA: ${{ secrets.BUILDKIT_CA }}
+          CERT: ${{ secrets.BUILDKIT_CERT }}
+          KEY: ${{ secrets.BUILDKIT_KEY }}
+        run: |
+          d=$(mktemp -d)
+          (umask 077; printf '%s\n' "$CA" > "$d/ca.pem"; printf '%s\n' "$CERT" > "$d/cert.pem"; printf '%s\n' "$KEY" > "$d/key.pem")
+          echo "BUILDKIT_TLS=$d" >> "$GITHUB_ENV"
       - if: runner.environment == 'self-hosted'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: remote
           endpoint: tcp://zephyr-buildkitd:1234
+          driver-opts: |
+            cacert=${{ env.BUILDKIT_TLS }}/ca.pem
+            cert=${{ env.BUILDKIT_TLS }}/cert.pem
+            key=${{ env.BUILDKIT_TLS }}/key.pem
+            servername=zephyr-buildkitd
           cleanup: false
       # No daemon needed: when `docker login` can't reach one, the CLI logs in client-side and still
       # writes $DOCKER_CONFIG/config.json, which buildx hands to the remote BuildKit for the push.
@@ -158,4 +179,4 @@ jobs:
           # may have written.
           no-cache: ${{ runner.environment == 'self-hosted' && startsWith(github.ref, 'refs/tags/v') }}
       - if: always()
-        run: rm -rf "$DOCKER_CONFIG"
+        run: rm -rf "$DOCKER_CONFIG" "${BUILDKIT_TLS:-}"

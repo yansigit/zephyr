@@ -11,12 +11,16 @@
 # (--rm); systemd then starts a fresh one from the image. No volume, no home, no ~/.cargo, no work
 # tree or target dir outlives a job, so nothing one job's code leaves behind reaches the next. A new
 # image or new limits apply from each slot's next job. Each runner gets ZEPHYR_RUNNER_CPUS (default
-# 8) CPUs and ZEPHYR_RUNNER_MEMORY (default 16g).
+# 8) CPUs and ZEPHYR_RUNNER_MEMORY (default 16g), no capabilities and no-new-privileges.
 # Everything sits on the zephyr-ci bridge network, never the host's: jobs get no Docker socket, no bind
 # mounts and no route to 127.0.0.1, so the live `zephyr` container (--network host) is out of reach.
+# zephyr-buildkitd answers only a client with the certificate this script makes (mTLS), which
+# image.yml alone is given, as repo secrets; the test jobs on the same network cannot use it.
 # Known risk: rootless BuildKit needs unprivileged user namespaces, which Ubuntu's AppArmor restriction
 # (sysctl kernel.apparmor_restrict_unprivileged_userns=1) can block. If the builder fails to start,
 # stop there: never switch to a privileged builder.
+# The units call gh as the owner, which reads ~/.config/gh/hosts.yml. If gh keeps its token in a
+# keyring a user service cannot reach, put GH_TOKEN=<token> in ~/.config/zephyr-runner/env (0600).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,31 +34,61 @@ cache=zephyr-buildkit-cache
 buildkit_image=moby/buildkit:v0.34.1-rootless
 runner_image=zephyr-runner:local
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+config=${XDG_CONFIG_HOME:-$HOME/.config}/zephyr-runner
+# BuildKit's CA, the daemon's and image.yml's certificates and keys: the owner's alone (0700).
+tls=$config/buildkit
 # The copy of this script the units run, so they do not depend on the checkout `up` ran from.
 self=${XDG_DATA_HOME:-$HOME/.local/share}/zephyr-runner/start.sh
+# How runners and the builder are started; a container started otherwise is replaced (once idle).
+kind=ephemeral-2
+builder_kind=mtls-1
 
 die() { echo "runner: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 exists() { docker container inspect "$1" >/dev/null 2>&1; }
+label() { docker inspect -f "{{index .Config.Labels \"$2\"}}" "$1"; }
 # Short-lived (1 h) tokens go straight into `docker exec` args, never to disk or the container's env.
 token() { gh api -X POST "repos/$repo/actions/runners/$1" --jq .token; }
 # online|offline and busy (true|false) of a registered runner; empty when it is not registered.
 state() { gh api "repos/$repo/actions/runners?per_page=100" --jq ".runners[] | select(.name == \"$1\") | \"\(.status) \(.busy)\""; }
+# Removes a runner's registration (GitHub refuses while it runs a job); none is fine.
+unregister() {
+  local id
+  id=$(gh api "repos/$repo/actions/runners?per_page=100" --jq ".runners[] | select(.name == \"$1\") | .id") || return
+  [ -z "$id" ] || gh api -X DELETE "repos/$repo/actions/runners/$id" >/dev/null 2>&1
+}
 
 # One runner for one job, in the foreground: unit zephyr-runner@<i> runs this, and systemd starts
 # it again when it returns.
 serve() {
-  local name=zephyr-runner-$1
+  local name=zephyr-runner-$1 t n
+  local fails=${XDG_RUNTIME_DIR:-/tmp}/zephyr-runner-$1.fails
+  n=$(cat "$fails" 2>/dev/null || echo 0)
+  # A failed login or registration waits 20 s, doubling to 10 min, so it never spins.
+  failed() {
+    local wait=$((10 << (n < 5 ? n + 1 : 6)))
+    [ "$wait" -le 600 ] || wait=600
+    echo $((n + 1)) > "$fails"
+    echo "$name: $1; trying again in ${wait}s" >&2
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    sleep "$wait"
+    exit 1
+  }
   docker rm -f "$name" >/dev/null 2>&1 || true
-  # The image's workdir is /home/runner (user runner); idle until config.sh writes .runner, then serve
-  # one job. Without /.dockerenv, which Docker makes at each start, the zephyr tests see a host, as on
-  # GitHub's runners, not the container (host::in_container).
-  docker run -d --rm --name "$name" --network "$net" --label zephyr.runner=ephemeral \
-    --cpus "$cpus" --memory "$memory" "$runner_image" \
-    bash -c 'sudo rm -f /.dockerenv; until [ -f .runner ]; do sleep 2; done; exec ./run.sh' >/dev/null
+  t=$(token registration-token) || failed "no registration token (is gh logged in? see this script's header)"
+  # Root only to remove /.dockerenv, which Docker makes at each start (without it the zephyr tests
+  # see a host, as on GitHub's runners: host::in_container), then the runner user for good, with no
+  # capability left and no-new-privileges (so no sudo). SETUID and SETGID are only for that switch.
+  # Idle until config.sh writes .runner, then serve one job from /home/runner.
+  docker run -d --rm --name "$name" --network "$net" --label "zephyr.runner=$kind" \
+    --cpus "$cpus" --memory "$memory" --cap-drop ALL --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges --user root -e HOME=/home/runner "$runner_image" \
+    sh -c 'rm -f /.dockerenv; exec setpriv --reuid=runner --regid=runner --init-groups bash -c "until [ -f .runner ]; do sleep 2; done; exec ./run.sh"' \
+    >/dev/null || failed "the runner container did not start"
   # --replace takes over the registration the last job's runner left under this name.
-  docker exec "$name" ./config.sh --url "https://github.com/$repo" --token "$(token registration-token)" \
-    --name "$name" --labels zephyr-local --unattended --replace --ephemeral >/dev/null
+  docker exec --user runner -e HOME=/home/runner "$name" ./config.sh --url "https://github.com/$repo" --token "$t" \
+    --name "$name" --labels zephyr-local --unattended --replace --ephemeral >/dev/null || failed "registration failed"
+  rm -f "$fails"
   echo "$name is waiting for a job"
   docker wait "$name" >/dev/null 2>&1 || true
 }
@@ -67,6 +101,7 @@ Description=zephyr-local CI runner %i: one job per container (deploy/runner/star
 
 [Service]
 Environment="PATH=$PATH" "ZEPHYR_GH_REPO=$repo" "ZEPHYR_RUNNER_CPUS=$cpus" "ZEPHYR_RUNNER_MEMORY=$memory"
+EnvironmentFile=-$config/env
 ExecStart=$self serve %i
 ExecStop=-$(command -v docker) rm -f zephyr-runner-%i
 Restart=always
@@ -77,20 +112,67 @@ WantedBy=default.target
 EOF
 }
 
+# The CA, the daemon's certificate (for name zephyr-buildkitd) and image.yml's client certificate,
+# made once; the client's three files go to the repo secrets image.yml reads.
+certs() {
+  if [ ! -f "$tls/client.pem" ]; then
+    step "making BuildKit's CA and certificates in $tls"
+    rm -rf "$tls"
+    (
+      set -e
+      umask 077
+      mkdir -p "$tls/daemon"
+      cd "$tls"
+      key() { openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$1" -keyout "$2" "${@:3}"; }
+      key zephyr-buildkit-ca ca-key.pem -x509 -days 3650 -out ca.pem
+      key "$builder" daemon/key.pem -out daemon.csr
+      printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$builder" > daemon.ext
+      openssl x509 -req -in daemon.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 -extfile daemon.ext -out daemon/cert.pem
+      key zephyr-image-workflow client-key.pem -out client.csr
+      printf 'extendedKeyUsage=clientAuth\n' > client.ext
+      openssl x509 -req -in client.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 -extfile client.ext -out client.pem
+      cp ca.pem daemon/
+      rm -f ./*.csr ./*.ext ca.srl
+    ) >/dev/null 2>&1 || die "could not make the certificates in $tls (openssl?)"
+  fi
+  step "giving image.yml the client certificate (repo secrets BUILDKIT_CA, BUILDKIT_CERT, BUILDKIT_KEY)"
+  gh secret set BUILDKIT_CA --repo "$repo" < "$tls/ca.pem"
+  gh secret set BUILDKIT_CERT --repo "$repo" < "$tls/client.pem"
+  gh secret set BUILDKIT_KEY --repo "$repo" < "$tls/client-key.pem"
+}
+
 up() {
   local n=$1 i name
+  # The rootless builder runs as uid 1000 and reads the daemon's key from the owner's folder.
+  [ "$(id -u)" = 1000 ] || die "the BuildKit certificates are read as uid 1000; run this as that user"
+  # User units stop at logout without linger.
+  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != yes ] &&
+    ! loginctl enable-linger "$USER" 2>/dev/null; then
+    echo "runner: the runners stop when you log out; to keep them: sudo loginctl enable-linger $USER" >&2
+  fi
   step "building $runner_image"
   docker build -q -t "$runner_image" . >/dev/null
   docker network inspect "$net" >/dev/null 2>&1 || { step "creating network $net"; docker network create --driver bridge "$net" >/dev/null; }
+  certs
 
   step "starting $builder"
+  if exists "$builder" && [ "$(label "$builder" zephyr.builder)" != "$builder_kind" ]; then
+    until [ "$(gh run list --repo "$repo" --workflow image.yml --status in_progress --json databaseId --jq length)" = 0 ]; do
+      echo "waiting for an image build to finish before the builder is replaced"
+      sleep 30
+    done
+    docker rm -f "$builder" >/dev/null
+  fi
   if exists "$builder"; then
     docker start "$builder" >/dev/null
   else
-    docker run -d --name "$builder" --network "$net" --restart unless-stopped \
-      --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-      --cpus 8 --memory 16g -v "$cache:/home/user/.local/share/buildkit" \
-      "$buildkit_image" --addr tcp://0.0.0.0:1234 --oci-worker-no-process-sandbox >/dev/null
+    # Each build step in a PID namespace of its own (BuildKit's process sandbox), so no step can
+    # see or signal the daemon; rootless, that needs /proc unmasked (systempaths=unconfined).
+    docker run -d --name "$builder" --network "$net" --restart unless-stopped --label "zephyr.builder=$builder_kind" \
+      --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
+      --cpus 8 --memory 16g -v "$cache:/home/user/.local/share/buildkit" -v "$tls/daemon:/certs:ro" \
+      "$buildkit_image" --addr tcp://0.0.0.0:1234 \
+      --tlscacert /certs/ca.pem --tlscert /certs/cert.pem --tlskey /certs/key.pem >/dev/null
   fi
   sleep 3
   [ "$(docker inspect -f '{{.State.Running}}' "$builder")" = true ] ||
@@ -104,23 +186,22 @@ up() {
   for i in $(seq "$n"); do
     name=zephyr-runner-$i
     step "$name"
-    # A runner from before ephemeral runners: kept volume and all. Replaced once idle, so no job is
-    # cut off, and its volume goes with it.
-    if exists "$name" && [ "$(docker inspect -f '{{index .Config.Labels "zephyr.runner"}}' "$name")" != ephemeral ]; then
-      # Only once idle; once removed it is given no job.
-      until [ "$(state "$name" | cut -d' ' -f2)" = false ] && gh api -X DELETE \
-        "repos/$repo/actions/runners/$(gh api "repos/$repo/actions/runners?per_page=100" --jq ".runners[] | select(.name == \"$name\") | .id")" \
-        >/dev/null 2>&1; do
-        echo "waiting for $name to finish its job"
-        sleep 10
-      done
-      echo "replacing it with an ephemeral runner"
-      docker rm -f "$name" >/dev/null
-      docker volume rm "$name-work" >/dev/null 2>&1 || true
-    fi
+    # A runner started otherwise (before ephemeral runners, or with other options) is replaced
+    # once idle, never mid-job, with its old work volume if it had one.
+    while exists "$name" && [ "$(label "$name" zephyr.runner)" != "$kind" ]; do
+      if [ "$(state "$name" | cut -d' ' -f2)" != true ] && unregister "$name"; then
+        echo "replacing it"
+        docker rm -f "$name" >/dev/null
+        docker volume rm "$name-work" >/dev/null 2>&1 || true
+        break
+      fi
+      echo "waiting for $name to finish its job"
+      sleep 10
+    done
     systemctl --user enable --now "zephyr-runner@$i"
-    for _ in $(seq 30); do
-      [ "$(state "$name" | cut -d' ' -f1)" = online ] && { echo "$name is online"; continue 2; }
+    for _ in $(seq 60); do
+      [ "$(state "$name" | cut -d' ' -f1)" = online ] && exists "$name" &&
+        [ "$(label "$name" zephyr.runner)" = "$kind" ] && { echo "$name is online"; continue 2; }
       sleep 2
     done
     die "$name did not come online; see: journalctl --user -u zephyr-runner@$i"
@@ -150,7 +231,7 @@ down() {
   step "removing $builder and $net"
   docker rm -f "$builder" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  echo "done. The BuildKit cache stays; delete it with: docker volume rm $cache"
+  echo "done. The BuildKit cache and certificates stay; delete them with: docker volume rm $cache; rm -r $tls"
 }
 
 usage="usage: deploy/runner/start.sh up [N] | down | serve I"

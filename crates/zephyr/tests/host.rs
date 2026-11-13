@@ -4731,6 +4731,41 @@ fn the_local_runners_take_one_job_each() {
     let run = &run[..run.find(">/dev/null").unwrap()];
     assert!(!run.contains(" -v ") && !run.contains("--restart"), "{run}");
     assert!(runner.contains("Restart=always"), "{runner}");
+    // No capability but the one switch to the runner user, no-new-privileges, no sudo.
+    for want in [
+        "--cap-drop ALL --cap-add SETUID --cap-add SETGID",
+        "--security-opt no-new-privileges",
+        "exec setpriv --reuid=runner",
+    ] {
+        assert!(run.contains(want), "{want}: {run}");
+    }
+    assert!(!runner.contains("sudo rm"), "{runner}");
+    // A failed login stops before a container is made, and backs off.
+    let token = runner
+        .find("t=$(token registration-token) || failed")
+        .unwrap();
+    assert!(token < runner.find("docker run -d --rm --name \"$name\"").unwrap());
+}
+
+/// zephyr-buildkitd answers only image.yml: its client certificate is a repo secret no other
+/// workflow names, and the daemon starts with TLS and its process sandbox.
+#[test]
+fn only_the_image_workflow_can_use_the_local_builder() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let yml = read(&path);
+        let image = path.ends_with("image.yml");
+        assert_eq!(yml.contains("secrets.BUILDKIT_"), image, "{path:?}");
+    }
+    let image = read(&root.join(".github/workflows/image.yml"));
+    for want in ["cacert=", "cert=", "key=", "servername=zephyr-buildkitd"] {
+        assert!(image.contains(want), "{want}");
+    }
+    let runner = read(&root.join("deploy/runner/start.sh"));
+    assert!(runner
+        .contains("--tlscacert /certs/ca.pem --tlscert /certs/cert.pem --tlskey /certs/key.pem"));
+    assert!(!runner.contains("--oci-worker-no-process-sandbox"));
 }
 
 /// release.sh refuses a version that is not above Cargo.toml's before it tests anything, and pushes

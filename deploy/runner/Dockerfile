@@ -33,6 +33,9 @@ RUN set -e; cd /tmp \
 # The base image leaves the home world-writable; a test checks that no folder above its temp dir
 # (RUNNER_TEMP, under it) is, as on GitHub's runners.
 RUN chmod 755 /home/runner
+# No sudo for jobs: the base image's runner is in group sudo with no password. start.sh also runs
+# the container with no-new-privileges, under which sudo cannot work at all.
+RUN gpasswd -d runner sudo
 USER runner
 # Each container serves one job and is removed (start.sh): the target dir, the cargo registry and
 # everything else a job writes go with it.

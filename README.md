@@ -1376,7 +1376,7 @@ before it pushes, and tags `:<version>` and `:latest`. It runs on GitHub-hosted 
 this machine's runner (below, building on its rootless BuildKit, without the smoke test) when
 `ZEPHYR_CI=local` or GitHub refused a hosted job in the last 6 hours. If the image run itself is
 refused for minutes, `gh run rerun <id>` (the whole run, not `--failed`) plans again and builds
-here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
+here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it; `-f local=true` builds it here.
 
 ### CI
 
@@ -1413,16 +1413,26 @@ takes one job, and its container is removed when it exits; systemd user unit `ze
 (which `up` installs, running a copy of the script in `~/.local/share/zephyr-runner/`) starts a
 fresh one from the image. No volume is mounted, so the checkout, the cargo registry and target dir,
 the home and anything a job's code wrote there go with its container, and the next job cannot run
-what an earlier one left behind. The cost is a cold build in every job. Run `up` again after
-changing the Dockerfile or the limits: each slot's next job uses them. A runner from before this
-(with its `zephyr-runner-<i>-work` volume) is unregistered once idle, never mid-job, and replaced,
-and its volume removed. `deploy/runner/start.sh down` stops the units and unregisters the runners.
-On zephyr-local's BuildKit a release (a `v*` tag) builds with no cache, so a branch's build cannot
-reach it. The runners register with `yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a
-fork. They and the
-rootless BuildKit sit on their own Docker network with no Docker socket, no access to the host's
-files and no route to its localhost; services the host serves on all interfaces (SSH, ComfyUI,
-...) are still reachable.
+what an earlier one left behind. The cost is a cold build in every job. A job runs as the runner
+user with no capabilities, no-new-privileges and no sudo. Run `up` again after changing the
+Dockerfile or the limits: each slot's next job uses them, and a runner started otherwise (or one
+from before ephemeral runners, with its `zephyr-runner-<i>-work` volume) is unregistered once
+idle, never mid-job, and replaced. `deploy/runner/start.sh down` stops the units and unregisters
+the runners. `up` turns on linger (or says the command), so the units outlive a logout. The units
+reach GitHub with `gh`'s own login (`~/.config/gh/hosts.yml`); if `gh` keeps it in a keyring a
+user service cannot reach, put `GH_TOKEN=<token>` in `~/.config/zephyr-runner/env` (mode 0600). A
+failed login or registration retries after 20 s, doubling up to 10 min.
+
+The rootless BuildKit (`zephyr-buildkitd`) answers only a client with the certificate `up` makes
+(mTLS; the CA and keys in `~/.config/zephyr-runner/buildkit/`, 0700) and stores as repo secrets
+`BUILDKIT_CA`, `BUILDKIT_CERT` and `BUILDKIT_KEY`, which `image.yml` alone reads. A test job on
+the same network can reach the daemon but not use it. Each build step runs in its own process
+namespace (BuildKit's sandbox). A release (a `v*` tag) built here uses no cache at all, so what a
+branch's image build left in the cache never reaches a release. The runners register with
+`yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a fork. They and the rootless BuildKit
+sit on their own Docker network with no Docker socket, no access to the host's files and no route
+to its localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still
+reachable.
 
 ### Keeping rpi current
 
