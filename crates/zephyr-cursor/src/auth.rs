@@ -240,17 +240,21 @@ fn client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// Attribution: `ullage-api.rs` (`is_secure_or_loopback`).
-pub(crate) fn is_secure_or_loopback(url: &reqwest::Url) -> bool {
+fn is_secure_or_loopback(url: &reqwest::Url) -> bool {
     let secure = url.scheme() == "https" && url.host().is_some();
     let loopback = url.scheme() == "http"
-        && url.host_str().is_some_and(|host| {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
+        && url
+            .host_str()
+            .is_some_and(|host| loopback_host(host.trim_start_matches('[').trim_end_matches(']')));
     secure || loopback
+}
+
+/// `localhost` or a loopback address, without brackets.
+pub(crate) fn loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// How long the token stays usable, read from the JWT payload's `exp`. The signature is not

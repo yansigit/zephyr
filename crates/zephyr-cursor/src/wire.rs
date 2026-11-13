@@ -859,14 +859,15 @@ pub fn endpoint() -> anyhow::Result<String> {
 }
 
 /// The agent URL, refusing one that would put the bearer token on the wire in clear: plain http
-/// only to a loopback address (the test server), as `auth::base` does.
+/// only to a loopback address (the test server), as `auth::base` does. Read with the transport's
+/// own parser, so the host checked is the host connected to.
 fn agent_url(over: Option<String>) -> anyhow::Result<String> {
     let Some(raw) = over else {
         return Ok("https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run".into());
     };
-    let url = reqwest::Url::parse(raw.trim())
+    let target = crate::transport::Target::parse(&raw)
         .map_err(|_| anyhow::anyhow!("CURSOR_AGENT_URL is not a valid URL"))?;
-    if !crate::auth::is_secure_or_loopback(&url) {
+    if !target.tls && !crate::auth::loopback_host(&target.host) {
         anyhow::bail!("CURSOR_AGENT_URL must be https or a loopback address");
     }
     Ok(raw)
@@ -949,6 +950,9 @@ mod tests {
         for bad in [
             "http://agent.example/Run",
             "http://10.0.0.1/Run",
+            // The URL parser reads these hosts as 127.0.0.1; the transport would not.
+            "http://127.0.0.1\\@evil.example/Run",
+            "http://127.0.0.1#@evil.example/Run",
             "not a url",
         ] {
             assert!(agent_url(Some(bad.into())).is_err(), "{bad}");
