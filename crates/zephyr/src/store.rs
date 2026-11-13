@@ -5,7 +5,7 @@ use crate::config::Budget;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -299,6 +299,7 @@ fn revert_row(r: &rusqlite::Row) -> rusqlite::Result<Revert> {
         at: r.get(2)?,
         since: r.get(3)?,
         channel: r.get(4)?,
+        set_to: r.get(5)?,
     })
 }
 
@@ -709,7 +710,9 @@ fn action_row(r: &rusqlite::Row) -> rusqlite::Result<Action> {
 }
 
 /// A time limit's end: `key` goes back to `value` (`None`: unset) at `at`. `since` is when the
-/// limit was set and `channel` where, so whoever set it is told how long it was.
+/// limit was set and `channel` where, so whoever set it is told how long it was. `set_to` is
+/// what the timed change set, as `/settings` shows it (`none`: unset): a key that holds anything
+/// else by then was changed since, and is not put back. `None` on a row from before v22.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revert {
     pub key: String,
@@ -717,6 +720,7 @@ pub struct Revert {
     pub at: i64,
     pub since: i64,
     pub channel: Option<String>,
+    pub set_to: Option<String>,
 }
 
 /// One entry of the activity record (DESIGN §4.19): `src` is the table it came from and `id` its
@@ -1235,6 +1239,13 @@ impl Store {
                     text TEXT NOT NULL, held_fact TEXT);
                  CREATE INDEX call_lines_call ON call_lines(call);
                  PRAGMA user_version = 21;",
+            )?;
+        }
+        if version < 22 {
+            // What a timed change set, so its end never undoes a later change (DESIGN §4.17).
+            db.execute_batch(
+                "ALTER TABLE setting_reverts ADD COLUMN set_to TEXT;
+                 PRAGMA user_version = 22;",
             )?;
         }
         // A database made by a build that has the token broker (DESIGN §4.21): its remote
@@ -1917,9 +1928,9 @@ impl Store {
     /// Schedules `r`, replacing any earlier revert for its key.
     pub fn set_revert(&self, r: &Revert) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT OR REPLACE INTO setting_reverts(key, value, at, since, channel)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![r.key, r.value, r.at, r.since, r.channel],
+            "INSERT OR REPLACE INTO setting_reverts(key, value, at, since, channel, set_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![r.key, r.value, r.at, r.since, r.channel, r.set_to],
         )?;
         Ok(())
     }
@@ -1928,7 +1939,7 @@ impl Store {
     pub fn revert(&self, key: &str) -> rusqlite::Result<Option<Revert>> {
         self.db
             .query_row(
-                "SELECT key, value, at, since, channel FROM setting_reverts WHERE key = ?1",
+                "SELECT key, value, at, since, channel, set_to FROM setting_reverts WHERE key = ?1",
                 params![key],
                 revert_row,
             )
@@ -1945,7 +1956,7 @@ impl Store {
     /// The reverts at or before `now`, oldest first. They stay until `drop_revert`.
     pub fn due_reverts(&self, now: i64) -> rusqlite::Result<Vec<Revert>> {
         let mut stmt = self.db.prepare(
-            "SELECT key, value, at, since, channel FROM setting_reverts WHERE at <= ?1
+            "SELECT key, value, at, since, channel, set_to FROM setting_reverts WHERE at <= ?1
              ORDER BY at, key",
         )?;
         let rows = stmt.query_map(params![now], revert_row)?;
@@ -5223,6 +5234,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V22: &str = "ALTER TABLE setting_reverts DROP COLUMN set_to;";
         const V21: &str = "DROP TABLE calls; DROP TABLE call_lines;";
         const V20: &str = "DROP TABLE cards; DROP TABLE payments;";
         const V19: &str = "ALTER TABLE inbox DROP COLUMN derived;";
@@ -5255,6 +5267,7 @@ mod tests {
             (18, ""),
             (19, ""),
             (20, ""),
+            (21, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -5267,8 +5280,9 @@ mod tests {
             let v18 = if version < 18 { V18 } else { "" };
             let v19 = if version < 19 { V19 } else { "" };
             let v20 = if version < 20 { V20 } else { "" };
+            let v21 = if version < 21 { V21 } else { "" };
             db.execute_batch(&format!(
-                "{V21} {v20} {v19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
+                "{V22} {v21} {v20} {v19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
             ))
             .unwrap();
             drop(db);
@@ -5585,6 +5599,7 @@ mod tests {
             at,
             since: at - 10,
             channel: Some("chat".into()),
+            set_to: Some("3".into()),
         }
     }
 

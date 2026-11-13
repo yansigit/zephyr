@@ -282,20 +282,15 @@ fn valid(doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
         .context("zephyr.toml would not load; nothing saved")
 }
 
-/// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
+/// Writes `preset` as `/approvals PRESET` does (D11, `settings::edit_doc`): the preset, and
 /// every hand-set class looser than it cleared, so a re-run of `init --preset manual` never
 /// leaves a looser class behind.
-pub(super) fn write_preset(
+fn write_preset(
     doc: &mut toml_edit::DocumentMut,
     preset: crate::approvals::Preset,
 ) -> anyhow::Result<()> {
-    let cfg: crate::config::Config =
-        toml::from_str(&doc.to_string()).context("reading zephyr.toml")?;
-    for (key, value) in crate::approvals::preset_edits(&cfg, preset) {
-        let value = value.map(toml_edit::Value::from);
-        crate::settings::write(doc, &key, value.as_ref())?;
-    }
-    Ok(())
+    let edit = crate::settings::Edit::default();
+    crate::settings::edit_doc(doc, "approvals.preset", preset.name(), &edit).map(drop)
 }
 
 /// The preset to start in (approvals spec §4.10), then the private facts. A config that already

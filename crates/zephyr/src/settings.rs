@@ -1350,6 +1350,74 @@ pub fn write(doc: &mut DocumentMut, key: &str, value: Option<&Value>) -> anyhow:
     Ok(())
 }
 
+/// What `edit_doc` needs besides the file and the value.
+#[derive(Default)]
+pub struct Edit<'a> {
+    /// The account the daemon runs: `/model` moves its model, else the first on that provider.
+    pub active: Option<&'a str>,
+    /// The end of a timed preset: the value is the `[approvals]` snapshot it puts back.
+    pub restore: bool,
+    /// R31: the class time limits pending (each key and the value it would put back), which an
+    /// owner's preset ends as it changes or clears them.
+    pub limits: &'a [(String, Option<String>)],
+}
+
+/// What a preset's edit leaves for its time limits: `before`, all of `[approvals]` it replaced
+/// (with each ended limit's class as that limit would have put it back), and the limits `ended`.
+#[derive(Debug, Default)]
+pub struct Edited {
+    pub before: Option<String>,
+    pub ended: Vec<String>,
+}
+
+/// The one edit of `zephyr.toml` for a registered setting, as the daemon's `set_setting` makes
+/// it and `zephyr config set` makes it with the daemon down: `raw` read by the setting's kind
+/// (`none` clears an optional one), a connector's rows in its `[[mcp]]` table, `model` on the
+/// account (`reload::set_model`), a preset with the hand-set classes looser than it dropped.
+/// Pure: the checks of who may change it are the caller's.
+pub fn edit_doc(doc: &mut DocumentMut, key: &str, raw: &str, e: &Edit) -> anyhow::Result<Edited> {
+    let s = find(key).ok_or_else(|| anyhow::anyhow!("no setting {key}"))?;
+    let raw = raw.trim();
+    let value = || match clears(s, raw) {
+        true => Ok(None),
+        false => parse(s, raw)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!(e.replace(s.key, key))),
+    };
+    match s.apply {
+        Apply::Toml => write(doc, key, value()?.as_ref())?,
+        Apply::Model => {
+            value()?;
+            crate::reload::set_model(doc, e.active, raw)?;
+        }
+        Apply::Preset => {
+            let now: crate::config::Config = toml::from_str(&doc.to_string())?;
+            let edits = match e.restore {
+                true => crate::approvals::restore_edits(&now, raw).map_err(anyhow::Error::msg)?,
+                false => {
+                    let preset = (value()?.map(|v| text(&v)))
+                        .ok_or_else(|| anyhow::anyhow!("no preset to set"))?;
+                    let p = crate::approvals::Preset::parse(&preset).map_err(anyhow::Error::msg)?;
+                    crate::approvals::preset_edits(&now, p)
+                }
+            };
+            let ends: Vec<(String, Option<String>)> = (e.limits.iter())
+                .filter(|(k, _)| edits.iter().any(|(e, _)| e == k))
+                .cloned()
+                .collect();
+            for (key, v) in edits {
+                write(doc, &key, v.map(Value::from).as_ref())?;
+            }
+            return Ok(Edited {
+                before: Some(crate::approvals::snapshot_with(&now, &ends)),
+                ended: ends.into_iter().map(|(k, _)| k).collect(),
+            });
+        }
+        _ => anyhow::bail!("{key} is not in zephyr.toml: set it in a chat while zephyr runs"),
+    }
+    Ok(Edited::default())
+}
+
 /// `/set`'s argument, `KEY VALUE [for D]`, as its three parts. `None` without a value.
 pub fn set_args(arg: &str) -> Option<(&str, &str, Option<&str>)> {
     let (key, rest) = arg.trim().split_once(char::is_whitespace)?;

@@ -2192,6 +2192,40 @@ fn config_set_while_stopped_reads_a_registered_key_by_its_kind() {
     assert!(!config.contains("daily_tokens"), "{config}");
 }
 
+/// With the container stopped, `config set model` edits what `/model` edits: the model of the
+/// account on that provider, moved first, never a top-level `model` the pool ignores.
+#[test]
+fn config_set_model_while_stopped_moves_the_accounts_model() {
+    let env = Env::new("config-stopped-model");
+    env.init(&[
+        "--no-start",
+        "--account",
+        "claude-a=anthropic/claude-sonnet-5",
+        "--account",
+        "codex-a=openai-codex/gpt-5.5",
+    ]);
+    let out = env.zephyr_env(
+        &["config", "set", "model", "openai-codex/gpt-5.4"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    let accounts: Vec<(&str, &str)> = cfg["account"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["name"].as_str().unwrap(), a["model"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        accounts,
+        [
+            ("codex-a", "openai-codex/gpt-5.4"),
+            ("claude-a", "anthropic/claude-sonnet-5")
+        ]
+    );
+    assert!(cfg.get("model").is_none(), "{cfg}");
+}
+
 /// A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`) live in its `[[mcp]]` table:
 /// with the container stopped the host edits that table, checked as the daemon would.
 #[test]

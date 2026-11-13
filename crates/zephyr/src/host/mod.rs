@@ -1474,25 +1474,13 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         eprintln!("warn: {key} is not a known setting; saved without checking");
                     }
                     let was = toml::from_str::<crate::config::Config>(&doc.to_string()).ok();
-                    // A registered key is read by its kind as `/set` reads it (a time stays a
-                    // string, a list a list, `none` clears); a connector's rows are found in its
-                    // `[[mcp]]` table by name; a preset drops the looser hand-set classes.
-                    use crate::settings::Apply;
+                    // A registered key gets the daemon's own edit (`settings::edit_doc`); a time
+                    // limit it set and this changes is not put back (`Router::revert_due`).
                     match crate::settings::find(key) {
-                        Some(s) if s.apply == Apply::Preset => {
-                            let p = crate::approvals::Preset::parse(value)
-                                .map_err(anyhow::Error::msg)?;
-                            setup::write_preset(&mut doc, p)?;
+                        Some(_) => {
+                            let edit = crate::settings::Edit::default();
+                            crate::settings::edit_doc(&mut doc, key, value, &edit)?;
                         }
-                        Some(s) if crate::settings::clears(s, value) => {
-                            crate::settings::write(&mut doc, key, None)?
-                        }
-                        Some(s) if matches!(s.apply, Apply::Toml | Apply::Model) => {
-                            let parsed = crate::settings::parse(s, value)
-                                .map_err(|e| anyhow::anyhow!("{}", e.replace(s.key, key)))?;
-                            crate::settings::write(&mut doc, key, Some(&parsed))?;
-                        }
-                        Some(_) => bail!("{key} is set in a chat while zephyr runs"),
                         None => conf::set(&mut doc, key, value)?,
                     }
                     // Refuse what the daemon would refuse (unknown keys, a bad time zone, one

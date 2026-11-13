@@ -4346,6 +4346,54 @@ async fn a_timed_preset_goes_back_to_the_whole_set() {
     gw.shutdown().await;
 }
 
+/// A timed change that something else changed since (`zephyr config set` with the daemon
+/// down, a hand edit) is not put back when its time ends: the revert would undo the later
+/// change, here loosening `manual` back to `semi`.
+#[tokio::test]
+async fn a_timed_change_changed_since_is_not_put_back() {
+    let home = home("approvals-superseded");
+    let mut cfg = on_file(&home, "[approvals]\npreset = \"semi\"");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    wait(10, || !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/approvals full for 1h").await;
+    let timed = gw.wait_replies(1).await.remove(0);
+    assert!(
+        timed.starts_with("[zephyr] approvals.preset semi → full until "),
+        "{timed}"
+    );
+    gw.shutdown().await;
+    // With the daemon down the owner sets manual; then the hour is over.
+    let path = home.join("zephyr.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("preset = \"full\"", "preset = \"manual\""),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute("UPDATE setting_reverts SET since = since - at, at = 0", [])
+        .unwrap();
+    drop(db);
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    wait(10, || !gw.replies().is_empty()).await;
+    assert_eq!(
+        gw.replies()[0],
+        "[zephyr] approvals.preset stays manual: it was changed after the 1h you set, so it \
+         does not go back"
+    );
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(
+        zephyr::approvals::effective(&cfg).line(),
+        "preset manual · messages ask · posts ask · money ask · facts hold"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.due_reverts(i64::MAX).unwrap().is_empty(), "dropped");
+    gw.shutdown().await;
+}
+
 /// The agent reads the modes with `gateway "/approvals"`, tightens a class at once and proposes
 /// a loosening, which needs a strong channel to approve.
 #[tokio::test]
@@ -7870,7 +7918,7 @@ fn old_install(home: &Path) {
     )
     .unwrap();
     db.execute_batch(&format!(
-        "DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments; ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
+        "ALTER TABLE setting_reverts DROP COLUMN set_to; DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments; ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
     ))
         .unwrap();
 }
@@ -8969,7 +9017,7 @@ async fn an_upgraded_install_is_told_of_the_payment_window_once() {
     db.execute_batch(
         "INSERT INTO inbox(channel, platform_msg_id, sender, text, status, sent_as)
          VALUES ('chat', 'old', 'owner', 'earlier', 'done', 'prompt');
-         DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments;
+         ALTER TABLE setting_reverts DROP COLUMN set_to; DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments;
          DELETE FROM meta WHERE key = 'window.notice';
          PRAGMA user_version = 19;",
     )

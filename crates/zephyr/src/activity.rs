@@ -809,6 +809,7 @@ mod tests {
             at,
             since: at - 3600,
             channel: Some("chat".into()),
+            set_to: None,
         }
     }
 
