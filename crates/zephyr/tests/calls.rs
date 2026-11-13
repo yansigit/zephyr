@@ -216,6 +216,7 @@ impl Gateway {
             sender: "owner".into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         self.say.send(m).await.unwrap();
     }

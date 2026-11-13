@@ -12,6 +12,10 @@ pub struct Inbound {
     /// `voice` when `inbox::append` added a transcript to `text` (DESIGN §4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<String>,
+    /// When the platform says it was sent (unix seconds), on a row read back after the
+    /// adapter was away (a backfill); `None` on one that came live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
 }
 
 /// A reply to send. `client_id` lets the platform drop a retried duplicate.

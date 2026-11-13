@@ -628,6 +628,7 @@ fn sort(u: Update) -> Sorted {
         sender: from.id.to_string(),
         text,
         derived: None,
+        sent_at: None,
     };
     Sorted::Row(row, docs, name(&from))
 }
@@ -686,6 +687,7 @@ mod tests {
                 sender: "55".into(),
                 text: "hi".into(),
                 derived: None,
+                sent_at: None,
             }
         );
         assert!(docs.is_empty());

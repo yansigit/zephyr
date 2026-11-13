@@ -714,6 +714,7 @@ impl Conn {
                 sender: "token".into(),
                 text,
                 derived: None,
+                sent_at: None,
             };
             // zephyr's words, not the owner's: never through `inbound`, which marks the owner's.
             let _ = self.router.send(AttachRequest::Notice(m)).await;
@@ -1026,6 +1027,7 @@ impl Conn {
             sender: sender(self.channel).into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         let sent = match cmd["followUp"] == true {
             true => self.router.send(AttachRequest::FollowUp(m)).await.is_ok(),

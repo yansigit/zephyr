@@ -257,6 +257,7 @@ impl Gateway {
                 sender: "owner".into(),
                 text: text.into(),
                 derived: None,
+                sent_at: None,
             })
             .await
             .unwrap();
@@ -734,6 +735,7 @@ async fn a_channel_pastes_the_callback_into_its_own_oauth_login() {
             sender: sender.into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         let feed = feed.clone();
         async move { feed.send(msg).await.unwrap() }
@@ -842,6 +844,7 @@ async fn login_cancel_stops_a_sign_in_whose_url_was_posted() {
                 sender: "owner".into(),
                 text,
                 derived: None,
+                sent_at: None,
             };
             async move { feed.send(msg).await.unwrap() }
         };
@@ -898,6 +901,7 @@ async fn login_from_a_channel() {
             sender: "owner".into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         })
         .await
         .unwrap();

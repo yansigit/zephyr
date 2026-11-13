@@ -258,6 +258,24 @@ fn markdown(session: &str, messages: &[Value]) -> String {
     out
 }
 
+/// A backfilled command older than this is not carried out (`stale`).
+const STALE_AFTER: i64 = 10 * 60;
+
+/// The text of a row read back after its adapter was away (`Inbound::sent_at`), sent over
+/// `STALE_AFTER` ago, that is a command which must never run late: an approval, a refusal, a
+/// stop, a pause or a vault grant (DESIGN §4.3). It is stored, and the owner told.
+fn stale(m: &Inbound) -> Option<&str> {
+    let at = m.sent_at?;
+    let text = m.text.trim();
+    let mut words = text.split_whitespace();
+    let late = match words.next()? {
+        "/ok" | "/no" | "/stop" | "/pause" => true,
+        "/vault" => words.next() == Some("grant"),
+        _ => false,
+    };
+    (late && crate::now() - at > STALE_AFTER).then_some(text)
+}
+
 /// How long a reply may be retried: only as long as the platform still dedupes the client id
 /// (or, without one, the adapter remembers what it delivered: `channel::Delivered`).
 pub fn retry_window(channel: &str) -> i64 {
@@ -1930,6 +1948,7 @@ impl<'a> Router<'a> {
             sender: crate::attach::sender(crate::attach::rows(channel)).into(),
             text: text.clone(),
             derived: None,
+            sent_at: None,
         };
         // The caller has decided who may approve here: a signature, or (the notification's
         // button, the TUI) what that client may do unsigned.
@@ -2190,6 +2209,24 @@ impl<'a> Router<'a> {
         }
         if after {
             log(self.store.deliver_after(id).map_err(Into::into));
+        }
+        if let Some(command) = stale(&m) {
+            let mins = (crate::now() - m.sent_at.unwrap_or_default()) / 60;
+            let reply = format!(
+                "[zephyr] skipped {command}: it was sent {mins} min ago and reached zephyr only \
+                 now; send it again if you still mean it"
+            );
+            let row = InboxRow {
+                id,
+                channel: m.channel,
+                sender: m.sender,
+                text: m.text,
+                tries: 0,
+                platform_id: m.platform_msg_id,
+                owner: true,
+                derived: None,
+            };
+            return log(self.store.reply(&row, &reply, "done").map_err(Into::into));
         }
         // A row that holds a transcript is never a command, whatever its typed caption says:
         // `/job add`, `/task`, `/btw` and the like would carry the transcript under the caption
@@ -5478,6 +5515,7 @@ impl<'a> Router<'a> {
                 sender: row.sender.clone(),
                 text: row.text.clone(),
                 derived: None,
+                sent_at: None,
             };
             match self.store.insert_inbox(&again) {
                 Ok(Some(id)) => break id,
@@ -6057,6 +6095,7 @@ mod tests {
             sender: "owner".into(),
             text: format!("/ok {id}"),
             derived: None,
+            sent_at: None,
         };
         r.inbound(m, false, None).await;
         let sent = r.store.pending_outbox().unwrap();
@@ -6248,6 +6287,7 @@ mod tests {
             sender: "owner".into(),
             text: "in flight".into(),
             derived: None,
+            sent_at: None,
         };
         let id = r.store.insert_inbox(&m).unwrap().unwrap();
         r.store.mark_dispatched_as(id, "prompt").unwrap();

@@ -131,6 +131,8 @@ struct Message {
     associated_message_guid: Option<String>,
     item_type: Option<i64>,
     attachments: Option<Vec<Attachment>>,
+    /// When it was sent, unix milliseconds.
+    date_created: Option<i64>,
 }
 
 /// A file on a message, fetched from `/api/v1/attachment/{guid}/download`.
@@ -196,6 +198,7 @@ fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
         sender: handle.address,
         text,
         derived: None,
+        sent_at: None,
     };
     Some((inbound, files))
 }
@@ -216,7 +219,9 @@ async fn backfill(this: &IMessage, tx: &mpsc::Sender<Inbound>) -> anyhow::Result
         let Ok(m) = serde_json::from_value::<Message>(raw) else {
             continue;
         };
-        if let Some((inbound, files)) = message_to_inbound(m) {
+        let sent_at = m.date_created.map(|ms| ms / 1000);
+        if let Some((mut inbound, files)) = message_to_inbound(m) {
+            inbound.sent_at = sent_at;
             if tx
                 .send(this.with_files(inbound, files).await)
                 .await
@@ -610,6 +615,7 @@ mod tests {
                 sender: "+15551234567".into(),
                 text: "hello from my phone".into(),
                 derived: None,
+                sent_at: None,
             }
         );
     }
@@ -875,7 +881,10 @@ mod tests {
         let after = json["after"].as_u64().unwrap();
         assert!(before - day <= after && after <= crate::unix_millis() as u64 - day);
 
-        assert_eq!(rx.recv().await.unwrap().platform_msg_id, "AAAA-older");
+        let older = rx.recv().await.unwrap();
+        assert_eq!(older.platform_msg_id, "AAAA-older");
+        // Marked with when it was sent (`dateCreated`), so a stale command is not carried out.
+        assert_eq!(older.sent_at, Some(1_798_000_000));
         assert_eq!(rx.recv().await.unwrap().platform_msg_id, "BBBB-newer");
     }
 

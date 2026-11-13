@@ -144,6 +144,7 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
         sender: "owner".into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     let replies = |n: usize| {
         let channel = channel.clone();
@@ -245,6 +246,7 @@ async fn a_missing_extension_does_not_stop_the_child() {
         sender: "owner".into(),
         text: "ping".into(),
         derived: None,
+        sent_at: None,
     })
     .await
     .unwrap();
@@ -308,6 +310,7 @@ async fn real_rpi_keeps_a_conversation_clean_across_runs_and_a_restart() {
         sender: "owner".into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     let replies = |n: usize| {
         let channel = channel.clone();
@@ -430,6 +433,7 @@ async fn real_rpi_fails_over_to_the_next_account() {
         sender: "owner".into(),
         text: "ping".into(),
         derived: None,
+        sent_at: None,
     })
     .await
     .unwrap();
@@ -514,6 +518,7 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
         sender: "owner".into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     let replies = |n: usize| {
         let channel = channel.clone();
@@ -647,6 +652,7 @@ async fn real_rpi_undo_retry_and_compact() {
         sender: "owner".into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     let replies = |n: usize| {
         let channel = channel.clone();

@@ -170,6 +170,7 @@ fn to_inbound(env: &Value, account: &str, own: Option<&str>) -> Option<(Inbound,
         sender: from.into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     Some((row, files))
 }

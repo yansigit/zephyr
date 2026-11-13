@@ -211,6 +211,7 @@ pub fn to_inbound(
         sender: author_id.to_string(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     })
 }
 
@@ -255,7 +256,9 @@ impl Handler {
             let mut page = dm.id.messages(http, ask).await?;
             page.sort_by_key(|m| m.id);
             for msg in &page {
-                if let Some(inbound) = self.inbound(msg).await {
+                if let Some(mut inbound) = self.inbound(msg).await {
+                    // Read back, so a stale command is not carried out (`router::stale`).
+                    inbound.sent_at = Some(msg.timestamp.unix_timestamp());
                     self.tx.send(inbound).await?;
                 }
             }
@@ -457,6 +460,7 @@ mod tests {
                 sender: "222".into(),
                 text: "hi".into(),
                 derived: None,
+                sent_at: None,
             }
         );
     }
@@ -683,6 +687,7 @@ mod tests {
             "GET /api/v10/channels/77/messages?&limit=100&after=100"
         );
         let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .inspect(|m| assert_eq!(m.sent_at, Some(1_793_437_964), "when it was sent"))
             .map(|m| (m.platform_msg_id, m.text))
             .collect();
         assert_eq!(
