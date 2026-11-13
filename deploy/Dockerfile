@@ -381,7 +381,12 @@ RUN ln -s /opt/zephyr/camoufox/camoufox-python /usr/local/bin/camoufox-python \
     && mkdir -p /opt/zephyr/gate/bin \
     && chmod 755 /opt/zephyr/libexec /opt/zephyr/gate /opt/zephyr/gate/bin \
     && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/agent-browser \
-    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/xdotool
+    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/xdotool \
+    && groupadd --gid 65533 zephyr-call \
+    && useradd --uid 65533 --gid 65533 --no-create-home --home-dir /nonexistent \
+       --shell /usr/sbin/nologin zephyr-call
+# zephyr-call (above): the uid a local phone call's whisper-server and Piper run as (DESIGN
+# §4.26), beside nobody's voice notes; no shell, no home, and no network under the floor.
 # The token broker's CA (DESIGN §4.21) is made when a container starts, so the image only says
 # where it will be: Camoufox installs the certificate its policies name (Chromium takes it from
 # the agent's NSS store, with certutil from libnss3-tools; everything else from the system bundle).

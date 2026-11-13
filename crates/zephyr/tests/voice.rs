@@ -347,6 +347,7 @@ async fn the_images_binaries_hear_what_piper_says() {
     // Safety: geteuid cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         assert_eq!(voice::uid().await, Some(voice::NOBODY));
+        assert_eq!(voice::call_uid().await, Some(voice::CALL_UID));
     }
     // A Korean sample, when one is beside the fakes (and its words in `ko.txt`).
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");

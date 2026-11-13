@@ -50,6 +50,14 @@ pub async fn gone(home: &Path, file: &str) {
     panic!("{file}: the process is still there: {:?}", stat());
 }
 
+/// Whether the process whose pid the fake wrote to `file` runs now: not gone, not a zombie.
+#[allow(dead_code)]
+pub fn running(home: &Path, file: &str) -> bool {
+    let pid = std::fs::read_to_string(home.join("voice").join(file)).unwrap();
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+    stat.is_ok_and(|s| !s.contains(") Z ") && !s.contains(") X "))
+}
+
 /// The hash the fakes log for `bytes`.
 #[allow(dead_code)]
 pub fn sha256(bytes: &[u8]) -> String {

@@ -225,7 +225,11 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   saved in `inbox/`, and marks the row `derived = "voice"` (schema v19), which taints main's
   conversation at dispatch; the transcript line starts with `[`, so speech is never a command. The
   real binaries' argv and output shapes are in `decode_args`, `whisper_args`, `detected`,
-  `piper_args` and `encode_args` alone: change them with the fakes.
+  `piper_args`, `encode_args`, `server_args`, `PIPER_LINES` and `ask_ear` (the multipart request
+  to whisper-server and the reading of its reply) alone: change them with the fakes. A local
+  phone call's warm whisper-server and Piper (`voice::Call`, DESIGN §4.26) run as uid 65533
+  (`zephyr-call`, `CALL_UID`) with a turn and a sweep of their own, so a voice note never waits
+  on a call.
 - Desktop takeover (DESIGN §4.3.3, §4.11): `desktop::Control` is the one lock the owner's takeover
   and the vault's fill share; a take writes root's `<state>-public/desktop-held`, and the
   `agent-browser` and `xdotool` wrappers (`browser_gate::held`, `xdotool` dispatched on `argv[0]`

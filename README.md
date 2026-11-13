@@ -709,8 +709,8 @@ reads it as two lines under your caption, if you typed one:
   approves nothing, so approvals stay typed. A command typed as a voice note's caption is not
   run either (the whole message goes to the agent): send the command as a message of its own.
 - A note longer than `voice.max_secs` (300) is saved but not transcribed. One note is
-  transcribed at a time; a minute of speech takes about 11 s on CPU. During a phone call with
-  `calls.speech = local` the voice is the call's, so a voice note waits for the call to end.
+  transcribed at a time; a minute of speech takes about 11 s on CPU. A phone call with
+  `calls.speech = local` has a voice of its own, so a note sent during one is heard at once.
 - A conversation that took in a voice note is no longer yours alone: with `memory.auto owner`,
   its memory changes wait for `/memory ok` until `/new`.
 - Settings (`[voice]` in `zephyr.toml`, or `/set`): `voice.transcribe` (`true`),
@@ -756,7 +756,7 @@ what is said as it is said.
   and speaks zephyr's lines, quickly, and so hears the call. Every line still passes through
   zephyr as text first. `/set calls.speech local` keeps speech on this machine (whisper and
   Piper: English, Korean with `KO_VOICE=1`, no French). Each call keeps its own whisper and Piper
-  loaded, so a turn takes about 1.7 s on a quiet machine, before the model's own time.
+  loaded, so a turn takes about 1.7 to 1.9 s on a quiet machine, before the model's own time.
 - **Nothing is recorded.** zephyr keeps no audio and never asks Telnyx to record; only the text is
   kept, for `calls.keep_days` (30). What the other party said is treated like a file someone sent
   you: the agent reads it as data, and a memory change after a call waits for `/memory ok`.

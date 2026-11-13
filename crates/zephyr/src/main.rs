@@ -993,6 +993,11 @@ async fn network_floor(cfg: &Config) -> bool {
             false,
         ),
     };
+    // The voice programs' uids get no network at all (DESIGN §4.20, §4.26).
+    match zephyr::egress::voice_refused().await {
+        Ok(()) => println!("ok   the voice programs' uids (65534, 65533) get no network"),
+        Err(e) => ok = check(&format!("{e:#}"), false),
+    }
     let files: Vec<(&str, String)> = ["tcp", "tcp6", "udp", "udp6"]
         .into_iter()
         .map(|name| {

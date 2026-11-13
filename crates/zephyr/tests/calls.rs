@@ -248,6 +248,11 @@ impl Gateway {
              now; /hangup 1 ends it"
         );
     }
+    /// The notice that call #1 is over, if it has come.
+    fn ended_yet(&self) -> Option<String> {
+        let ended = "[zephyr] call #1 to +1 416-555-0123 ";
+        self.replies().into_iter().find(|r| r.contains(ended))
+    }
     /// The notice that call #1 is over.
     async fn ended(&self) -> String {
         self.reply_with("[zephyr] call #1 to +1 416-555-0123 ")
@@ -397,8 +402,14 @@ async fn a_call_runs_from_the_ask_to_the_report() {
         "{piper:?}"
     );
     assert!(voice_fakes::ran(&gw.home, "whisper-cli").is_empty());
-    voice_fakes::gone(&gw.home, "whisper-server.pid").await;
-    voice_fakes::gone(&gw.home, "piper.pid").await;
+    assert!(
+        !voice_fakes::running(&gw.home, "whisper-server.pid"),
+        "whisper-server outlived the call's end"
+    );
+    assert!(
+        !voice_fakes::running(&gw.home, "piper.pid"),
+        "piper outlived the call's end"
+    );
     gw.shutdown().await;
 }
 
@@ -407,7 +418,8 @@ async fn a_call_runs_from_the_ask_to_the_report() {
 /// `--ignored`. The other party's sentences are the image's Piper as μ-law, played in real time
 /// with a second of silence after; the call's agent is the stand-in, which answers at once.
 /// Prints, for each turn, the end of their speech to its transcript (the endpointer's 0.7 s of
-/// silence included) and the transcript to the reply's first audio on the line.
+/// silence included) and the transcript to the reply's first audio on the line. Then, with the
+/// call still on, an owner's voice note (the image's Piper as Ogg Opus) is transcribed, timed.
 #[tokio::test]
 #[ignore]
 async fn a_local_turn_with_the_real_voice() {
@@ -437,6 +449,8 @@ async fn a_local_turn_with_the_real_voice() {
         script += &format!("play {}\nwait 4\n", file.display());
     }
     std::fs::write(telnyx.dir.join("script"), script).unwrap();
+    let note = "Remind me to call the restaurant again tomorrow morning.";
+    let ogg = zephyr::voice::speak(&cfg, note, "discord").await.unwrap();
     gw.ask_and_approve().await;
     let now = || {
         let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
@@ -480,6 +494,85 @@ async fn a_local_turn_with_the_real_voice() {
         );
     }
     assert_eq!(audio.len(), them.len(), "{texts:?}");
+    // The call is still on (its script is silent now): a voice note does not wait for it.
+    assert!(gw.ended_yet().is_none(), "the call ended before the note");
+    let at = now();
+    let (heard, _) = zephyr::voice::transcribe(&cfg, &ogg).await;
+    println!(
+        "a voice note during the call: {heard:?} in {:.2} s",
+        now() - at
+    );
+    assert!(
+        matches!(heard, zephyr::voice::Heard::Said { .. }),
+        "{heard:?}"
+    );
+    assert!(
+        gw.ended_yet().is_none(),
+        "the call ended before the note was heard"
+    );
+    gw.shutdown().await;
+}
+
+/// A `/hangup` that comes while the call's voice is still waiting to start (here behind another
+/// call's, which holds the call uid's turn) ends the call there: nobody is dialled, and no
+/// whisper or Piper is started for it.
+#[tokio::test]
+async fn a_hangup_while_the_voice_warms_dials_nobody() {
+    let (gw, telnyx) = start("warming", "stream\nanswer\n", "Hello.", "", |_| {}).await;
+    let gen = gw.home.join("gen");
+    std::fs::create_dir_all(&gen).unwrap();
+    let other = zephyr::voice::Call::new(&config(&gen, 0, ""), "en");
+    other.warm().await;
+    gw.typed("m1", ASK).await;
+    gw.reply_with("[zephyr] approve #1: phone call").await;
+    gw.typed("ok", "/ok 1").await;
+    gw.reply_with("[zephyr] approved #1").await;
+    gw.typed("h1", "/hangup 1").await;
+    let ended = gw.ended().await;
+    assert!(ended.contains("by the owner (/hangup)"), "{ended}");
+    assert!(telnyx.api().is_empty(), "no dial: {:?}", telnyx.api());
+    assert!(!gw.home.join("voice/whisper-server.pid").exists());
+    drop(other);
+    gw.shutdown().await;
+}
+
+/// A voice note while a local call is on is heard at once: the call's whisper and Piper have a
+/// uid and a lock of their own (DESIGN §4.26). And a `/hangup` that comes while a note is still
+/// being transcribed ends the call then, leaving the note's run alone.
+#[tokio::test]
+async fn a_voice_note_during_a_call_is_heard_at_once() {
+    let (gw, telnyx) = start("note", "stream\nanswer\n", "Hello.", "", |_| {}).await;
+    gw.ask_and_approve().await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    assert!(voice_fakes::running(&gw.home, "whisper-server.pid"));
+    // The owner's note, through the voice code a channel's adapter runs, with fakes of its own.
+    let gen = gw.home.join("gen");
+    std::fs::create_dir_all(&gen).unwrap();
+    let cfg = config(&gen, 0, "");
+    let note = zephyr::voice::transcribe(&cfg, b"a note");
+    let (heard, _) = (tokio::time::timeout(Duration::from_secs(10), note).await)
+        .expect("the note waited for the call");
+    assert_eq!(
+        heard,
+        zephyr::voice::Heard::Said {
+            lang: "en".into(),
+            text: "hello from the fake".into()
+        }
+    );
+    assert!(voice_fakes::running(&gw.home, "whisper-server.pid"));
+    assert!(voice_fakes::running(&gw.home, "piper.pid"));
+    // A note still in whisper when the owner hangs up.
+    std::fs::write(cfg.voice_dir.join("hang"), "").unwrap();
+    let note = tokio::spawn(async move { zephyr::voice::transcribe(&cfg, b"long").await });
+    wait(120, || gen.join("voice/hang.pid").exists()).await;
+    gw.typed("h1", "/hangup").await;
+    let ended = gw.ended().await;
+    assert!(ended.ends_with("by the owner (/hangup)"), "{ended}");
+    assert!(!voice_fakes::running(&gw.home, "whisper-server.pid"));
+    assert!(!note.is_finished(), "the call's end took the note's run");
+    assert!(voice_fakes::running(&gen, "hang.pid"));
+    note.abort();
+    voice_fakes::gone(&gen, "hang.pid").await;
     gw.shutdown().await;
 }
 
@@ -489,7 +582,7 @@ async fn a_local_turn_with_the_real_voice() {
 async fn a_dropped_call_leaves_no_voice_running() {
     let (gw, telnyx) = start("dropped", "stream\nanswer\n", "Hello.", "", |_| {}).await;
     gw.ask_and_approve().await;
-    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
     let home = gw.home.clone();
     assert!(home.join("voice/whisper-server.pid").exists());
     gw.task.abort();
@@ -636,8 +729,14 @@ async fn hangup_ends_the_call_at_once() {
         .into_iter()
         .find(|r| r["path"] == "/v2/calls/fake-1/actions/hangup");
     assert_eq!(hangup.unwrap()["auth"], format!("Bearer {KEY}"));
-    voice_fakes::gone(&gw.home, "whisper-server.pid").await;
-    voice_fakes::gone(&gw.home, "piper.pid").await;
+    assert!(
+        !voice_fakes::running(&gw.home, "whisper-server.pid"),
+        "whisper-server outlived the call's end"
+    );
+    assert!(
+        !voice_fakes::running(&gw.home, "piper.pid"),
+        "piper outlived the call's end"
+    );
     gw.shutdown().await;
 }
 

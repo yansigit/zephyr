@@ -133,6 +133,22 @@ fn the_agent_reaches_only_the_proxy() {
             "{url} was not refused at once"
         );
     }
+    // The voice programs' uids, a voice note's decoders and a phone call's whisper and Piper,
+    // get no network at all: not the internet, and not even the proxy.
+    for uid in ["65534:65534", "65533:65533"] {
+        for url in ["https://1.1.1.1", "http://127.0.0.1:7792/", attach.as_str()] {
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", "-u", uid, "-w", "/", &side.container]);
+            let out = cmd.args(["curl", "-sS", "-m", "5", "--noproxy", "*", url]);
+            let out = out.output().expect("running docker");
+            assert_eq!(
+                out.status.code(),
+                Some(REFUSED),
+                "{uid} {url}: {}",
+                text(&out)
+            );
+        }
+    }
     // The same ports answer root, so the refusals above are the rules' and not a closed port.
     let root = side.root(&["curl", "-s", "-m", "5", "-o", "/dev/null", &attach]);
     assert_ne!(
@@ -191,6 +207,7 @@ fn the_agent_reaches_only_the_proxy() {
         "ok   the proxy refuses [::ffff:7f00:1]:443",
         "ok   the proxy reaches example.com:443",
         "ok   nothing of root's listens where the agent can reach it",
+        "ok   the voice programs' uids (65534, 65533) get no network",
     ] {
         assert!(doctor.contains(line), "{line}\n{doctor}");
     }
