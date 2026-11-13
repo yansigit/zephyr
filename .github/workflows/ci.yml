@@ -1,9 +1,11 @@
-# fmt, clippy, shellcheck, cargo deny and the tests on every PR and push to main, split between the
-# owner's runner (zephyr-local, deploy/runner/start.sh) and GitHub's; `ci-ok` is the one check to gate
-# merges on (README "CI"). .github/ci.sh holds the placement and the checks.
-# Variable ZEPHYR_CI: unset or `both` runs the last test shard on GitHub-hosted and the rest on
-# zephyr-local for a push to main and the nightly run, and everything on zephyr-local for a pull
-# request; `local` runs everything there, `hosted` everything on GitHub (the server is down).
+# Two checks on every PR and push to main, each compiling once: lint (shellcheck, fmt, cargo deny,
+# clippy) and test (the whole suite), on the owner's runners (zephyr-local, deploy/runner/start.sh)
+# seeded from main's last build; `ci-ok` is the one check to gate merges on (README "CI").
+# .github/ci.sh holds the placement, the checks and when none are needed (only Markdown outside the
+# code changed, or main's merge of a PR whose head passed on the same tree).
+# Variable ZEPHYR_CI: unset or `both` runs the nightly run's test on GitHub-hosted and everything
+# else on zephyr-local; `local` runs everything there, `hosted` everything on GitHub (the server is
+# down).
 # The ignored tests need the pinned rpi binary: deploy/release.sh runs them.
 name: ci
 on:
@@ -18,6 +20,11 @@ permissions:
   contents: read
   actions: read
   checks: read
+  pull-requests: read
+# A PR's newer push cancels its older run; a push to main and the nightly run are never cancelled.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
   CARGO_TERM_COLOR: never
 jobs:
@@ -27,17 +34,25 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       rescue: ${{ steps.plan.outputs.rescue }}
+      skip: ${{ steps.skip.outputs.skip }}
     steps:
+      # Depth 2: the parent (for a PR, the base its merge commit sits on) says what changed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - id: plan
         run: .github/ci.sh plan
         env:
           GH_TOKEN: ${{ github.token }}
           ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
+      - id: skip
+        run: .github/ci.sh skip
+        env:
+          GH_TOKEN: ${{ github.token }}
   check:
     needs: plan
+    if: needs.plan.outputs.skip == ''
     name: ${{ matrix.check }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -55,16 +70,16 @@ jobs:
         uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
         with:
           components: rustfmt, clippy
-      - if: runner.environment == 'github-hosted' && matrix.check != 'deny'
+      - if: runner.environment == 'github-hosted'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: ${{ matrix.check == 'lint' && 'lint' || 'test' }}
+          shared-key: ${{ matrix.check }}
       - if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest@0.9.146,cargo-deny@0.20.2
       # tests/tui.rs drives tmux and skips without it; script, python3 and node come with the runner.
-      - if: runner.environment == 'github-hosted' && startsWith(matrix.check, 'test')
+      - if: runner.environment == 'github-hosted' && matrix.check == 'test'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
       - run: .github/ci.sh run "$CHECK"
         env:
@@ -101,8 +116,13 @@ jobs:
     steps:
       - run: |
           echo "plan: $PLAN, checks: $CHECK, rescue: $RESCUE"
+          if [ "$PLAN" = success ] && [ -n "$SKIP" ] && [ "$CHECK" = skipped ]; then
+            echo "ci-ok without checks: $SKIP" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           [ "$PLAN" = success ] && { [ "$CHECK" = success ] || [ "$RESCUE" = success ]; }
         env:
           PLAN: ${{ needs.plan.result }}
           CHECK: ${{ needs.check.result }}
           RESCUE: ${{ needs.rescue.result }}
+          SKIP: ${{ needs.plan.outputs.skip }}

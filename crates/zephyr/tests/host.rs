@@ -4801,8 +4801,15 @@ fn the_local_runners_take_one_job_each() {
     assert!(register.contains("--ephemeral"), "{register}");
     let run = &runner[runner.find("docker run -d --rm --name \"$name\"").unwrap()..];
     let run = &run[..run.find(">/dev/null").unwrap()];
-    assert!(!run.contains(" -v ") && !run.contains("--restart"), "{run}");
+    assert!(!run.contains("--restart"), "{run}");
     assert!(runner.contains("Restart=always"), "{runner}");
+    // Its one volume is main's build, read only.
+    let volumes: Vec<&str> = run
+        .split(" -v ")
+        .skip(1)
+        .map(|v| v.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(volumes, ["\"$ci_cache:/cache:ro\""], "{run}");
     // No capability but the one switch to the runner user, no-new-privileges, no sudo.
     for want in [
         "--cap-drop ALL --cap-add SETUID --cap-add SETGID",
@@ -4817,6 +4824,208 @@ fn the_local_runners_take_one_job_each() {
         .find("t=$(token registration-token) || failed")
         .unwrap();
     assert!(token < runner.find("docker run -d --rm --name \"$name\"").unwrap());
+}
+
+/// The CI cache is written only from the host, from main: `warm` fetches main's commit with the
+/// owner's gh and is the one place the volume is mounted writable; every runner gets it read only,
+/// and no workflow names it.
+#[test]
+fn only_main_reaches_the_ci_cache() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let runner = read(&root.join("deploy/runner/start.sh"));
+    let warm =
+        &runner[runner.find("\nwarm() {").unwrap()..runner.find("\nwarm_units() {").unwrap()];
+    let mounts: Vec<(usize, &str)> = runner.match_indices("\"$ci_cache:/cache").collect();
+    assert_eq!(mounts.len(), 2, "{mounts:?}");
+    for (at, _) in mounts {
+        let rest = &runner[at + "\"$ci_cache:/cache".len()..];
+        let warm_at = runner.find("\nwarm() {").unwrap();
+        let inside_warm = at > warm_at && at < warm_at + warm.len();
+        assert_eq!(
+            rest.starts_with(":ro\""),
+            !inside_warm,
+            "{}",
+            &runner[at..at + 40]
+        );
+    }
+    assert!(
+        warm.contains("gh api \"repos/$repo/commits/main\" --jq .sha"),
+        "{warm}"
+    );
+    assert!(
+        warm.contains("gh api \"repos/$repo/tarball/$sha\""),
+        "{warm}"
+    );
+    assert!(
+        warm.contains("mv -T /cache/current.new /cache/current"),
+        "{warm}"
+    );
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let yml = read(&entry.unwrap().path());
+        assert!(
+            !yml.contains("zephyr-ci-cache") && !yml.contains("/cache"),
+            "{yml}"
+        );
+    }
+    // A job that copies it in makes its own checkout newer than the copy, so cargo never trusts
+    // main's build over the branch's files.
+    let ci = read(&root.join(".github/ci.sh"));
+    let seed = &ci[ci.find("\nseed() {").unwrap()..];
+    let copy = seed.find("cp -a \"$from/target/.\"").unwrap();
+    assert!(copy < seed.find("-exec touch -c {} +").unwrap(), "{seed}");
+}
+
+/// ci.sh plan puts the test job on GitHub's runner for the nightly run alone, and ci.sh skip runs
+/// no checks only for Markdown outside the code or main's merge of a PR whose head passed ci-ok
+/// on the same tree; anything it cannot read means running the checks.
+#[test]
+fn ci_plans_one_test_job_and_skips_only_what_was_tested() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tmp = std::env::temp_dir().join(format!("zephyr-ci-plan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (repo, bin) = (tmp.join("repo"), tmp.join("bin"));
+    std::fs::create_dir_all(repo.join(".github")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(root.join(".github/ci.sh"), repo.join(".github/ci.sh")).unwrap();
+    // gh as the Actions API answers, after --jq: one merged PR #7 with head FAKE_HEAD on tree
+    // FAKE_TREE, FAKE_OK ci-ok passes, no refused runs; FAKE_FAIL makes every call fail.
+    std::fs::write(
+        bin.join("gh"),
+        r#"#!/bin/sh
+[ -z "$FAKE_FAIL" ] || exit 1
+for a; do case $a in repos/*) e=$a ;; esac; done
+case $e in
+  */commits/*/pulls) echo 7 ;;
+  */pulls/7) echo "$FAKE_HEAD" ;;
+  */git/commits/*) echo "$FAKE_TREE" ;;
+  */check-runs*) echo "$FAKE_OK" ;;
+  */actions/runs*) ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &tmp)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    // A commit that changes `files`, on top of the base; returns its tree.
+    let change = |files: &[&str]| {
+        git(&["reset", "-q", "--hard", "HEAD~0"]);
+        let base = git(&["rev-list", "--max-parents=0", "HEAD"]);
+        git(&["reset", "-q", "--hard", &base]);
+        for f in files {
+            let path = repo.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{f}\n")).unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "change"]);
+        git(&["rev-parse", "HEAD^{tree}"])
+    };
+    let ci = |cmd: &str, vars: &[(&str, &str)]| {
+        let out_file = tmp.join("output");
+        let _ = std::fs::remove_file(&out_file);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = Command::new("bash")
+            .args([".github/ci.sh", cmd])
+            .current_dir(&repo)
+            .env("PATH", path)
+            .env("GITHUB_OUTPUT", &out_file)
+            .env("GITHUB_REPOSITORY", "o/r")
+            .env("GITHUB_SHA", "a".repeat(40))
+            .env("GITHUB_REF", "refs/heads/main")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &tmp)
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::read_to_string(&out_file).unwrap()
+    };
+    let skip = |vars: &[(&str, &str)]| {
+        ci("skip", vars)
+            .trim()
+            .trim_start_matches("skip=")
+            .to_string()
+    };
+
+    // Placement: one test job, on GitHub's runner only for the nightly run.
+    let matrix = |event: &str, mode: &str| {
+        let out = ci("plan", &[("GITHUB_EVENT_NAME", event), ("ZEPHYR_CI", mode)]);
+        let rescue = out.contains("rescue=true");
+        let m = out
+            .lines()
+            .find_map(|l| l.strip_prefix("matrix="))
+            .unwrap()
+            .to_string();
+        (m, rescue)
+    };
+    let all_local = r#"{"include":[{"check":"lint","runner":"zephyr-local"},{"check":"test","runner":"zephyr-local"}]}"#;
+    assert_eq!(
+        matrix("pull_request", "both"),
+        (all_local.to_string(), false)
+    );
+    assert_eq!(matrix("push", "both"), (all_local.to_string(), false));
+    assert_eq!(matrix("schedule", "local"), (all_local.to_string(), false));
+    let nightly = all_local.replace(
+        r#"{"check":"test","runner":"zephyr-local"}"#,
+        r#"{"check":"test","runner":"ubuntu-latest"}"#,
+    );
+    assert_eq!(matrix("schedule", "both"), (nightly, true));
+
+    let pr = [("GITHUB_EVENT_NAME", "pull_request")];
+    // Markdown outside the code: no checks. Inside .github/, crates/ or deploy/, or any other
+    // file: all of them.
+    change(&["README.md", "docs/plans/x.md"]);
+    assert!(skip(&pr).starts_with("only Markdown"), "{}", skip(&pr));
+    for code in [
+        &["README.md", "crates/zephyr/assets/web/x.md"][..],
+        &["deploy/skills/report/SKILL.md"],
+        &[".github/notes.md"],
+        &["README.md", "crates/zephyr/src/lib.rs"],
+    ] {
+        change(code);
+        assert_eq!(skip(&pr), "", "{code:?}");
+    }
+    // The nightly and manual runs always run everything.
+    change(&["README.md"]);
+    assert_eq!(skip(&[("GITHUB_EVENT_NAME", "schedule")]), "");
+    assert_eq!(skip(&[("GITHUB_EVENT_NAME", "workflow_dispatch")]), "");
+
+    // main's merge of PR #7: skipped only when the PR's head is this tree and passed ci-ok.
+    let tree = change(&["crates/zephyr/src/lib.rs"]);
+    let head = "b".repeat(40);
+    let push = |tree: &str, ok: &str, fail: &str| {
+        skip(&[
+            ("GITHUB_EVENT_NAME", "push"),
+            ("FAKE_HEAD", &head),
+            ("FAKE_TREE", tree),
+            ("FAKE_OK", ok),
+            ("FAKE_FAIL", fail),
+        ])
+    };
+    assert!(
+        push(&tree, "1", "").starts_with("PR #7's head"),
+        "{}",
+        push(&tree, "1", "")
+    );
+    assert_eq!(push(&"c".repeat(40), "1", ""), "");
+    assert_eq!(push(&tree, "0", ""), "");
+    assert_eq!(push(&tree, "1", "1"), "");
+    std::fs::remove_dir_all(&tmp).unwrap();
 }
 
 /// zephyr-buildkitd answers only image.yml: its client certificate is a repo secret no other
