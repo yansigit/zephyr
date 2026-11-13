@@ -466,20 +466,25 @@ fn proxy_for(
         return Ok(None);
     }
     let url = url.trim();
+    // The variable's value is never echoed: it may carry a password, and an `@` anywhere in
+    // it (a password with a `/` puts it past the authority) is refused before it is parsed.
+    if url.contains('@') {
+        bail!("the proxy variable is not an http://host:port URL");
+    }
     let url = if url.contains("://") {
         url.to_string()
     } else {
         format!("http://{url}")
     };
-    // The variable's value is never echoed: it may carry a password.
     match Target::parse(&url) {
-        Ok(proxy) if !proxy.tls && !proxy.authority.contains('@') => Ok(Some(proxy)),
+        Ok(proxy) if !proxy.tls => Ok(Some(proxy)),
         _ => bail!("the proxy variable is not an http://host:port URL"),
     }
 }
 
 /// Asks the proxy for a tunnel to `target` and reads its answer up to the blank line, a byte at
 /// a time so nothing the server sends after it is taken from the stream TLS or h2 reads next.
+/// Any 2xx on an `HTTP/1.x` status line opens it.
 async fn tunnel(tcp: &mut tokio::net::TcpStream, target: &Target) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let authority = if target.host.contains(':') {
@@ -503,7 +508,11 @@ async fn tunnel(tcp: &mut tokio::net::TcpStream, target: &Target) -> anyhow::Res
     }
     let head = String::from_utf8_lossy(&head);
     let line = head.lines().next().unwrap_or_default();
-    if line.split_whitespace().nth(1) != Some("200") {
+    let mut words = line.split_whitespace();
+    let version = words.next().unwrap_or_default();
+    let code = words.next().unwrap_or_default();
+    let ok = code.len() == 3 && code.starts_with('2') && code.bytes().all(|b| b.is_ascii_digit());
+    if !version.starts_with("HTTP/1.") || !ok {
         bail!("the proxy refused CONNECT {authority}: {line}");
     }
     Ok(())
@@ -679,6 +688,46 @@ mod tests {
             .err()
             .expect("a proxy URL with credentials is refused");
         assert!(!e.to_string().contains("hunter2"), "{e}");
+        // A password with a `/` in it puts the `@` past the authority: still refused.
+        let slashed: &[(&str, &str)] = &[("HTTPS_PROXY", "http://u:hun/ter2@proxy:8080")];
+        let e = proxy_for(&Target::parse(cursor).unwrap(), env(slashed))
+            .err()
+            .expect("a proxy URL with an @ anywhere is refused");
+        assert!(!e.to_string().contains("hun"), "{e}");
+    }
+
+    /// The proxy's answer: any 2xx on an `HTTP/1.x` status line opens the tunnel.
+    #[tokio::test]
+    async fn the_tunnel_opens_on_a_2xx_status_line_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = Target::parse("https://agent.example/Run").unwrap();
+        for (answer, opens) in [
+            ("HTTP/1.1 200 Connection established\r\n\r\n", true),
+            ("HTTP/1.0 200 OK\r\n\r\n", true),
+            ("HTTP/1.1 204 No Content\r\n\r\n", true),
+            ("HTTP/1.1 403 Forbidden\r\n\r\n", false),
+            ("XTTP/1.1 200 OK\r\n\r\n", false),
+            ("200 200\r\n\r\n", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(s.read_u8().await.unwrap());
+                }
+                s.write_all(answer.as_bytes()).await.unwrap();
+                head
+            });
+            let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            assert_eq!(tunnel(&mut tcp, &target).await.is_ok(), opens, "{answer:?}");
+            let head = String::from_utf8(proxy.await.unwrap()).unwrap();
+            assert_eq!(
+                head,
+                "CONNECT agent.example:443 HTTP/1.1\r\nHost: agent.example:443\r\n\r\n"
+            );
+        }
     }
 
     #[test]

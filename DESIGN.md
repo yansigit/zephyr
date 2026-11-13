@@ -612,7 +612,7 @@ label admitted.
 - **Through the proxy.** The child runs as the agent, which under the network floor (§4.20) reaches
   nothing but the proxy, so the stream honours `https_proxy`/`HTTPS_PROXY` (`http_proxy` for an
   `http://` test URL) unless `NO_PROXY` names the host: it sends `CONNECT host:port` with a `Host`
-  header, reads at most 8 KiB up to a 200 and the blank line within the connect timeout, and runs
+  header, reads at most 8 KiB up to a 2xx on an `HTTP/1.x` status line and the blank line within the connect timeout (a variable with an `@` anywhere in it is refused, never echoed), and runs
   TLS and HTTP/2 over the tunnel. The key exchange goes through `reqwest`, which reads the same
   variables.
 - **Credentials.** rpi resolves the account's key into `opts.api_key` (§4.7: `[[account]]`, `auth.json`);
