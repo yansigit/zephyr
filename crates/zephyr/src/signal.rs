@@ -47,6 +47,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TYPING_EVERY: Duration = Duration::from_secs(10);
 /// How often `D/.trust` (dropped by `zephyr signal-setup trust`) is looked for.
 const TRUST_EVERY: Duration = Duration::from_secs(2);
+/// How long a stopping signal-cli's handed-over envelopes may take to be taken.
+const DRAIN_WAIT: Duration = Duration::from_secs(10);
 /// Names remembered for `known_as`.
 const NAMES: usize = 256;
 /// Root's PATH for signal-cli: nothing the agent can write.
@@ -310,13 +312,16 @@ impl Signal {
             let _ = file.map(|f| std::fs::remove_file(f.path()));
         }
         let own = self.own_aci();
+        // In a process group of its own, so what it leaves behind can be killed with it.
         let mut child = command(&self.cli, &self.dir)
             .args(["-a", &self.account, "jsonRpc"])
             .args(["--ignore-stories", "--ignore-avatars", "--ignore-stickers"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .process_group(0)
             .spawn()
             .with_context(|| format!("starting {}", self.cli.display()))?;
+        let group = child.id().map(|pid| pid as i32);
         let (mut stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         let (lines_tx, mut lines) = mpsc::unbounded_channel::<String>();
         *self.rpc.writer.lock().unwrap() = Some(lines_tx);
@@ -360,16 +365,29 @@ impl Signal {
         };
         let taken = async { tokio::join!(reader, taker) };
         tokio::pin!(taken);
-        tokio::select! {
-            (r, ()) = &mut taken => r?,
-            r = writer => r?,
+        let (ended, drained) = tokio::select! {
+            (r, ()) = &mut taken => (r, true),
+            r = writer => (r, false),
             () = side => {
                 eprintln!("zephyr: signal-cli stops while zephyr signal-setup holds the account");
-                let _ = child.start_kill();
-                // What it handed over is still taken: Signal's server will not give it again.
-                taken.await.0?;
+                (Ok(()), false)
+            }
+        };
+        if !drained {
+            let _ = child.start_kill();
+            // What it handed over is still taken, whichever way it ends: Signal's server will
+            // not give it again. Bounded, as something it left may hold its output open. The
+            // next start empties the attachments only after this, so none a row needs is gone.
+            if tokio::time::timeout(DRAIN_WAIT, &mut taken).await.is_err() {
+                eprintln!("zephyr: signal-cli's output did not end; killing its process group");
+                if let Some(group) = group {
+                    // SAFETY: a plain kill of the group this spawn made.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut taken).await;
             }
         }
+        ended?;
         let status = child.wait().await?;
         eprintln!("zephyr: signal-cli exited ({status})");
         Ok(())
