@@ -3700,9 +3700,9 @@ fn the_image_workflow_smoke_tests_every_extension() {
 }
 
 /// A crate's build script must never read a GitHub token: GH_TOKEN is set only in a step's own
-/// `env` (never a job's or the workflow's), a step that sets it runs no cargo (nor `ci.sh run`, nor
-/// bump-rpi.sh's `cargo update`), `ci.sh rescue` runs its checks without it, and no checkout keeps
-/// its token in `.git/config`.
+/// `env` (never a job's or the workflow's), a step that sets it runs no cargo (nor `ci.sh run` or
+/// `ci.sh rescue`, which run the checks, nor bump-rpi.sh's `cargo update`), `ci.sh rescue` refuses
+/// to start with one in its environment, and no checkout keeps its token in `.git/config`.
 #[test]
 fn no_step_that_runs_cargo_holds_a_github_token() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3751,7 +3751,8 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             let words: Vec<&str> = step
                 .split(|c: char| c.is_whitespace() || c == ';')
                 .collect();
-            let ci_run = words.windows(2).any(|w| w == [".github/ci.sh", "run"]);
+            let ci_run = (words.windows(2))
+                .any(|w| w == [".github/ci.sh", "run"] || w == [".github/ci.sh", "rescue"]);
             let cargo = ["cargo", "deploy/bump-rpi.sh"]
                 .iter()
                 .any(|c| words.contains(c));
@@ -3790,9 +3791,19 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
     }
     assert!(tokens >= 6, "{tokens}");
     let ci = read(&root.join(".github/ci.sh"));
+    // Not an `unset` in a subshell: the parent's /proc/<pid>/environ would still hold the token.
+    assert!(!ci.contains("unset GH_TOKEN"), "{ci}");
+    let refuse = "[ -z \"${GH_TOKEN:-}${GITHUB_TOKEN:-}\" ] || die";
+    let rescue = &ci[ci.find("\nrescue() {").unwrap()..];
     assert!(
-        ci.contains("( unset GH_TOKEN; check \"${name% (*}\" )"),
+        rescue.find(refuse).unwrap() < rescue.find("check \"$what\"").unwrap(),
         "{ci}"
+    );
+    // ...and the step that runs it has no token, which the loop above checks for every workflow.
+    let ci_yml = read(&root.join(".github/workflows/ci.yml"));
+    assert!(
+        ci_yml.contains("run: .github/ci.sh rescue-plan"),
+        "{ci_yml}"
     );
 }
 

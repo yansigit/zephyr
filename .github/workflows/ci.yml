@@ -78,9 +78,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: .github/ci.sh rescue
+      # Two steps, so the token is never in the environment of a process that builds the branch:
+      # this one only asks the Actions API which checks to rescue.
+      - id: which
+        run: .github/ci.sh rescue-plan
         env:
           GH_TOKEN: ${{ github.token }}
+      - run: .github/ci.sh rescue
+        env:
+          CHECKS: ${{ steps.which.outputs.checks }}
   ci-ok:
     needs: [plan, check, rescue]
     if: always()

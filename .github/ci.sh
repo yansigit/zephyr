@@ -2,8 +2,9 @@
 # What the workflows run (README "CI"), so placement and the checks live in one place:
 #   .github/ci.sh plan          where jobs go, from repo variable ZEPHYR_CI (both|local|hosted)
 #   .github/ci.sh run CHECK     one check: lint | deny | test K/N (a nextest hash partition)
-#   .github/ci.sh rescue        run here what GitHub refused to start on its own runners
-# plan and rescue read the Actions API with GH_TOKEN (actions: read; checks: read for the reason).
+#   .github/ci.sh rescue-plan   which checks GitHub refused to start on its own runners
+#   .github/ci.sh rescue        run those (CHECKS) here, with no GitHub token
+# plan and rescue-plan read the Actions API with GH_TOKEN (actions: read; checks: read for the reason).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -112,28 +113,42 @@ check() {
   esac
 }
 
-# Runs here each check GitHub refused to start on its runners. A check that started and failed is
-# never run again: that is a real failure, and so is anything else that did not pass.
-rescue() {
-  local jobs refused bad name
+# Which checks GitHub refused to start on its runners, one per line in output `checks`. A check that
+# started and failed is never run again: that is a real failure, and so is anything else that did
+# not pass. Its step holds GH_TOKEN and runs only these API calls; `rescue`, the next step, runs
+# the checks with no token in its environment at all.
+rescue_plan() {
+  local jobs refused bad id name list=
   jobs=$(api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs?per_page=100" \
     --jq '.jobs[] | select(.name | test("^(lint|deny|test [0-9]+/[0-9]+) \\("))')
   bad=$(jq -r "select(.conclusion != \"success\") | select(. as \$j | [\$j | $NOT_STARTED] | length == 0) | .name" <<<"$jobs")
   [ -z "$bad" ] || die "not rescued, these ran (or were cancelled) and did not pass: $(echo "$bad" | paste -sd, -)"
   refused=$(jq -r "$NOT_STARTED | \"\(.id)\t\(.name)\"" <<<"$jobs")
   [ -n "$refused" ] || die "nothing to rescue"
-  # fd 3, so nothing the checks run can read the list.
-  while IFS=$'\t' read -r -u 3 id name; do
+  while IFS=$'\t' read -r id name; do
     summary "rescue: GitHub did not start '$name' ($(api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" \
       --jq '[.[].message] | join(" ")' 2>/dev/null || echo "no annotation")); running it here"
-    # The checks build and run code from the branch: they never see the token.
-    ( unset GH_TOKEN; check "${name% (*}" )
-  done 3<<<"$refused"
+    list+="${name% (*}"$'\n'
+  done <<<"$refused"
+  { echo "checks<<EOF"; printf '%s' "$list"; echo "EOF"; } >> "${GITHUB_OUTPUT:-/dev/stdout}"
+}
+
+# Runs the checks rescue_plan chose, given in CHECKS. They build and run the branch's code, so
+# this step starts with no GitHub token in its environment.
+rescue() {
+  local what
+  [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] || die "rescue runs the branch's code: run it without a GitHub token"
+  [ -n "${CHECKS:-}" ] || die "nothing to rescue"
+  # fd 3, so nothing the checks run can read the list.
+  while IFS= read -r -u 3 what; do
+    [ -z "$what" ] || check "$what"
+  done 3<<<"$CHECKS"
 }
 
 case "${1:-}" in
   plan) plan ;;
   run) [ $# -eq 2 ] || die "usage: ci.sh run CHECK"; check "$2" ;;
+  rescue-plan) rescue_plan ;;
   rescue) rescue ;;
-  *) die "usage: ci.sh plan | run CHECK | rescue" ;;
+  *) die "usage: ci.sh plan | run CHECK | rescue-plan | rescue" ;;
 esac

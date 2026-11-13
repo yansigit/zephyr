@@ -1398,7 +1398,8 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   a new test lands in a shard by itself. A test that passes only on its one retry is listed as
   flaky in the job summary; one that hangs is killed after 3 minutes.
 - `rescue` runs here, after them, each check GitHub did not start (failed with no runner and no
-  step; the job's annotation says why). A check that started and failed is never rescued.
+  step; the job's annotation says why). A check that started and failed is never rescued. Its
+  token only asks the Actions API which checks those are; the step that runs them has none.
 - `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
   check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
 
