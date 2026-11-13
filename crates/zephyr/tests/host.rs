@@ -3777,8 +3777,15 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             let check = push
                 .find(" .github/bump-check.py ")
                 .expect("an allowlist check");
-            let apply = push.find("run: git apply ").expect("the patch is applied");
+            let apply =
+                (push.find("git -c core.quotePath=true apply ")).expect("the patch is applied");
             assert!(check < apply, "{push}");
+            // The job before them reads, with gh alone: no checkout, no repository code, no cargo.
+            let gate = job("  gate:");
+            assert!(gate.contains("pull-requests: read"), "{gate}");
+            for never in ["write", "actions/checkout", "cargo", ".github/", "deploy/"] {
+                assert!(!gate.contains(never), "{never}: {gate}");
+            }
         }
     }
     assert!(tokens >= 6, "{tokens}");
@@ -3790,33 +3797,77 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
 }
 
 /// rpi-bump's push job applies the build's patch only when it moves the rpi pins and nothing else:
-/// a real bump (tests/fixtures/rpi-bump.patch, made by bump-rpi.sh, its versions swapped for
-/// 9.8.7 and 9.9.0 so a later bump does not rewrite it) passes, and each kind of smuggled change fails.
+/// a real bump (tests/fixtures/rpi-bump.patch and the Cargo.lock it was made on, from bump-rpi.sh,
+/// their versions swapped for 9.8.7 and 9.9.0 so a later bump does not rewrite them) passes, and
+/// each kind of smuggled change fails.
 #[test]
 fn the_bump_check_passes_only_a_pin_move() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let good = read(&root.join("crates/zephyr/tests/fixtures/rpi-bump.patch"));
+    let fixtures = root.join("crates/zephyr/tests/fixtures");
+    let good = read(&fixtures.join("rpi-bump.patch"));
+    let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
+    // The checker reads the Cargo.lock the patch applies to from the directory it runs in.
     let dir = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let check = |name: &str, patch: &str| {
+    std::fs::write(dir.join("Cargo.lock"), &lock).unwrap();
+    let sha = |arch: &str| {
+        let line = format!("+ARG RPI_SHA256_{arch}=");
+        let at = good.find(&line).unwrap() + line.len();
+        good[at..at + 64].to_string()
+    };
+    let (amd64, arm64) = (sha("AMD64"), sha("ARM64"));
+    let run = |name: &str, patch: &str, args: [&str; 4]| {
         let file = dir.join(name);
         std::fs::write(&file, patch).unwrap();
         let out = Command::new("python3")
             .arg("-I")
             .arg(root.join(".github/bump-check.py"))
-            .args(["9.8.7", "9.9.0"])
+            .args(args)
             .arg(&file)
+            .current_dir(&dir)
             .output()
             .unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        (out.status.success(), err)
     };
+    let check = |name: &str, patch: &str| run(name, patch, ["9.8.7", "9.9.0", &amd64, &arm64]);
     assert_eq!(check("good", &good), (true, String::new()));
+
     let pin = "+const RPI_PIN: &str = \"rpi 9.9.\";\n";
-    assert!(good.contains(pin));
+    let fake = "+    print(\"rpi 9.9.0\"); sys.exit(0)\n";
+    assert!(good.contains(pin) && good.contains(fake));
+    // serde moved to another version and checksum: a hunk in Cargo.lock, in order among the others.
+    let serde = lock.lines().position(|l| l == "name = \"serde\"").unwrap();
+    let block: Vec<&str> = lock.lines().skip(serde + 1).take(3).collect();
+    assert!(block[0].starts_with("version = ") && block[2].starts_with("checksum = "));
+    let hunk = format!(
+        "@@ -{at},3 +{at},3 @@\n-{}\n+version = \"1.0.999\"\n {}\n-{}\n+checksum = \"{}\"\n",
+        block[0],
+        block[1],
+        block[2],
+        "0".repeat(64),
+        at = serde + 2
+    );
+    let section = good.find("diff --git a/Cargo.lock").unwrap();
+    let start = |i: usize| -> usize {
+        let header = &good[i + 4..];
+        header[..header.find([',', ' ']).unwrap()].parse().unwrap()
+    };
+    let next = (good[section..].match_indices("\n@@ -"))
+        .map(|(i, _)| section + i + 1)
+        .find(|&i| start(i) > serde + 2)
+        .unwrap();
+    let moved_serde = format!("{}{hunk}{}", &good[..next], &good[next..]);
+    let cr_main = pin.replace(";\n", ";\r fn planted() { std::process::exit(7) }\n");
+    let cr_fake = fake.replace("(0)\n", "(0)\r__import__('os').system('id')\n");
     let bad = [
+        ("moved-serde", moved_serde),
+        ("cr-main", good.replacen(pin, &cr_main, 1)),
+        ("cr-fake-rpi", good.replacen(fake, &cr_fake, 1)),
+        (
+            "non-ascii",
+            good.replacen(pin, &pin.replace("9.9.", "9.9.\u{202e}"), 1),
+        ),
         ("other-file", format!("{good}diff --git a/.github/ci.sh b/.github/ci.sh\nindex 1111111..2222222 100755\n--- a/.github/ci.sh\n+++ b/.github/ci.sh\n@@ -1 +1 @@\n-a\n+b\n")),
         ("extra-line", good.replacen(pin, &format!("{pin}+fn planted() {{}}\n"), 1)),
         ("git-source", good.replacen(
@@ -3836,14 +3887,16 @@ fn the_bump_check_passes_only_a_pin_move() {
         let (ok, err) = check(name, patch);
         assert!(!ok && err.starts_with("bump-check: "), "{name}: {err}");
     }
-    let out = Command::new("python3")
-        .arg("-I")
-        .arg(root.join(".github/bump-check.py"))
-        .args(["9.8.7", "9.9.0; x"])
-        .arg(dir.join("good"))
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "{out:?}");
+    let (_, err) = check("moved-serde", &bad[0].1);
+    assert!(
+        err.contains("serde") && err.contains("waits for a person"),
+        "{err}"
+    );
+    // The release's own sha256s, which the push job fetches, must be the ones the patch pins.
+    let (ok, err) = run("good", &good, ["9.8.7", "9.9.0", &"1".repeat(64), &arm64]);
+    assert!(!ok && err.contains("sha256s"), "{err}");
+    let (ok, _) = run("good", &good, ["9.8.7", "9.9.0; x", &amd64, &arm64]);
+    assert!(!ok);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

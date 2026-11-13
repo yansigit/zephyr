@@ -1426,11 +1426,16 @@ own `.sha256` files and checked against the tarballs, `RPI_PIN`, the `=` Cargo p
 `Cargo.lock`, fake-rpi's `--version`, the real-rpi test path). The workflow runs fmt, clippy, the
 tests and the real-rpi suite against the new binary (`RPI_BIN`), opens a PR `rpi-bump/v<version>`,
 and merges it when all of that passed; when anything failed the PR stays open with the run linked,
-and later runs leave it alone. The bump and the tests (which run the new crates' build scripts) hold
-no token; a second job on a fresh GitHub-hosted runner, never this machine, takes their diff, checks
-that it touches only the files `bump-rpi.sh` edits and in them only the version and the rpi sha256s
-(`.github/bump-check.py`), and only then applies it, pushes and opens and merges the PR. When GitHub
-will not start that job, the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
+and later runs leave it alone: a first job, with a read token and no repository code, sees the open
+PR and stops before anything is built. The bump and the tests (which run the new rpi binary and the
+new crates' build scripts) hold no token. A last job on a fresh GitHub-hosted runner, never this
+machine, takes their diff and checks it against its own checkout (`.github/bump-check.py`): only
+the files `bump-rpi.sh` edits, in them only the rpi version, from the pinned one to a newer one,
+with the sha256s the release itself publishes, fetched again; in `Cargo.lock` no crate but the
+`rpi-*` ones moved, and new ones only from crates.io; no control or non-ASCII character on a
+changed line. Only then does it apply the diff, push, and open and merge the PR. A bump that needs
+another crate moved fails that check and waits for a person. When GitHub will not start that job,
+the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
 The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
 General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and
 pull-requests write on this repo) so `ci` runs on the PR, and allow auto-merge: the merge then waits
