@@ -13,6 +13,30 @@ use std::path::{Path, PathBuf};
 const SKIP: [&str; 3] = [".git", "target", "node_modules"];
 /// The most completions listed.
 const CAP: usize = 50;
+/// The most entries of one folder read for a completion: the agent may fill one.
+const ENTRIES: usize = 4096;
+/// The most of a saved prompt read, and of one read for its first line only.
+const PROMPT_BYTES: u64 = 64 * 1024;
+const FIRST_LINE_BYTES: u64 = 4 * 1024;
+
+/// The first `cap` bytes of `path`, a file in a folder the agent writes, or `None` when it is
+/// not a regular file: opened without following a link or waiting on a FIFO's writer, and
+/// checked on the open descriptor, so a FIFO cannot hang the UI loop nor a sparse 20 GB file
+/// fill its memory.
+fn read_capped(path: &Path, cap: u64) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = (std::fs::OpenOptions::new().read(true))
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 /// The words of `text`, split at whitespace that is not escaped with `\`.
 fn words(text: &str) -> Vec<Range<usize>> {
@@ -88,6 +112,7 @@ pub fn complete(before: &str, home: &Path, projects: Option<&Path>) -> Vec<Choic
             return vec![];
         };
         list.flatten()
+            .take(ENTRIES)
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
                 let hidden = name.starts_with('.') && !prefix.starts_with('.');
@@ -209,7 +234,7 @@ pub fn prompts(home: &Path) -> Vec<(String, String)> {
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             let name = name.strip_suffix(".md").filter(|n| !n.starts_with('.'))?;
-            let text = std::fs::read_to_string(e.path()).ok()?;
+            let text = read_capped(&e.path(), FIRST_LINE_BYTES)?;
             let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
             Some((name.to_string(), first.trim().to_string()))
         })
@@ -244,7 +269,7 @@ pub fn prompt(home: &Path, name: &str, args: &str) -> Result<String, String> {
         true => None,
         false => {
             let _fs = crate::agent::fs();
-            std::fs::read_to_string(&path).ok()
+            read_capped(&path, PROMPT_BYTES)
         }
     };
     let text = text.ok_or_else(|| format!("no saved prompt {name}; /p lists them"))?;
@@ -440,5 +465,35 @@ mod tests {
         for bad in ["nope", "../prompts/hi", ""] {
             assert!(prompt(&home, bad, "").is_err(), "{bad}");
         }
+    }
+
+    /// The agent writes the prompts folder: a FIFO there never blocks the UI loop (it is
+    /// skipped), and a huge file is read only as far as the cap.
+    #[test]
+    fn a_fifo_or_a_huge_file_in_the_prompts_folder_never_stalls_the_ui() {
+        let home = crate::test_dir("files-prompts-fifo");
+        let dir = home.join("prompts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("x.md").to_str().unwrap()).unwrap();
+        // Safety: a valid C string; the result is checked.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let big = std::fs::File::create(dir.join("big.md")).unwrap();
+        big.set_len(100 << 20).unwrap(); // sparse: 100 MB of zeros, no disk
+        std::fs::write(dir.join("ok.md"), "Fine").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = home.clone();
+        std::thread::spawn(move || {
+            let listed = prompts(&at);
+            let one = prompt(&at, "x", "");
+            let huge = prompt(&at, "big", "").map(|t| t.len());
+            let _ = tx.send((listed, one, huge));
+        });
+        let (listed, one, huge) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("prompts() blocked on a FIFO");
+        let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["big", "ok"], "the FIFO is no prompt");
+        assert!(one.is_err());
+        assert!(huge.is_ok_and(|n| n <= 64 * 1024));
     }
 }
