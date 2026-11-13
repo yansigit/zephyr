@@ -1395,11 +1395,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_call_line_is_spoken_as_mu_law() {
         let cfg = fakes("voice-call-say", "");
-        let _turn = Turn::take(Who::Call).await;
-        let audio = say_once(&cfg, "Seven thirty, please.", "en", Who::Call)
-            .await
-            .unwrap();
-        // The stand-ins pass the text through: Piper's `pcm:`, then ffmpeg's `ulaw:`.
+        let call = Call::new(&cfg, "en");
+        let audio = call.say("Seven thirty, **please**.").await.unwrap();
+        // Only what is spoken goes to Piper; the stand-ins pass it through: Piper's `pcm:`,
+        // then ffmpeg's `ulaw:`.
         assert_eq!(audio, b"ulaw:pcm:Seven thirty, please.");
         let ffmpeg = &log(&cfg, "ffmpeg")[0];
         let argv = ffmpeg["argv"].to_string();
@@ -1415,8 +1414,9 @@ pub(crate) mod tests {
         assert_eq!(Call::new(&cfg, "ko").say("안녕하세요.").await, None);
         assert_eq!(Call::new(&cfg, "fr").say("Bonjour.").await, None);
         assert_eq!(log(&cfg, "python").len(), 1);
+        // Piper fails, warm and then once: nothing is said.
         mark(&cfg, "piper_fail", "");
-        assert_eq!(say_once(&cfg, "Hello.", "en", Who::Call).await, None);
+        assert_eq!(call.say("Hello.").await, None);
     }
 
     /// One second of an 8 kHz square wave: an utterance as the call's endpointer cuts it.
