@@ -471,16 +471,8 @@ impl Channel for IMessage {
                 "tempGuid": msg.client_id,
             })
         });
-        // The text and the file are the reply's pieces: tempGuid drops no retry once a send is
-        // over, so a retry starts after what BlueBubbles took (`channel::Delivered`).
-        let texts = usize::from(text.is_some());
-        let mut sending = (self.delivered).begin("imessage", &msg.recipient, &msg.client_id)?;
-        sending.total = texts + usize::from(msg.attachment.is_some());
-        let file = match msg
-            .attachment
-            .as_ref()
-            .filter(|_| sending.before < sending.total)
-        {
+        // Read before the send begins: one that cannot be read must not hold the chat's turn.
+        let file = match msg.attachment.as_ref() {
             Some(path) => {
                 let name = path
                     .file_name()
@@ -501,6 +493,12 @@ impl Channel for IMessage {
             }
             None => None,
         };
+        // The text and the file are the reply's pieces: tempGuid drops no retry once a send is
+        // over, so a retry starts after what BlueBubbles took (`channel::Delivered`).
+        let texts = usize::from(text.is_some());
+        let mut sending = (self.delivered).begin("imessage", &msg.recipient, &msg.client_id)?;
+        sending.total = texts + usize::from(file.is_some());
+        let file = file.filter(|_| sending.before < sending.total);
         // In a task of its own: AppleScript can take longer than the router waits.
         let this = self.clone();
         let send = move |sending: crate::channel::Sending| async move {
@@ -967,6 +965,23 @@ mod tests {
             .filter(|s| s.contains("/message/attachment"))
             .count();
         assert_eq!((texts, uploads), (1, 1), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_holds_up_no_other_reply() {
+        let (base, _cap) = stub(200, r#"{"status":200,"message":"ok"}"#).await;
+        let im = adapter(base);
+        let gone = Outbound {
+            client_id: "c-gone".into(),
+            attachment: Some("/nonexistent/zephyr/report.pdf".into()),
+            ..outbound()
+        };
+        assert!(im.send(&gone).await.is_err());
+        let next = Outbound {
+            client_id: "c-next".into(),
+            ..outbound()
+        };
+        im.send(&next).await.expect("the chat's turn is free");
     }
 
     #[tokio::test]

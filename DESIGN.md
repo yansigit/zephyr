@@ -320,7 +320,7 @@ The settings and approvals methods act as the owner on channel `tui`, a strong c
 - **iMessage.**
   - Needs an always-on Mac (any Apple Silicon or recent Intel) signed in to your Apple ID, running BlueBubbles Server, joined to the same Tailscale network.
   - Inbound arrives as a BlueBubbles webhook to the gateway's tailnet-only listener, with a shared secret, and is checked against your handle.
-  - Outbound uses the BlueBubbles REST send endpoint: `POST /api/v1/message/text`, then a file as `POST /api/v1/message/attachment` (tempGuid `<client id>-f`). `tempGuid` drops a duplicate only while a send is in flight, so the send goes as Telegram's does (`channel::detach`): in a task of its own, with the text and the file as its two pieces, and a retry starts after what BlueBubbles took. An upload slower than the router's 10 s carries on, and the text goes once. Each request has 120 s, a whole send 15 minutes.
+  - Outbound uses the BlueBubbles REST send endpoint: `POST /api/v1/message/text`, then a file as `POST /api/v1/message/attachment` (tempGuid `<client id>-f`). `tempGuid` drops a duplicate only while a send is in flight, so the send goes as Telegram's does (`channel::detach`): in a task of its own, with the text and the file as its two pieces, and a retry starts after what BlueBubbles took. An upload slower than the router's 10 s carries on, and the text goes once. The file is read before the send begins, so one that cannot be read fails its row and holds up no other reply to that chat. Each request has 120 s, a whole send 15 minutes.
   - The BlueBubbles API shape was read from source and still needs checking against a running server. Without a Mac, this adapter stays off and the rest works.
 
 #### 4.3.3 The web app
