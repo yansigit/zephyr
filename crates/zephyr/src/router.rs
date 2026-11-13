@@ -357,11 +357,7 @@ pub async fn run<C: Channel>(
         .map_err(Into::into));
     // A card's number was in the memory of the daemon before this one: what is still open is
     // closed at its issuer, never filled again (DESIGN §4.25).
-    crate::cards::close_all(
-        &router.cfg,
-        &router.store,
-        "zephyr restarted and forgot its number",
-    );
+    crate::cards::start(&router.cfg, &router.store);
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
         c.acks(router.acks.clone());

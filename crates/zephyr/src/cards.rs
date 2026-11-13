@@ -2231,6 +2231,13 @@ pub fn close_all(cfg: &Arc<Config>, store: &Store, why: &'static str) {
     }
 }
 
+/// A start: the cards the daemon before this one had open are closed, and its `FILLED_FILE`
+/// goes with them, since this daemon keeps no number to refuse a read-back for.
+pub fn start(cfg: &Arc<Config>, store: &Store) {
+    close_all(cfg, store, "zephyr restarted and forgot its number");
+    let _ = std::fs::remove_file(crate::drafts::public_dir(cfg).join(FILLED_FILE));
+}
+
 fn log<T>(done: rusqlite::Result<T>) {
     if let Err(e) = done {
         eprintln!("zephyr: recording a card failed: {e}");
@@ -2842,5 +2849,39 @@ mod tests {
         assert_eq!(close_at_issuer(&cfg, &mut stale).await, Ok(()));
         let log = Fake::script(&cfg, |s| s.log.clone());
         assert_eq!(log, [format!("close {id}")]);
+    }
+
+    fn manual_card(name: &str) -> (Arc<Config>, Store, i64) {
+        let dir = crate::test_dir(name);
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'manual'\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "manual".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            channel: "chat".into(),
+            sender: "o".into(),
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        (cfg, store, id)
+    }
+
+    /// At a start no number is kept and every card was just closed: the flag a daemon before
+    /// this one left, which refuses the browser's read-backs, goes too.
+    #[tokio::test]
+    async fn a_start_removes_the_filled_flag_it_was_left() {
+        let (cfg, store, id) = manual_card("cards-start-flag");
+        let flag = crate::drafts::public_dir(&cfg).join(FILLED_FILE);
+        std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        std::fs::write(&flag, "https://shop.example\thttps://shop.example/pay\n").unwrap();
+        start(&cfg, &store);
+        assert!(!flag.exists(), "the flag outlived the daemon that wrote it");
+        assert_ne!(store.card(id).unwrap().unwrap().status, "waiting");
     }
 }

@@ -522,7 +522,8 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     // A card's number is in this page's fields (DESIGN §4.25): the page is not read back.
     let (reads, snap) = (reads_back(&argv.rest), snapshots(&argv.rest));
     if reads || snap {
-        if let Some(text) = card_filled(env, &page, reads, snap) {
+        let moved = argv.rest.first().is_some_and(|c| c == "batch") && moves(&argv.rest);
+        if let Some(text) = card_filled(env, &page, reads, snap, moved) {
             return (Next::Refuse(text), None);
         }
     }
@@ -994,6 +995,8 @@ fn reads_back(rest: &[String]) -> bool {
         | "connect" | "console" => true,
         "get" => matches!(sub, Some("value" | "html" | "attr" | "cdp-url")),
         "diff" => sub == Some("screenshot"),
+        // It moves the address and not the page, so `card_filled`'s page line no longer finds it.
+        "pushstate" => true,
         "batch" => args.iter().any(|c| {
             let words = shell_words_split(c);
             reads_back(&words) || reads_back(&split(&words).rest)
@@ -1002,13 +1005,37 @@ fn reads_back(rest: &[String]) -> bool {
     }
 }
 
-/// Whether `rest` is a `snapshot`, or a `batch` holding one: it prints the fields' values.
+/// Whether `rest` is a `snapshot` (or `diff snapshot`, which takes one), or a `batch` holding
+/// one: it prints the fields' values.
 fn snapshots(rest: &[String]) -> bool {
     match rest.split_first() {
         Some((cmd, _)) if cmd == "snapshot" => true,
+        Some((cmd, args)) if cmd == "diff" => args.first().is_some_and(|s| s == "snapshot"),
         Some((cmd, args)) if cmd == "batch" => args.iter().any(|c| {
             let words = shell_words_split(c);
             snapshots(&words) || snapshots(&split(&words).rest)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `rest` moves to another page or address, or is a `batch` holding a command that does.
+fn moves(rest: &[String]) -> bool {
+    const MOVES: &[&str] = &[
+        "open",
+        "goto",
+        "navigate",
+        "back",
+        "forward",
+        "reload",
+        "tab",
+        "pushstate",
+    ];
+    match rest.split_first() {
+        Some((cmd, _)) if MOVES.contains(&cmd.as_str()) => true,
+        Some((cmd, args)) if cmd == "batch" => args.iter().any(|c| {
+            let words = shell_words_split(c);
+            moves(&words) || moves(&split(&words).rest)
         }),
         _ => false,
     }
@@ -1018,8 +1045,9 @@ fn snapshots(rest: &[String]) -> bool {
 /// `cards-filled`, beside the gate socket and written by `cards::live`, lists a line per card
 /// whose number zephyr still keeps: the origin it was typed into and the page, tab separated.
 /// A read-back is refused on that origin; a `snapshot` on that page (its `#…` aside) until it
-/// moves on. No file is no card; one that cannot be read refuses.
-fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool) -> Option<String> {
+/// moves on. A batch that also `moved` is judged by the page before it runs, so while any card
+/// is listed it is refused. No file is no card; one that cannot be read refuses.
+fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool, moved: bool) -> Option<String> {
     let flag = public(env).join(crate::cards::FILLED_FILE);
     let listed = match std::fs::read_to_string(&flag) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -1028,6 +1056,13 @@ fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool) -> Option<String
     };
     if listed.trim().is_empty() {
         return None;
+    }
+    if moved {
+        return Some(
+            "not run: a virtual card is filled, and this batch moves to another page before it \
+             reads a page back; run the move and the read as commands of their own"
+                .into(),
+        );
     }
     let url = page.url();
     let Some(origin) = crate::vault::origin(&url).map(|o| o.ascii_serialization()) else {
@@ -3115,6 +3150,58 @@ cat "$d/$f.json"
         t.page("https://mail.example.com/done", COMPOSE, "");
         assert_eq!(t.run(&["snapshot", "-i"]), Next::Exec);
         assert!(matches!(t.run(&["eval", "1"]), Next::Refuse(_)));
+    }
+
+    /// `diff snapshot` takes a full snapshot and prints what changed: the card's fields too.
+    #[test]
+    fn a_diff_snapshot_of_the_page_a_card_was_just_typed_into_is_refused() {
+        let t = T::new("bg-card-diff");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        std::fs::write(&flag, format!("https://mail.example.com\t{MAIL}\n")).unwrap();
+        for args in [&["diff", "snapshot"][..], &["batch", "diff snapshot"]] {
+            assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?} ran");
+        }
+    }
+
+    /// `pushstate` moves the address without leaving the page, so the page's own line in the
+    /// flag would no longer name it: on a card's origin it is refused as a read-back.
+    #[test]
+    fn a_pushstate_on_a_cards_origin_is_refused() {
+        let t = T::new("bg-card-push");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        assert_eq!(t.run(&["pushstate", "/pay?x"]), Next::Exec);
+        std::fs::write(&flag, format!("https://mail.example.com\t{MAIL}\n")).unwrap();
+        assert!(matches!(t.run(&["pushstate", "/pay?x"]), Next::Refuse(_)));
+        std::fs::write(&flag, "https://other.example\n").unwrap();
+        assert_eq!(t.run(&["pushstate", "/pay?x"]), Next::Exec);
+    }
+
+    /// A batch is judged by the page before it runs: one that moves to another page and reads
+    /// it back (`back` to the card's form, whose values Chrome restores) is refused while any
+    /// card is filled anywhere.
+    #[test]
+    fn a_batch_that_moves_and_reads_back_is_refused_while_a_card_is_filled() {
+        let t = T::new("bg-card-batch");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        let cases: [&[&str]; 4] = [
+            &["batch", "back", "get value #cc"],
+            &["batch", "open https://shop.example/pay", "snapshot"],
+            &["batch", "tab 2", "eval 1"],
+            &["batch", "pushstate /x", "diff snapshot"],
+        ];
+        for args in cases {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        std::fs::write(&flag, "https://shop.example\thttps://shop.example/pay\n").unwrap();
+        for args in cases {
+            assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?} ran");
+        }
+        // Moving alone, or reading alone on a page no card is on, still runs.
+        assert_eq!(t.run(&["batch", "back", "get text @e1"]), Next::Exec);
+        assert_eq!(t.run(&["batch", "get value @e1"]), Next::Exec);
     }
 
     #[test]
