@@ -928,6 +928,11 @@ impl Store {
         &self.db
     }
 
+    /// The database file the store was opened at, as SQLite resolved it.
+    pub fn path(&self) -> Option<&str> {
+        self.db.path()
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

@@ -728,9 +728,11 @@ for line in iter(next_line, None):
         if "[hang]" in cmd["message"]:
             hanging = True; continue
         if "bash: " in cmd["message"] and tools:
-            out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash",
+            # Unique across children, as the `[call ...]` ids are: tests share one process.
+            calls += 1; cid = "t%d-%d" % (os.getpid(), calls)
+            out({"type": "tool_execution_start", "toolCallId": cid, "toolName": "bash",
                  "args": {"command": cmd["message"].split("bash: ", 1)[1]}})
-            out({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash",
+            out({"type": "tool_execution_end", "toolCallId": cid, "toolName": "bash",
                  "isError": False, "result": {"content": [{"type": "text", "text": ""}]}})
             finish(s, "ran"); continue
         if "[tool]" in cmd["message"] and tools:

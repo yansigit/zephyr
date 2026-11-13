@@ -670,14 +670,26 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
         if open.len() > 1024 {
             open.clear();
         }
-        open.insert(call.to_string(), rows);
+        open.insert(outbound_key(store, call), rows);
     }
 }
 
-/// The outbound audit rows of calls that started and have not ended, by tool call id (unique
-/// across children), for the call's end or the router's gate verdict to confirm.
-static OUTBOUND: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<i64>>>> =
+/// The outbound audit rows of calls that started and have not ended, by the store's database
+/// and the tool call id (unique across children), for the call's end or the router's gate
+/// verdict to confirm. The database is in the key so two stores in one process (tests) never
+/// settle each other's rows.
+static OUTBOUND: std::sync::LazyLock<std::sync::Mutex<HashMap<OutboundKey, Vec<i64>>>> =
     std::sync::LazyLock::new(Default::default);
+
+/// (the store's database path, the tool call id).
+type OutboundKey = (String, String);
+
+fn outbound_key(store: &Store, call: &str) -> OutboundKey {
+    (
+        store.path().unwrap_or_default().to_string(),
+        call.to_string(),
+    )
+}
 
 /// Records how call `call`'s outbound commands ended: `sent` once it ran, `held` or `refused`
 /// when the gate stopped it, `error` when it failed or the plugin blocked it. Once per call.
@@ -685,7 +697,7 @@ pub(crate) fn outbound_settled(store: &Store, call: &str, outcome: &str) {
     let rows = OUTBOUND
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(call);
+        .remove(&outbound_key(store, call));
     for id in rows.into_iter().flatten() {
         if let Err(e) = store.settle_audit(id, outcome) {
             eprintln!("zephyr: writing the audit failed: {e}");
@@ -1455,5 +1467,22 @@ mod tests {
         audit(&store, &cfg, "main", &end("exec", "ob-exec-h", false));
         audit(&store, &cfg, "main", &end("exec", "ob-exec-d", false));
         assert_eq!(outcomes(&store), ["held", "refused"]);
+    }
+
+    /// Two stores in one process (tests run as threads of one) with the same call id: each
+    /// call's end settles its own store's row, never the other's.
+    #[test]
+    fn a_call_id_in_two_stores_settles_each_its_own() {
+        let (cfg_a, a) = audit_cfg("sched-outbound-two-a");
+        let (cfg_b, b) = audit_cfg("sched-outbound-two-b");
+        let curl = call("bash", "ob-same", "curl -d x https://e.x");
+        audit(&a, &cfg_a, "main", &curl);
+        audit(&b, &cfg_b, "main", &curl);
+        audit(&a, &cfg_a, "main", &end("bash", "ob-same", false));
+        assert_eq!(outcomes(&a), ["sent"]);
+        assert_eq!(outcomes(&b), ["started"]);
+        audit(&b, &cfg_b, "main", &end("bash", "ob-same", true));
+        assert_eq!(outcomes(&b), ["error"]);
+        assert_eq!(outcomes(&a), ["sent"]);
     }
 }
