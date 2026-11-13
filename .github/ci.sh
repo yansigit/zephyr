@@ -77,14 +77,47 @@ plan() {
   } >> "${GITHUB_OUTPUT:-/dev/stdout}"
 }
 
+# The files this run changes, every path a rename touches on both its sides; fails when it cannot
+# tell. A PR's checkout is its merge into the base, so HEAD^1 is the base. A push compares the
+# commit before it (BEFORE, github.event.before) with this one through the API, so every commit it
+# brought counts, and fails for a new branch (all zeros), a force push (BEFORE not an ancestor) or a
+# comparison GitHub cuts at 300 files.
+changed() {
+  local out
+  case ${GITHUB_EVENT_NAME:-} in
+    pull_request) git diff --name-only --no-renames HEAD^1 HEAD ;;
+    push)
+      [[ ${BEFORE:-} =~ ^[0-9a-f]{40}$ ]] && [[ $BEFORE =~ [1-9a-f] ]] || return 1
+      out=$(api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" \
+        --jq '[.status, (.files | length | tostring)] + [.files[] | .filename, (.previous_filename // empty)] | .[]') ||
+        return 1
+      [ "$(sed -n 1p <<<"$out")" = ahead ] && [ "$(sed -n 2p <<<"$out")" -lt 300 ] || return 1
+      sed 1,2d <<<"$out" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Whether ci.yml itself passed on commit $1 for a pull request: a successful ci.yml run for that
+# head, and a ci-ok check-run made by GitHub Actions in that run's own check suite. A check-run of
+# the same name from any other workflow or app counts for nothing.
+passed() {
+  local suite
+  for suite in $(api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$1&event=pull_request&status=success&per_page=20" \
+    --jq ".workflow_runs[] | select(.head_sha == \"$1\" and .event == \"pull_request\" and .conclusion == \"success\" and .path == \".github/workflows/ci.yml\") | .check_suite_id"); do
+    [[ $suite =~ ^[0-9]+$ ]] || continue
+    [ "$(api "repos/$GITHUB_REPOSITORY/commits/$1/check-runs?check_name=ci-ok&per_page=100" \
+      --jq "[.check_runs[] | select(.name == \"ci-ok\" and .conclusion == \"success\" and .app.slug == \"github-actions\" and .check_suite.id == $suite)] | length")" -gt 0 ] &&
+      return 0
+  done
+  return 1
+}
+
 # Prints why this run needs no checks, or nothing. Only a pull request or a push: the nightly and
-# manual runs always test everything. Needs the checkout's parent (fetch-depth 2).
+# manual runs always test everything.
 why_skip() {
   local files f tree pr head
   case ${GITHUB_EVENT_NAME:-} in pull_request | push) ;; *) return 0 ;; esac
-  # A PR's checkout is its merge into the base, so HEAD^1 is the base for both events.
-  files=$(git diff --name-only HEAD^1 HEAD) || return 0
-  if [ -n "$files" ]; then
+  if files=$(changed) && [ -n "$files" ]; then
     local docs=yes
     while IFS= read -r f; do
       # Markdown outside the code: .github/ holds workflows, crates/ embeds files (assets/web) and
@@ -98,15 +131,16 @@ why_skip() {
       return 0
     fi
   fi
-  # main's merge of a PR rebased onto it is the PR's head tree, which its ci-ok already tested.
+  # main's merge of a PR rebased onto it is the PR's head tree, which its ci.yml run already tested.
   [ "${GITHUB_EVENT_NAME:-}" = push ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || return 0
   tree=$(git rev-parse 'HEAD^{tree}')
-  for pr in $(api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].number') ; do
+  for pr in $(api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].number'); do
+    [[ $pr =~ ^[0-9]+$ ]] || continue
     head=$(api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq '.head.sha') || continue
+    [[ $head =~ ^[0-9a-f]{40}$ ]] || continue
     [ "$(api "repos/$GITHUB_REPOSITORY/git/commits/$head" --jq '.tree.sha')" = "$tree" ] || continue
-    if [ "$(api "repos/$GITHUB_REPOSITORY/commits/$head/check-runs?check_name=ci-ok&per_page=100" \
-      --jq '[.check_runs[] | select(.conclusion == "success")] | length')" -gt 0 ]; then
-      echo "PR #$pr's head $head passed ci-ok on this same tree"
+    if passed "$head"; then
+      echo "PR #$pr's head $head passed ci.yml's ci-ok on this same tree"
       return 0
     fi
   done

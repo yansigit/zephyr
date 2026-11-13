@@ -4848,8 +4848,23 @@ fn only_main_reaches_the_ci_cache() {
             &runner[at..at + 40]
         );
     }
+    // The branch ref itself, which a tag named main cannot shadow.
     assert!(
-        warm.contains("gh api \"repos/$repo/commits/main\" --jq .sha"),
+        warm.contains("gh api \"repos/$repo/git/ref/heads/main\" --jq .object.sha"),
+        "{warm}"
+    );
+    // The build runs as the runner user, as the runners do: no capability left, no-new-privileges.
+    for want in [
+        "--cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN",
+        "--security-opt no-new-privileges",
+        "exec setpriv --reuid=runner",
+    ] {
+        assert!(warm.contains(want), "{want}: {warm}");
+    }
+    // Built into a folder of its own, renamed into place, then pointed at.
+    let built = warm.find("mv -T \"$new\" \"/cache/build-$SHA\"").unwrap();
+    assert!(
+        built < warm.find("mv -T /cache/current.new").unwrap(),
         "{warm}"
     );
     assert!(
@@ -4876,36 +4891,52 @@ fn only_main_reaches_the_ci_cache() {
 }
 
 /// ci.sh plan puts the test job on GitHub's runner for the nightly run alone, and ci.sh skip runs
-/// no checks only for Markdown outside the code or main's merge of a PR whose head passed ci-ok
-/// on the same tree; anything it cannot read means running the checks.
+/// no checks only for Markdown outside the code (renames counted on both sides, every commit of a
+/// push) or for main's merge of a PR whose head passed ci.yml's own ci-ok on the same tree;
+/// anything it cannot read or trust means running the checks. The Actions API is a fake gh that
+/// answers from JSON fixtures through jq, so ci.sh's own filters are what decide.
 #[test]
 fn ci_plans_one_test_job_and_skips_only_what_was_tested() {
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipped: no jq on PATH (CI's runners have it)");
+        return;
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let tmp = std::env::temp_dir().join(format!("zephyr-ci-plan-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let (repo, bin) = (tmp.join("repo"), tmp.join("bin"));
-    std::fs::create_dir_all(repo.join(".github")).unwrap();
-    std::fs::create_dir_all(&bin).unwrap();
+    let (repo, bin, api) = (tmp.join("repo"), tmp.join("bin"), tmp.join("api"));
+    for dir in [repo.join(".github"), bin.clone(), api.clone()] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     std::fs::copy(root.join(".github/ci.sh"), repo.join(".github/ci.sh")).unwrap();
-    // gh as the Actions API answers, after --jq: one merged PR #7 with head FAKE_HEAD on tree
-    // FAKE_TREE, FAKE_OK ci-ok passes, no refused runs; FAKE_FAIL makes every call fail.
     std::fs::write(
         bin.join("gh"),
         r#"#!/bin/sh
 [ -z "$FAKE_FAIL" ] || exit 1
-for a; do case $a in repos/*) e=$a ;; esac; done
+filter=. e=
+while [ $# -gt 0 ]; do
+  case $1 in --jq) filter=$2; shift ;; -H) shift ;; repos/*) e=${1%%\?*} ;; esac
+  shift
+done
 case $e in
-  */commits/*/pulls) echo 7 ;;
-  */pulls/7) echo "$FAKE_HEAD" ;;
-  */git/commits/*) echo "$FAKE_TREE" ;;
-  */check-runs*) echo "$FAKE_OK" ;;
-  */actions/runs*) ;;
+  */compare/*) f=compare ;;
+  */commits/*/pulls) f=pulls ;;
+  */commits/*/check-runs) f=checkruns ;;
+  */pulls/*) f=pr ;;
+  */git/commits/*) f=gitcommit ;;
+  */actions/workflows/ci.yml/runs) f=runs ;;
+  */actions/runs) f=refusals ;;
   *) exit 1 ;;
 esac
+[ -f "$FAKE_API/$f.json" ] || exit 1
+jq -r "$filter" "$FAKE_API/$f.json"
 "#,
     )
     .unwrap();
     std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fixture =
+        |name: &str, json: &str| std::fs::write(api.join(format!("{name}.json")), json).unwrap();
+    fixture("refusals", r#"{"workflow_runs":[]}"#);
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
@@ -4918,18 +4949,22 @@ esac
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    std::fs::create_dir_all(repo.join("crates/zephyr/src")).unwrap();
+    std::fs::write(repo.join("crates/zephyr/src/main.rs"), "fn main() {}\n").unwrap();
     git(&["init", "-q"]);
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
-    // A commit that changes `files`, on top of the base; returns its tree.
-    let change = |files: &[&str]| {
-        git(&["reset", "-q", "--hard", "HEAD~0"]);
-        let base = git(&["rev-list", "--max-parents=0", "HEAD"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    // A commit on the base that writes `files` (and renames `from` to `to`); returns its tree.
+    let change = |files: &[&str], rename: Option<(&str, &str)>| {
         git(&["reset", "-q", "--hard", &base]);
         for f in files {
             let path = repo.join(f);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, format!("{f}\n")).unwrap();
+        }
+        if let Some((from, to)) = rename {
+            git(&["mv", from, to]);
         }
         git(&["add", "-A"]);
         git(&["commit", "-qm", "change"]);
@@ -4943,6 +4978,7 @@ esac
             .args([".github/ci.sh", cmd])
             .current_dir(&repo)
             .env("PATH", path)
+            .env("FAKE_API", &api)
             .env("GITHUB_OUTPUT", &out_file)
             .env("GITHUB_REPOSITORY", "o/r")
             .env("GITHUB_SHA", "a".repeat(40))
@@ -4986,45 +5022,134 @@ esac
     );
     assert_eq!(matrix("schedule", "both"), (nightly, true));
 
+    // A pull request, against its base: Markdown outside the code, and nothing else, runs no
+    // checks; a rename counts on both its sides.
     let pr = [("GITHUB_EVENT_NAME", "pull_request")];
-    // Markdown outside the code: no checks. Inside .github/, crates/ or deploy/, or any other
-    // file: all of them.
-    change(&["README.md", "docs/plans/x.md"]);
+    change(&["README.md", "docs/plans/x.md"], None);
     assert!(skip(&pr).starts_with("only Markdown"), "{}", skip(&pr));
-    for code in [
-        &["README.md", "crates/zephyr/assets/web/x.md"][..],
-        &["deploy/skills/report/SKILL.md"],
-        &[".github/notes.md"],
-        &["README.md", "crates/zephyr/src/lib.rs"],
+    for (code, rename) in [
+        (&["README.md", "crates/zephyr/assets/web/x.md"][..], None),
+        (&["deploy/skills/report/SKILL.md"], None),
+        (&[".github/notes.md"], None),
+        (&["README.md", "crates/zephyr/src/lib.rs"], None),
+        (&[], Some(("crates/zephyr/src/main.rs", "notes.md"))),
     ] {
-        change(code);
-        assert_eq!(skip(&pr), "", "{code:?}");
+        change(code, rename);
+        assert_eq!(skip(&pr), "", "{code:?} {rename:?}");
     }
     // The nightly and manual runs always run everything.
-    change(&["README.md"]);
+    change(&["README.md"], None);
     assert_eq!(skip(&[("GITHUB_EVENT_NAME", "schedule")]), "");
     assert_eq!(skip(&[("GITHUB_EVENT_NAME", "workflow_dispatch")]), "");
 
-    // main's merge of PR #7: skipped only when the PR's head is this tree and passed ci-ok.
-    let tree = change(&["crates/zephyr/src/lib.rs"]);
+    // A push, against the commit before it, every commit it brought.
+    let before = "f".repeat(40);
+    let push = |before: &str| skip(&[("GITHUB_EVENT_NAME", "push"), ("BEFORE", before)]);
+    fixture(
+        "compare",
+        r#"{"status":"ahead","files":[{"filename":"README.md"},{"filename":"docs/a.md"}]}"#,
+    );
+    assert!(
+        push(&before).starts_with("only Markdown"),
+        "{}",
+        push(&before)
+    );
+    // A code commit earlier in the push, though the last one is docs (and HEAD^1..HEAD is too).
+    change(&["README.md"], None);
+    fixture(
+        "compare",
+        r#"{"status":"ahead","files":[{"filename":"README.md"},{"filename":"crates/zephyr/src/lib.rs"}]}"#,
+    );
+    assert_eq!(push(&before), "");
+    // A rename the comparison reports by its new name only.
+    fixture(
+        "compare",
+        r#"{"status":"ahead","files":[{"filename":"notes.md","previous_filename":"crates/zephyr/src/main.rs"}]}"#,
+    );
+    assert_eq!(push(&before), "");
+    // A force push (the commit before is not an ancestor), a new branch (all zeros), no BEFORE,
+    // or a comparison cut at 300 files: everything runs.
+    fixture(
+        "compare",
+        r#"{"status":"diverged","files":[{"filename":"README.md"}]}"#,
+    );
+    assert_eq!(push(&before), "");
+    fixture(
+        "compare",
+        r#"{"status":"ahead","files":[{"filename":"README.md"}]}"#,
+    );
+    assert_eq!(push(&"0".repeat(40)), "");
+    assert_eq!(push(""), "");
+    let many: Vec<String> = (0..300)
+        .map(|i| format!(r#"{{"filename":"d{i}.md"}}"#))
+        .collect();
+    fixture(
+        "compare",
+        &format!(r#"{{"status":"ahead","files":[{}]}}"#, many.join(",")),
+    );
+    assert_eq!(push(&before), "");
+
+    // main's merge of PR #7: skipped only when the PR's head is this tree and ci.yml's own run
+    // for that head passed, its ci-ok check-run made by GitHub Actions in that run's suite.
+    fixture(
+        "compare",
+        r#"{"status":"ahead","files":[{"filename":"crates/zephyr/src/lib.rs"}]}"#,
+    );
+    let tree = change(&["crates/zephyr/src/lib.rs"], None);
     let head = "b".repeat(40);
-    let push = |tree: &str, ok: &str, fail: &str| {
+    fixture("pulls", r#"[{"number":7}]"#);
+    fixture("pr", &format!(r#"{{"head":{{"sha":"{head}"}}}}"#));
+    fixture("gitcommit", &format!(r#"{{"tree":{{"sha":"{tree}"}}}}"#));
+    let run = |path: &str, event: &str, conclusion: &str| {
+        format!(
+            r#"{{"workflow_runs":[{{"head_sha":"{head}","event":"{event}","conclusion":"{conclusion}","path":"{path}","check_suite_id":111}}]}}"#
+        )
+    };
+    let ci_yml = ".github/workflows/ci.yml";
+    let ok = |slug: &str, suite: u32| {
+        format!(
+            r#"{{"check_runs":[{{"name":"ci-ok","conclusion":"success","app":{{"slug":"{slug}"}},"check_suite":{{"id":{suite}}}}}]}}"#
+        )
+    };
+    fixture("runs", &run(ci_yml, "pull_request", "success"));
+    fixture("checkruns", &ok("github-actions", 111));
+    assert!(
+        push(&before).starts_with("PR #7's head"),
+        "{}",
+        push(&before)
+    );
+    // A ci-ok from another app, or from another workflow's check suite: forged, so no skip.
+    fixture("checkruns", &ok("evil-app", 111));
+    assert_eq!(push(&before), "");
+    fixture("checkruns", &ok("github-actions", 222));
+    assert_eq!(push(&before), "");
+    fixture("checkruns", &ok("github-actions", 111));
+    // No passing ci.yml run of a pull request for that head.
+    for runs in [
+        run(".github/workflows/other.yml", "pull_request", "success"),
+        run(ci_yml, "push", "success"),
+        run(ci_yml, "pull_request", "failure"),
+    ] {
+        fixture("runs", &runs);
+        assert_eq!(push(&before), "", "{runs}");
+    }
+    fixture("runs", &run(ci_yml, "pull_request", "success"));
+    // Another tree, or an API that cannot be read: everything runs.
+    fixture(
+        "gitcommit",
+        &format!(r#"{{"tree":{{"sha":"{}"}}}}"#, "c".repeat(40)),
+    );
+    assert_eq!(push(&before), "");
+    fixture("gitcommit", &format!(r#"{{"tree":{{"sha":"{tree}"}}}}"#));
+    assert!(push(&before).starts_with("PR #7's head"));
+    assert_eq!(
         skip(&[
             ("GITHUB_EVENT_NAME", "push"),
-            ("FAKE_HEAD", &head),
-            ("FAKE_TREE", tree),
-            ("FAKE_OK", ok),
-            ("FAKE_FAIL", fail),
-        ])
-    };
-    assert!(
-        push(&tree, "1", "").starts_with("PR #7's head"),
-        "{}",
-        push(&tree, "1", "")
+            ("BEFORE", &before),
+            ("FAKE_FAIL", "1")
+        ]),
+        ""
     );
-    assert_eq!(push(&"c".repeat(40), "1", ""), "");
-    assert_eq!(push(&tree, "0", ""), "");
-    assert_eq!(push(&tree, "1", "1"), "");
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

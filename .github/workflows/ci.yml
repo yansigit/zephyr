@@ -50,6 +50,7 @@ jobs:
         run: .github/ci.sh skip
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
   check:
     needs: plan
     if: needs.plan.outputs.skip == ''
@@ -88,7 +89,7 @@ jobs:
   # failed is never rescued.
   rescue:
     needs: [plan, check]
-    if: always() && needs.plan.outputs.rescue == 'true' && needs.check.result == 'failure'
+    if: ${{ !cancelled() && needs.plan.outputs.rescue == 'true' && needs.check.result == 'failure' }}
     runs-on: zephyr-local
     timeout-minutes: 45
     steps:
@@ -110,7 +111,8 @@ jobs:
           CHECKS: ${{ steps.which.outputs.checks }}
   ci-ok:
     needs: [plan, check, rescue]
-    if: always()
+    # A superseded run, cancelled, posts no failed ci-ok.
+    if: ${{ !cancelled() }}
     runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
     timeout-minutes: 5
     steps:
