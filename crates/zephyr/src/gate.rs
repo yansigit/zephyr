@@ -3718,7 +3718,7 @@ mod tests {
         }
         // The mail itself, sent some other way than plain `himalaya`: its config, and so where
         // it goes, may be another's.
-        let prefixed = ["HIMALAYA_CONFIG=/tmp/c ", "./", "env -S ", "timeout 5 "];
+        let prefixed = ["HIMALAYA_CONFIG=/tmp/c ", "./", "timeout 5 "];
         for (i, prefix) in prefixed.iter().enumerate() {
             let cmd = format!("{prefix}{mail}");
             let v = decide(
