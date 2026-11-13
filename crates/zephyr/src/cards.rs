@@ -657,12 +657,49 @@ pub mod live {
         write_flag(&flag, &all);
     }
 
-    /// The pages whose fields hold a kept number, `origin<TAB>page` a line; no file for none.
+    /// At a start: the flag a daemon before this one left keeps its lines until `KEEP_SECS`
+    /// past its last write, as its own lines would have, since the number may still be in an
+    /// open page; [`sweep_left`] then drops them.
+    pub fn inherit(cfg: &Config) {
+        let flag = crate::drafts::public_dir(cfg).join(FILLED_FILE);
+        let Ok(text) = std::fs::read_to_string(&flag) else {
+            return; // none; or one that cannot be read, which stays and refuses
+        };
+        let wrote = std::fs::metadata(&flag).and_then(|m| m.modified()).ok();
+        let wrote = wrote.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        let until = wrote.map_or_else(crate::now, |d| d.as_secs() as i64) + KEEP_SECS;
+        let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+        left.retain(|(f, ..)| *f != flag);
+        let lines = text.lines().filter(|l| !l.trim().is_empty());
+        left.extend(lines.map(|l| (flag.clone(), l.to_string(), until)));
+    }
+
+    /// Lines an earlier daemon left in a flag ([`inherit`]): the flag, the line, and when it goes.
+    static LEFT: Mutex<Vec<(PathBuf, String, i64)>> = Mutex::new(Vec::new());
+
+    /// Drops the lines an earlier daemon left once their hour is over, rewriting their flags.
+    pub fn sweep_left(now: i64) {
+        let mut flags: Vec<PathBuf> = {
+            let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+            let gone = (left.iter().filter(|(.., until)| *until <= now)).map(|(f, ..)| f.clone());
+            let gone = gone.collect();
+            left.retain(|(.., until)| *until > now);
+            gone
+        };
+        flags.dedup();
+        let all = lock();
+        flags.iter().for_each(|flag| write_flag(flag, &all));
+    }
+
+    /// The pages whose fields hold a kept number, `origin<TAB>page` a line, with the lines an
+    /// earlier daemon left that are not over yet; no file for none.
     fn write_flag(flag: &std::path::Path, all: &[Held]) {
+        let left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
         let mut origins: Vec<&str> = (all.iter())
             .filter_map(|h| h.filled.as_ref())
             .filter(|(f, _)| f == flag)
             .map(|(_, line)| line.as_str())
+            .chain((left.iter().filter(|(f, ..)| f == flag)).map(|(_, l, _)| l.as_str()))
             .collect();
         origins.sort_unstable();
         origins.dedup();
@@ -1798,6 +1835,7 @@ fn closed(
     now: i64,
 ) {
     // Whatever the issuer said: the number is never filled again.
+    fills::stop(cfg.state_dir(), card.id);
     live::forget(cfg.state_dir(), card.id, now);
     // Asked before the issuer had made the card, so with nothing there to close: if the issue
     // has landed since, the close it made is the one recorded (`issue`).
@@ -1989,6 +2027,7 @@ const LANDED: &str = "it was closed while it was being issued";
 /// past its expiry, or due (every 30 s), has its issuer asked, off the loop.
 pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     live::sweep(now);
+    live::sweep_left(now);
     let words: Vec<(Card, Word)> = {
         let mut all = WORDS.lock().unwrap_or_else(|e| e.into_inner());
         let state = cfg.state_dir();
@@ -2120,6 +2159,7 @@ fn stated(
             });
         }
         Ok(CardState::Closed) => {
+            fills::stop(cfg.state_dir(), card.id);
             live::forget(cfg.state_dir(), card.id, now);
             let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
             let moved = store.move_card(card.id, &UNSETTLED, "closed", now);
@@ -2133,6 +2173,7 @@ fn stated(
             }
         }
         Ok(CardState::Failed(why)) => {
+            fills::stop(cfg.state_dir(), card.id);
             live::forget(cfg.state_dir(), card.id, now);
             let why = crate::vault::scrubbed(cfg, why);
             let text = format!("[zephyr] card #{} was not issued: {why}", card.id);
@@ -2157,6 +2198,7 @@ fn stated(
 /// the agent are told who charged it when that answer is in ([`used_closed`]).
 fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i64) {
     let Some(first) = charges.first() else { return };
+    fills::stop(cfg.state_dir(), card.id);
     live::forget(cfg.state_dir(), card.id, now);
     // The window counts what the issuer took in all, when that is more than the cap; in another
     // currency it cannot be counted, and the window holds the next payment as over.
@@ -2232,11 +2274,11 @@ pub fn close_all(cfg: &Arc<Config>, store: &Store, why: &'static str) {
     }
 }
 
-/// A start: the cards the daemon before this one had open are closed, and its `FILLED_FILE`
-/// goes with them, since this daemon keeps no number to refuse a read-back for.
+/// A start: the cards the daemon before this one had open are closed. Its `FILLED_FILE` stays
+/// as the tick's to remove ([`live::inherit`]): the number may still be in an open page.
 pub fn start(cfg: &Arc<Config>, store: &Store) {
     close_all(cfg, store, "zephyr restarted and forgot its number");
-    let _ = std::fs::remove_file(crate::drafts::public_dir(cfg).join(FILLED_FILE));
+    live::inherit(cfg);
 }
 
 fn log<T>(done: rusqlite::Result<T>) {
@@ -2887,16 +2929,85 @@ mod tests {
         assert!(stopped.is_ok(), "the fill in hand was not stopped");
     }
 
-    /// At a start no number is kept and every card was just closed: the flag a daemon before
-    /// this one left, which refuses the browser's read-backs, goes too.
+    /// Every close stops a fill in hand: the issuer saying the card is closed, a charge coming
+    /// in, and the answer to a close asked of it.
     #[tokio::test]
-    async fn a_start_removes_the_filled_flag_it_was_left() {
+    async fn a_close_from_the_issuer_or_a_charge_stops_a_fill() {
+        let wait = std::time::Duration::from_millis(200);
+        let (cfg, store, id) = manual_card("cards-stop-fill");
+        let now = crate::now();
+        let card = || store.card(id).unwrap().unwrap();
+        let stop = fills::start(cfg.state_dir(), id);
+        stated(&cfg, &store, card(), Ok(CardState::Closed), now);
+        let stopped = tokio::time::timeout(wait, stop.notified()).await.is_ok();
+        fills::end(cfg.state_dir(), id, &stop);
+        assert!(stopped, "the issuer's close left the fill running");
+        let (cfg, store, id) = manual_card("cards-stop-fill-charge");
+        let charge = Charge {
+            minor: 500,
+            currency: "CAD".into(),
+            merchant_id: None,
+            descriptor: None,
+            mcc: None,
+        };
+        let stop = fills::start(cfg.state_dir(), id);
+        used(
+            &cfg,
+            &store,
+            store.card(id).unwrap().unwrap(),
+            &[charge],
+            now,
+        );
+        let stopped = tokio::time::timeout(wait, stop.notified()).await.is_ok();
+        fills::end(cfg.state_dir(), id, &stop);
+        assert!(stopped, "a charge left the fill running");
+        let (cfg, store, id) = manual_card("cards-stop-fill-closed");
+        let stop = fills::start(cfg.state_dir(), id);
+        let card = store.card(id).unwrap().unwrap();
+        closed(&cfg, &store, &card, "the owner's /stop", Ok(()), now);
+        let stopped = tokio::time::timeout(wait, stop.notified()).await.is_ok();
+        fills::end(cfg.state_dir(), id, &stop);
+        assert!(stopped, "a close's answer left the fill running");
+    }
+
+    /// After a re-exec or a crash the number may still be in the agent's open page: the flag
+    /// the daemon before this one left keeps its lines, beside any card filled since, until
+    /// an hour past its last write, and then the tick removes it. It never stays for good.
+    #[tokio::test]
+    async fn a_start_keeps_the_filled_flag_an_hour_past_its_last_write() {
         let (cfg, store, id) = manual_card("cards-start-flag");
         let flag = crate::drafts::public_dir(&cfg).join(FILLED_FILE);
         std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
         std::fs::write(&flag, "https://shop.example\thttps://shop.example/pay\n").unwrap();
+        let wrote = std::fs::metadata(&flag).unwrap().modified().unwrap();
+        let wrote = wrote
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         start(&cfg, &store);
-        assert!(!flag.exists(), "the flag outlived the daemon that wrote it");
         assert_ne!(store.card(id).unwrap().unwrap().status, "waiting");
+        assert!(flag.exists(), "the number may still be in the open page");
+        live::sweep_left(wrote + KEEP_SECS - 1);
+        assert!(flag.exists());
+        // A card filled meanwhile keeps the old line beside its own, and its drop keeps it.
+        live::put(cfg.state_dir(), 99, pan("4242 4242 4242 4242", "123"));
+        live::filled(
+            &cfg,
+            99,
+            "https://other.example",
+            "https://other.example/pay",
+        );
+        let text = std::fs::read_to_string(&flag).unwrap();
+        assert!(
+            text.contains("https://shop.example\t") && text.contains("https://other.example\t")
+        );
+        live::forget(cfg.state_dir(), 99, -KEEP_SECS);
+        live::sweep(1);
+        assert_eq!(
+            std::fs::read_to_string(&flag).unwrap(),
+            "https://shop.example\thttps://shop.example/pay\n"
+        );
+        live::sweep_left(wrote + KEEP_SECS);
+        assert!(!flag.exists(), "the flag outlived its hour");
     }
 }
