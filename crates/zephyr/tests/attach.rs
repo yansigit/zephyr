@@ -333,6 +333,46 @@ async fn command_replies_and_notices_reach_the_attached_client() {
     gw.shutdown().await;
 }
 
+/// The TUI's way in (DESIGN §4.3.1): the daemon proves it holds the token over both nonces,
+/// then the client does, and the token itself is never sent. A wrong proof, or one with no
+/// challenge before it, is refused and the connection closed.
+#[tokio::test]
+async fn the_daemon_proves_itself_and_takes_a_proof_in_place_of_the_token() {
+    use zephyr::attach::{nonce, proof, proven, BY_CLIENT, BY_DAEMON};
+    let gw = start("challenge");
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.prove", json!({"proof": "00"})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    assert!(c.read().await.is_none(), "a prove with no challenge closes");
+
+    async fn challenge(c: &mut Client) -> ([u8; 32], Vec<u8>) {
+        let (mine, hex) = nonce();
+        let said = c.call("zephyr.challenge", json!({"nonce": hex})).await;
+        let theirs = said["result"]["nonce"].as_str().unwrap().to_string();
+        let theirs = data_encoding::HEXLOWER.decode(theirs.as_bytes()).unwrap();
+        let given = said["result"]["proof"].as_str().unwrap();
+        assert!(proven(TOKEN, BY_DAEMON, &mine, &theirs, given), "{said}");
+        // A daemon's proof is never a client's.
+        assert!(!proven(TOKEN, BY_CLIENT, &mine, &theirs, given));
+        (mine, theirs)
+    }
+    let mut c = Client::connect(gw.port).await;
+    let (mine, theirs) = challenge(&mut c).await;
+    let wrong = proof("not-the-token", BY_CLIENT, &mine, &theirs);
+    let bad = c.call("zephyr.prove", json!({"proof": wrong})).await;
+    assert_eq!(bad["error"]["code"], -32001, "{bad}");
+    assert!(c.read().await.is_none(), "a wrong proof closes");
+
+    let mut c = Client::connect(gw.port).await;
+    let (mine, theirs) = challenge(&mut c).await;
+    let right = proof(TOKEN, BY_CLIENT, &mine, &theirs);
+    let ok = c.call("zephyr.prove", json!({"proof": right})).await;
+    assert_eq!(ok["result"]["authenticated"], true, "{ok}");
+    let hello = c.call("zephyr.hello", json!({})).await;
+    assert!(hello.get("result").is_some(), "{hello}");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn bad_token_is_rejected() {
     let gw = start("badtoken");

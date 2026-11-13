@@ -373,12 +373,27 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
             let mut changed = false;
             // A grant was taken back on this connection.
             let mut revoked = false;
+            // The nonces of this connection's `zephyr.challenge`: the TUI's and ours.
+            let mut nonces = None;
             let frame = |v: Value| format!("{v}\n");
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
                 let id = req["id"].clone();
                 let result = match req["method"].as_str().unwrap() {
-                    "authenticate" if req["params"]["token"] == TOKEN => {
+                    "zephyr.challenge" => {
+                        let hex = req["params"]["nonce"].as_str().unwrap();
+                        let tui = data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap();
+                        let (ours, hex) = zephyr::attach::nonce();
+                        let proof =
+                            zephyr::attach::proof(TOKEN, zephyr::attach::BY_DAEMON, &tui, &ours);
+                        nonces = Some((tui, ours));
+                        json!({"nonce": hex, "proof": proof})
+                    }
+                    "zephyr.prove" => {
+                        let (tui, ours) = nonces.take().unwrap();
+                        let given = req["params"]["proof"].as_str().unwrap();
+                        let by = zephyr::attach::BY_CLIENT;
+                        assert!(zephyr::attach::proven(TOKEN, by, &tui, &ours, given));
                         json!({"authenticated": true})
                     }
                     "zephyr.hello" => snapshot(scene),

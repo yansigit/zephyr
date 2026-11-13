@@ -439,7 +439,27 @@ async fn session(
         lines: &mut lines,
         id: 0,
     };
-    rpc.call("authenticate", json!({"token": token}))
+    // The token never crosses the socket (DESIGN §4.3.1): the daemon proves it holds it first,
+    // so a program holding the attach port while the daemon is down learns nothing, and the
+    // TUI stops there rather than send it the vault's or the facts' values.
+    use crate::attach::{proof, proven, BY_CLIENT, BY_DAEMON};
+    let impostor = format!(
+        "whatever answers on {addr} could not prove it is your zephyr daemon, so nothing was \
+         sent to it: another program may hold the attach port (run zephyr restart, then \
+         attach again), or this attach token is not the daemon's"
+    );
+    let (client, hex) = crate::attach::nonce();
+    let said = rpc.call("zephyr.challenge", json!({"nonce": hex})).await;
+    let said = said.map_err(|e| fatal(e, &impostor))?;
+    let daemon = (said["nonce"].as_str())
+        .and_then(|n| data_encoding::HEXLOWER.decode(n.as_bytes()).ok())
+        .filter(|n| n.len() == crate::attach::NONCE);
+    let given = said["proof"].as_str().unwrap_or_default();
+    let Some(daemon) = daemon.filter(|d| proven(token, BY_DAEMON, &client, d, given)) else {
+        return Err(Fail::Fatal(impostor));
+    };
+    let mine = proof(token, BY_CLIENT, &client, &daemon);
+    rpc.call("zephyr.prove", json!({"proof": mine}))
         .await
         .map_err(|e| fatal(e, "the attach token was refused"))?;
     let hello = rpc.call("zephyr.hello", json!({})).await.map_err(|e| {
@@ -864,9 +884,9 @@ impl Rpc<'_> {
     }
 }
 
-/// The tests' scripted attach daemon: answers the three handshake calls (and refuses a
-/// wrong token), so a test can then script whatever the panel asks for. Shared with
-/// `tui::mod`'s tests, which drive the same fake to a login panel.
+/// The tests' scripted attach daemon: answers the handshake, proving itself with `token`
+/// and refusing a client that cannot, so a test can then script whatever the panel asks for.
+/// Shared with `tui::mod`'s tests, which drive the same fake to a login panel.
 #[cfg(test)]
 pub(crate) async fn handshake(
     lines: &mut Lines<BufReader<OwnedReadHalf>>,
@@ -874,15 +894,29 @@ pub(crate) async fn handshake(
     token: &str,
     model: &str,
 ) -> Option<()> {
-    for _ in 0..3 {
+    use crate::attach::{proof, proven, BY_CLIENT, BY_DAEMON};
+    let mut nonces = None;
+    for _ in 0..4 {
         let req: Value = serde_json::from_str(&lines.next_line().await.ok()??).ok()?;
         let id = &req["id"];
         let answer = match req["method"].as_str()? {
-            "authenticate" if req["params"]["token"] == token => {
-                json!({"jsonrpc": "2.0", "id": id, "result": {"authenticated": true}})
+            "zephyr.challenge" => {
+                let hex = req["params"]["nonce"].as_str()?;
+                let client = data_encoding::HEXLOWER.decode(hex.as_bytes()).ok()?;
+                let (daemon, hex) = crate::attach::nonce();
+                let proof = proof(token, BY_DAEMON, &client, &daemon);
+                nonces = Some((client, daemon));
+                json!({"jsonrpc": "2.0", "id": id, "result": {"nonce": hex, "proof": proof}})
             }
-            "authenticate" => {
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "invalid token"}})
+            "zephyr.prove" => {
+                let (client, daemon) = nonces.take()?;
+                let given = req["params"]["proof"].as_str()?;
+                match proven(token, BY_CLIENT, &client, &daemon, given) {
+                    true => json!({"jsonrpc": "2.0", "id": id, "result": {"authenticated": true}}),
+                    false => {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "invalid proof"}})
+                    }
+                }
             }
             "zephyr.hello" => {
                 json!({"jsonrpc": "2.0", "id": id, "result": {"session": "main", "model": model, "run": {"busy": false}}})
@@ -1444,6 +1478,77 @@ mod tests {
         assert!(!bad(&v.to_string()), "{v}");
     }
 
+    /// Whatever listens on the attach address (the agent's program, while the daemon is down)
+    /// and agrees to everything never hears the token, and the TUI stops there, saying why.
+    #[tokio::test]
+    async fn a_listener_that_cannot_prove_itself_never_gets_the_token() {
+        const TOKEN: &str = "s3cret-attach-token";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let heard = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let mut heard = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                heard.push_str(&line);
+                let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                // An impostor's best: yes to anything, with a proof it cannot make.
+                let answer = json!({"jsonrpc": "2.0", "id": req["id"], "result": {
+                    "authenticated": true, "nonce": "00".repeat(32), "proof": "00".repeat(32)}});
+                if w.write_all(format!("{answer}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            heard
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ptx, prx) = mpsc::unbounded_channel();
+        let on = run(addr, TOKEN.into(), tx, prx);
+        let gone = tokio::time::timeout(Duration::from_secs(10), on).await;
+        assert!(gone.is_ok(), "the TUI stayed on the impostor");
+        match rx.recv().await {
+            Some(Msg::Fatal(e)) => assert!(e.contains("could not prove"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        let heard = heard.await.unwrap();
+        assert!(
+            !heard.contains(TOKEN),
+            "the token reached the listener: {heard}"
+        );
+        assert!(heard.contains("zephyr.challenge"), "{heard}");
+    }
+
+    /// An impostor that answers the challenge with nothing, or with an error, is no daemon
+    /// either: the TUI ends with the same words, and never sends a prove.
+    #[tokio::test]
+    async fn an_impostor_that_refuses_the_challenge_is_fatal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let heard = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let mut heard = vec![];
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                heard.push(req["method"].as_str().unwrap_or_default().to_string());
+                let answer = json!({"jsonrpc": "2.0", "id": req["id"], "result": {}});
+                if w.write_all(format!("{answer}\n").as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            heard
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ptx, prx) = mpsc::unbounded_channel();
+        let on = run(addr, "tok".into(), tx, prx);
+        let gone = tokio::time::timeout(Duration::from_secs(10), on).await;
+        assert!(gone.is_ok(), "the TUI stayed on the impostor");
+        assert!(matches!(rx.recv().await, Some(Msg::Fatal(e)) if e.contains("could not prove")));
+        assert_eq!(heard.await.unwrap(), ["zephyr.challenge"]);
+    }
+
     #[tokio::test]
     async fn a_refused_token_is_fatal() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1457,7 +1562,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ptx, prx) = mpsc::unbounded_channel();
         run(addr, "wrong".into(), tx, prx).await;
-        assert!(matches!(rx.recv().await, Some(Msg::Fatal(e)) if e.contains("token was refused")));
+        assert!(matches!(rx.recv().await, Some(Msg::Fatal(e)) if e.contains("could not prove")));
     }
 
     #[test]

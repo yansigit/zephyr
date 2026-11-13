@@ -533,6 +533,8 @@ async fn methods_closed_to_the_web_app_answer_32601() {
     let mut ws = gw.ws(&gw.cookie("phone")).await;
     for method in [
         "authenticate",
+        "zephyr.challenge",
+        "zephyr.prove",
         "start_session",
         "subscribe",
         "stop_session",
