@@ -52,21 +52,23 @@ jobs:
       # The toolchain the image builds with (deploy/Dockerfile's rust:1.95), so a newer clippy's lints
       # land with a deliberate bump, not on an unrelated PR.
       - if: runner.environment == 'github-hosted'
-        uses: dtolnay/rust-toolchain@1.95
+        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
         with:
           components: rustfmt, clippy
       - if: runner.environment == 'github-hosted' && matrix.check != 'deny'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ${{ matrix.check == 'lint' && 'lint' || 'test' }}
       - if: runner.environment == 'github-hosted'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest@0.9.146,cargo-deny@0.20.2
       # tests/tui.rs drives tmux and skips without it; script, python3 and node come with the runner.
       - if: runner.environment == 'github-hosted' && startsWith(matrix.check, 'test')
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
-      - run: .github/ci.sh run "${{ matrix.check }}"
+      - run: .github/ci.sh run "$CHECK"
+        env:
+          CHECK: ${{ matrix.check }}
   # A hosted job GitHub would not start (spending limit or quota) runs here instead; one that ran and
   # failed is never rescued.
   rescue:

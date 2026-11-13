@@ -10,13 +10,13 @@
 # The token that can push never shares a machine with the code the bump brings (the new rpi binary,
 # the new crates' build scripts):
 # - `gate` picks the version and stops here when an open PR for it already waits for a person;
-# - `build` bumps and tests with no token and hands on its diff;
+# - `build` bumps and tests with no token, in a throwaway container, and hands on its diff;
 # - `push`, on a fresh GitHub-hosted runner, checks that diff against its own checkout and the
 #   release's own sha256s (.github/bump-check.py), applies it, pushes, opens the PR and merges. It
 #   never runs cargo or anything the build made.
-# `gate` and `build` follow variable ZEPHYR_CI as ci.yml does (.github/ci.sh plan, README "CI"): on
-# zephyr-local, unless that is `hosted`. `push` is hosted only: when GitHub will not start it
-# (quota, spending limit) it fails and the bump waits for the next day's run.
+# `gate` follows variable ZEPHYR_CI as ci.yml does (README "CI"): on zephyr-local, unless that is
+# `hosted`. `build` (for its Docker) and `push` are hosted only: when GitHub will not start them
+# (quota, spending limit) they fail and the bump waits for the next day's run.
 name: rpi-bump
 on:
   schedule:
@@ -52,30 +52,17 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "go=$([ "$open" = 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           [ "$open" = 0 ] || echo "an open PR for rpi $v waits for a person; nothing to do"
-  plan:
+  # No token in any step, and everything that runs the bump's code (bump-rpi.sh runs the new rpi
+  # binary and `cargo update`; the tests run the new crates' build scripts) runs in a throwaway
+  # container (.github/sandbox.sh), where it cannot see the runner's processes, whose environment
+  # holds the Actions runtime token (which can write the cache main's jobs restore), nor outlive its
+  # step. GitHub-hosted, for its Docker daemon: zephyr-local's runners have none. No toolchain or
+  # cache action runs here. What it hands on is its diff, which `push` checks before using it.
+  build:
     needs: gate
     if: needs.gate.outputs.go == 'true'
-    runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      runner: ${{ steps.plan.outputs.local }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - id: plan
-        run: .github/ci.sh plan
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
-  # No token in any step: what it hands on is its diff, which `push` checks before using it.
-  build:
-    needs: [gate, plan]
-    runs-on: ${{ needs.plan.outputs.runner }}
-    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
     outputs:
@@ -88,15 +75,22 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      # The sandbox's image and a copy of its script, made before anything untrusted runs.
+      - run: |
+          .github/sandbox.sh image
+          cp .github/sandbox.sh "$RUNNER_TEMP/sandbox.sh"
       - id: bump
-        run: deploy/bump-rpi.sh "$VERSION"
         env:
           VERSION: ${{ needs.gate.outputs.version }}
-          RPI_BUMP_DIR: ${{ runner.temp }}/rpi
-      # Taken before the tests run the new crates' build scripts, though bump-rpi.sh has already run
-      # the new rpi binary (its --version). Nothing that binary does outlasts this job (zephyr-local's
-      # runners are ephemeral, README "CI"), and whatever it wrote into the diff `push` refuses
-      # unless it is the pin move. No system or user git config shapes the diff's headers.
+        run: |
+          mkdir -p target
+          SANDBOX_ENV="VERSION RPI_BUMP_DIR=/src/target/rpi GITHUB_OUTPUT=/src/target/bump.out" \
+            "$RUNNER_TEMP/sandbox.sh" run deploy/bump-rpi.sh "$VERSION"
+          # Only the version, in its shape, from what the sandbox wrote.
+          v=$(sed -n 's/^version=\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' target/bump.out 2>/dev/null | head -1)
+          [ -z "$v" ] || echo "version=$v" >> "$GITHUB_OUTPUT"
+      # Taken before the tests. The sandbox saw .git read only, so no config of its own shapes
+      # this; whatever the bump wrote into the files, `push` refuses unless it is the pin move.
       - if: steps.bump.outputs.version != ''
         run: |
           GIT_CONFIG_NOSYSTEM=1 HOME=$(mktemp -d) git -c core.quotePath=true diff --no-ext-diff \
@@ -110,26 +104,14 @@ jobs:
           retention-days: 7
           # "Re-run all jobs" uploads it again.
           overwrite: true
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != ''
-        uses: dtolnay/rust-toolchain@1.95
-        with:
-          components: rustfmt, clippy
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != ''
-        uses: Swatinem/rust-cache@v2
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != ''
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
       - id: test
         if: steps.bump.outputs.version != ''
-        env:
-          RPI_BIN: ${{ steps.bump.outputs.rpi }}
-          ZEPHYR_REAL_RPI: "1"
-          # The runner empties its temp dir before each job; zephyr-local's /tmp would only grow.
-          TMPDIR: ${{ runner.temp }}
         run: |
-          cargo fmt --all --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --workspace
-          cargo test --workspace -- --ignored
+          SANDBOX_ENV="ZEPHYR_REAL_RPI=1 RPI_BIN=/src/target/rpi/rpi" "$RUNNER_TEMP/sandbox.sh" run sh -c '
+            cargo fmt --all --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test --workspace
+            cargo test --workspace -- --ignored'
   # The one job with a token that can push: a fresh GitHub-hosted runner, never zephyr-local, and
   # nothing rescues it onto zephyr-local. GH_TOKEN is only on the steps that talk to GitHub
   # (tests/host.rs no_step_that_runs_cargo_holds_a_github_token).

@@ -3724,12 +3724,21 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
                 .find(|&j| indent(lines[j]) < indent(lines[at]))
         };
         for (i, line) in lines.iter().enumerate() {
-            if let Some(at) = line.trim_start().strip_prefix("- uses: actions/checkout@") {
-                let sha = at.split_whitespace().next().unwrap();
+            // Every action by commit SHA, with the version it is as a comment.
+            let uses = line.trim_start().trim_start_matches("- ");
+            if let Some(action) = uses.strip_prefix("uses: ") {
+                let (_, rest) = action.split_once('@').unwrap();
+                let sha = rest.split_whitespace().next().unwrap();
                 assert!(
                     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "{path:?}: checkout pinned by tag: {line}"
+                    "{path:?}: an action pinned by tag: {line}"
                 );
+                assert!(
+                    rest[40..].starts_with(" # "),
+                    "{path:?}: no version comment: {line}"
+                );
+            }
+            if line.trim_start().starts_with("- uses: actions/checkout@") {
                 assert!(
                     block(i).contains("persist-credentials: false"),
                     "{path:?}: {}",
@@ -3767,6 +3776,38 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             assert!(
                 !build.contains("GH_TOKEN") && !build.contains("token"),
                 "{build}"
+            );
+            // Its cargo and the bump run only in the sandbox (a throwaway container, from a copy
+            // of the script made first), on a hosted runner for its Docker, with no cache action.
+            assert!(build.contains("\n    runs-on: ubuntu-latest\n"), "{build}");
+            let sandboxed = "\"$RUNNER_TEMP/sandbox.sh\" run ";
+            // With what the sandbox runs taken out (the bump, and the tests' quoted script),
+            // nothing in the job names cargo or the bump.
+            let mut outside = build.replace(&format!("{sandboxed}deploy/bump-rpi.sh "), "");
+            let tests = format!("{sandboxed}sh -c '");
+            let at = outside.find(&tests).expect("the tests run in the sandbox");
+            let end = at + tests.len() + outside[at + tests.len()..].find('\'').unwrap();
+            outside.replace_range(at..=end, "");
+            let words: Vec<&str> =
+                (outside.split(|c: char| c.is_whitespace() || c == ';')).collect();
+            for never in [
+                "cargo",
+                "deploy/bump-rpi.sh",
+                "rust-cache",
+                "rust-toolchain",
+            ] {
+                assert!(
+                    !words.iter().any(|w| w.contains(never)),
+                    "{never} outside the sandbox:\n{outside}"
+                );
+            }
+            let copy = build
+                .find("cp .github/sandbox.sh \"$RUNNER_TEMP/sandbox.sh\"")
+                .unwrap();
+            assert!(copy < build.find(sandboxed).unwrap(), "{build}");
+            let sandbox = read(&root.join(".github/sandbox.sh"));
+            assert!(
+                sandbox.contains("docker run --rm -v \"$PWD:/src\" -v \"$PWD/.git:/src/.git:ro\"")
             );
             let push = job("  push:");
             let words: Vec<&str> = push
@@ -4792,6 +4833,15 @@ fn only_the_image_workflow_can_use_the_local_builder() {
     let image = read(&root.join(".github/workflows/image.yml"));
     for want in ["cacert=", "cert=", "key=", "servername=zephyr-buildkitd"] {
         assert!(image.contains(want), "{want}");
+    }
+    // A release uses no Actions cache, which other runs can write, anywhere.
+    let gha: Vec<&str> = image.lines().filter(|l| l.contains("type=gha")).collect();
+    assert_eq!(gha.len(), 4, "{gha:?}");
+    for line in gha {
+        assert!(
+            line.contains("!startsWith(github.ref, 'refs/tags/v')"),
+            "{line}"
+        );
     }
     let runner = read(&root.join("deploy/runner/start.sh"));
     assert!(runner

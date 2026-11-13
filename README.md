@@ -1403,7 +1403,7 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
 - `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
   check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
 
-`rpi-bump.yml` builds and tests here unless `ZEPHYR_CI=hosted`, and pushes from GitHub-hosted only (below); `image.yml` as above.
+`rpi-bump.yml` asks here whether a bump is due, and builds, tests and pushes on GitHub-hosted runners only (below); `image.yml` as above.
 
 The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
 `deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
@@ -1445,7 +1445,10 @@ tests and the real-rpi suite against the new binary (`RPI_BIN`), opens a PR `rpi
 and merges it when all of that passed; when anything failed the PR stays open with the run linked,
 and later runs leave it alone: a first job, with a read token and no repository code, sees the open
 PR and stops before anything is built. The bump and the tests (which run the new rpi binary and the
-new crates' build scripts) hold no token. A last job on a fresh GitHub-hosted runner, never this
+new crates' build scripts) hold no token, and run on a GitHub-hosted runner inside a throwaway
+container (`.github/sandbox.sh`: the image's Ubuntu and Rust by digest, the checkout mounted, its
+`.git` read only), so nothing they start sees the runner's processes, whose environment holds the
+Actions runtime token, or outlives them. A last job on a fresh GitHub-hosted runner, never this
 machine, takes their diff to a fresh checkout of main (`.github/bump-check.py`): a first look at
 its bytes (only the files `bump-rpi.sh` edits, no control or non-ASCII character on a changed
 line), then `git apply`, then a check of what git actually wrote. Each of those files must be
