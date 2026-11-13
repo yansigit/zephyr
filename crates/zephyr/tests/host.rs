@@ -661,6 +661,53 @@ fn init_again_on_a_configured_install_changes_nothing() {
     assert_eq!(count(RUN), 1, "{calls:#?}");
 }
 
+/// Interactive init reads zephyr.toml again after the failover order and the approvals
+/// prompts: what the daemon wrote while the owner chose is kept.
+#[test]
+fn init_keeps_what_the_daemon_wrote_during_its_prompts() {
+    let env = Env::new("init-prompt-edits");
+    configure_an_install(&env);
+    let toml = env.daemon().join("zephyr.toml");
+    let text = env
+        .config()
+        .replace("\n[approvals]\npreset = \"semi\"\n", "\n");
+    std::fs::write(&toml, text).unwrap();
+    let edits = pty_edits(&[
+        ("Failover order", &toml, "\n[tasks]\nparallel = 3\n"),
+        (
+            "Approvals: how much",
+            &toml,
+            "\n[budget]\ndaily_tokens = 1234\n",
+        ),
+    ]);
+    let (_, shown) = env.on_a_driven_tty_env(
+        &["init"],
+        &[
+            ("Projects folder", "\n"),
+            ("Providers", "\n"),
+            ("Add another", "\n"),
+            ("Add another", "\n"),
+            ("Failover order", "\n"),
+            ("Change the discord channel?", "\n"),
+            ("Change the imessage channel?", "\n"),
+            ("Set up telegram?", "\n"),
+            ("Set up signal?", "\n"),
+            ("Approvals: how much", "\n"),
+            ("Add private facts", "\n"),
+            ("Change the web app?", "\n"),
+        ],
+        &[("PTY_EDITS", &edits)],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    let config = env.config();
+    assert!(config.contains("parallel = 3"), "{config}");
+    assert!(config.contains("daily_tokens = 1234"), "{config}");
+    assert!(config.contains("preset = \"manual\""), "{config}");
+}
+
 /// A port init added (the iMessage webhook) is published by making the container again: a
 /// restart cannot add one.
 #[test]

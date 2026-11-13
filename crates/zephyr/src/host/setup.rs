@@ -204,6 +204,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             .items(&names)
             .interact()?;
         let ordered: Vec<String> = order.into_iter().map(|i| names[i].clone()).collect();
+        // Read again: the daemon may have written it while the owner chose.
+        doc = h.data.load()?;
         conf::order_accounts(&mut doc, &ordered)?;
         h.data.save(&doc)?;
     }
@@ -311,10 +313,9 @@ fn write_preset(
 /// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
 fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow::Result<()> {
     use crate::approvals::Preset;
-    let mut doc = h.data.load()?;
     let chosen = match preset {
         Some(p) => Some(p),
-        None if doc.get("approvals").is_some() => None,
+        None if h.data.load()?.get("approvals").is_some() => None,
         None => {
             let presets = [Preset::Manual, Preset::Semi, Preset::Full];
             let items: Vec<String> = (presets.iter())
@@ -329,6 +330,8 @@ fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow:
         }
     };
     if let Some(p) = chosen {
+        // Read after the prompt: the daemon may have written it while the owner chose.
+        let mut doc = h.data.load()?;
         write_preset(&mut doc, p)?;
         h.data.save(&doc)?;
     }
