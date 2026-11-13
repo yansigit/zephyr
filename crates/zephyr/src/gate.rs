@@ -1079,7 +1079,7 @@ fn origin_of(raw: &str) -> String {
 
 /// The owner's `classes` entry for a connector's tool (spec §4.1): `Some(None)` for `none`. A
 /// value validation would refuse counts as the class whose mode is strictest now, never `none`.
-fn connector_class(cfg: &Config, server: &str, tool: &str) -> Option<Option<Class>> {
+pub(crate) fn connector_class(cfg: &Config, server: &str, tool: &str) -> Option<Option<Class>> {
     let mcp = cfg
         .mcp
         .iter()
