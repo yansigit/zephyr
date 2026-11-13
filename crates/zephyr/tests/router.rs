@@ -7458,7 +7458,7 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
 // ---- the browser wrapper (approvals spec §4.4) ----
 
 /// A stand-in for the real agent-browser: it appends each argv to `ab-argv.log` beside it and
-/// answers `get url`, `get cdp-url` (`fake_cdp`), `get title`, `snapshot` and `eval` with
+/// answers `get url`, `get cdp-url` and `tab` (`fake_cdp`), `get title`, `snapshot` and `eval` with
 /// `ab-<what>.json` (with `--json`) or
 /// `ab-<what>.txt` (without); anything else prints `done: <argv>`. A `batch` reads its commands
 /// (a JSON array) from standard input into `ab-stdin.log`, one batch a line, and answers as
@@ -7474,6 +7474,7 @@ d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/ab-argv.log"
 case " $* " in *" --json "*) ext=json ;; *) ext=txt ;; esac
 case " $* " in
+  " tab "*) f=tab ;;
   *" get cdp-url "*) f=cdp-url ;;
   *" get url "*) f=url ;;
   *" get title "*) f=title ;;
@@ -9049,6 +9050,8 @@ async fn a_stop_during_a_slow_issue_leaves_the_card_closed() {
 /// may be one it is leaving) and parent, and what its own document says (`origin`, `self.origin`,
 /// `window.parent === window.top`, `location.ancestorOrigins`, the selectors it holds). With
 /// `moves_to`, the frame is on that origin from the first script after the one that found it.
+/// With `top_leaves`, the page goes to that address as the value is to be typed: the frame is
+/// gone, and the script is answered with DevTools' error for a lost context.
 #[derive(Clone)]
 struct CdpFrame {
     url: String,
@@ -9059,6 +9062,7 @@ struct CdpFrame {
     ancestors: Vec<String>,
     fields: Vec<&'static str>,
     moves_to: Option<String>,
+    top_leaves: Option<String>,
 }
 
 /// A frame of `origin` directly in the shop's checkout, holding the card fields.
@@ -9072,12 +9076,14 @@ fn stripe_frame(origin: &str) -> CdpFrame {
         ancestors: vec!["https://shop.example".into()],
         fields: vec!["#n", "#e", "#c"],
         moves_to: None,
+        top_leaves: None,
     }
 }
 
 /// A stand-in for Chromium's DevTools socket, as `cards_frame` uses it, on the loopback address
-/// the fake agent-browser's `get cdp-url` prints. `Target.getTargets` lists the page `PAGE`
-/// (on the fake browser's address) and `frames`; attaching, an isolated world and detaching are
+/// the fake agent-browser's `get cdp-url` prints. `Target.getTargets` lists two tabs on the
+/// fake browser's address, `PAGE` (agent-browser's active one, as its `tab` says) and `BG`, and
+/// `frames`; attaching, an isolated world and detaching are
 /// answered; `Runtime.evaluate` answers the look (no `const value`) with the frame's own facts,
 /// and the typing script as the real one does: its checks (`cards_frame::CHECKS`, keep in step),
 /// then the field. Each value typed is a line `fill <selector> <value>` in the returned log.
@@ -9091,6 +9097,13 @@ fn fake_cdp(home: &Path, frames: Arc<Mutex<Vec<CdpFrame>>>) -> Arc<Mutex<Vec<Str
     let url = format!("ws://127.0.0.1:{port}/devtools/browser/fake\n");
     std::fs::write(home.join("ab-cdp-url.txt"), url).unwrap();
     let page = std::fs::read_to_string(home.join("ab-url.txt")).unwrap();
+    let page = page.trim().to_string();
+    let tabs = serde_json::json!({"success": true, "data": {"tabs": [
+        {"tabId": "t1", "targetId": "BG", "url": page, "type": "page", "active": false},
+        {"tabId": "t2", "targetId": "PAGE", "url": page, "type": "page", "active": true},
+    ]}});
+    std::fs::write(home.join("ab-tab.json"), tabs.to_string()).unwrap();
+    let home = home.to_path_buf();
     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
     let log = typed.clone();
     tokio::spawn(async move {
@@ -9099,6 +9112,7 @@ fn fake_cdp(home: &Path, frames: Arc<Mutex<Vec<CdpFrame>>>) -> Arc<Mutex<Vec<Str
                 continue;
             };
             let (frames, log, page) = (frames.clone(), log.clone(), page.clone());
+            let home = home.clone();
             tokio::spawn(async move {
                 let mut probed: Vec<usize> = Vec::new();
                 while let Some(Ok(Message::Text(text))) = ws.next().await {
@@ -9110,9 +9124,10 @@ fn fake_cdp(home: &Path, frames: Arc<Mutex<Vec<CdpFrame>>>) -> Arc<Mutex<Vec<Str
                     let mut all = frames.lock().unwrap().clone();
                     let result = match msg["method"].as_str().unwrap() {
                         "Target.getTargets" => {
-                            let mut infos = vec![serde_json::json!(
-                                {"targetId": "PAGE", "type": "page", "url": page.trim()}
-                            )];
+                            let mut infos = vec![
+                                serde_json::json!({"targetId": "BG", "type": "page", "url": page}),
+                                serde_json::json!({"targetId": "PAGE", "type": "page", "url": page}),
+                            ];
                             for (i, f) in all.iter().enumerate() {
                                 infos.push(serde_json::json!({"targetId": format!("F{i}"),
                                     "type": "iframe", "url": f.url, "parentFrameId": f.parent}));
@@ -9147,6 +9162,13 @@ fn fake_cdp(home: &Path, frames: Arc<Mutex<Vec<CdpFrame>>>) -> Arc<Mutex<Vec<Str
                                     "ancestors": f.ancestors,
                                     "field": if has { "ok" } else { "missing" }})
                                 .to_string(),
+                                Some(_) if f.top_leaves.is_some() => {
+                                    set_page(&home, f.top_leaves.as_deref().unwrap());
+                                    let error = serde_json::json!({"id": msg["id"], "error":
+                                        {"code": -32000, "message": "Cannot find context"}});
+                                    let _ = ws.send(Message::Text(error.to_string())).await;
+                                    continue;
+                                }
                                 Some(value) => {
                                     let frame = literal("frame").unwrap();
                                     let want = literal("want").unwrap();
@@ -9210,40 +9232,83 @@ async fn a_card_is_typed_into_a_stripe_frame_directly_in_its_checkout() {
     // Not a process's argument either.
     let argv = browser_argv(&home);
     assert!(!argv.iter().any(|l| l.contains("4000")), "{argv:?}");
+    // The read-back refusal stays on the checkout: 0.41's `get url` prints the top's address
+    // whatever frame is selected, so a frame selected by ref is read back to no one.
     let public = format!("{}-public", home.file_name().unwrap().to_string_lossy());
-    let flag_path = home.with_file_name(public).join("cards-filled");
-    let flag = std::fs::read_to_string(&flag_path).unwrap();
-    assert!(
-        flag.contains("https://shop.example\thttps://shop.example/checkout"),
-        "{flag}"
+    let flag = std::fs::read_to_string(home.with_file_name(public).join("cards-filled")).unwrap();
+    assert_eq!(
+        flag,
+        "https://shop.example\thttps://shop.example/checkout\n"
     );
-    assert!(
-        flag.lines().any(|l| l == "https://js.stripe.com\t"),
-        "{flag}"
-    );
-    // A fill into the page's own document after it keeps the frame listed: its field may
-    // still hold the number.
-    std::fs::remove_file(home.join("ab-fill.txt")).unwrap();
-    gw.say("f2b", "owner", &format!("{CARD_FILL} again")).await;
-    said("again\ncard: filled").await;
-    let flag = std::fs::read_to_string(&flag_path).unwrap();
-    assert!(
-        flag.lines().any(|l| l == "https://js.stripe.com\t"),
-        "{flag}"
-    );
-
-    // The frame's own origin is not read back, as the checkout is not.
-    set_page(&home, "https://js.stripe.com/v3/elements-inner-card.html");
-    let peek = format!(
-        r#"[call exec {{"command": "{} eval 1"}}]"#,
-        home.join("bin/agent-browser").display()
-    );
-    gw.say("f3", "owner", &peek).await;
+    let wrapper = home.join("bin/agent-browser").display().to_string();
+    let exec = |c: &str| format!(r#"[call exec {{"command": "{wrapper} {c}"}}]"#);
+    gw.say("f3", "owner", &exec("frame @e4")).await;
+    said("done: frame @e4").await;
+    gw.say("f4", "owner", &exec("snapshot -i")).await;
+    said("not run: a virtual card was just typed into this page").await;
+    gw.say("f5", "owner", &exec("get value input")).await;
     let refused = said("a virtual card is filled on").await;
     assert!(
-        refused.contains("not run: a virtual card is filled on https://js.stripe.com;"),
+        refused.contains("not run: a virtual card is filled on https://shop.example;"),
         "{refused}"
     );
+    gw.shutdown().await;
+}
+
+/// Only the tab agent-browser is on is looked into: a Stripe frame in another tab of the same
+/// checkout is never typed into, and a second checkout tab is no reason to refuse the active one.
+#[tokio::test]
+async fn a_stripe_frame_in_a_background_tab_is_never_typed_into() {
+    let (home, cfg) = card_home("card-frame-tabs", "fake", "auto 100");
+    let mut background = stripe_frame("https://js.stripe.com");
+    background.parent = "BG";
+    let frames = Arc::new(Mutex::new(vec![background.clone()]));
+    let typed = fake_cdp(&home, frames.clone());
+    let gw = start(cfg);
+    gw.say("t1", "owner", &card_ask("10")).await;
+    wait(10, || card_status(&home, 1) == "open").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    std::fs::write(home.join("ab-fill.txt"), "missing").unwrap();
+    gw.say("t2", "owner", &format!("{CARD_FILL} bg")).await;
+    let answer = reply_where(&gw, "chat", |r| r.contains("bg\ncard: but not the number")).await;
+    assert!(answer.contains("is never filled"), "{answer}");
+    assert!(typed.lock().unwrap().is_empty());
+    // The active tab has its own frame too: only that one is typed into.
+    *frames.lock().unwrap() = vec![background, stripe_frame("https://js.stripe.com")];
+    gw.say("t3", "owner", &format!("{CARD_FILL} both")).await;
+    let filled = reply_where(&gw, "chat", |r| r.contains("both\ncard: filled")).await;
+    assert!(
+        filled.contains("in its payment frame on https://js.stripe.com"),
+        "{filled}"
+    );
+    assert_eq!(typed.lock().unwrap().len(), 3);
+    gw.shutdown().await;
+}
+
+/// A checkout that leaves while a field in its payment frame is being typed: the frame is gone,
+/// nothing is typed, and the card is closed, as when the page's own document moves.
+#[tokio::test]
+async fn a_checkout_that_leaves_during_a_frame_fill_closes_the_card() {
+    let (home, cfg) = card_home("card-frame-left", "fake", "auto 100");
+    let mut leaving = stripe_frame("https://js.stripe.com");
+    leaving.top_leaves = Some("https://evil.example/pay".into());
+    let typed = fake_cdp(&home, Arc::new(Mutex::new(vec![leaving])));
+    let gw = start(cfg);
+    gw.say("l1", "owner", &card_ask("10")).await;
+    wait(10, || card_status(&home, 1) == "open").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    std::fs::write(home.join("ab-fill.txt"), "missing").unwrap();
+    gw.say("l2", "owner", CARD_FILL).await;
+    let stopped = reply_where(&gw, "chat", |r| r.contains("\ncard: stopped")).await;
+    assert!(
+        stopped.contains(
+            "\ncard: stopped: the page was on https://evil.example, not https://shop.example; \
+             nothing was typed. Card #1 is closed."
+        ),
+        "{stopped}"
+    );
+    wait(10, || card_status(&home, 1) == "closed").await;
+    assert!(typed.lock().unwrap().is_empty());
     gw.shutdown().await;
 }
 
@@ -9319,7 +9384,7 @@ async fn a_frame_that_is_not_a_processors_directly_in_the_checkout_gets_no_numbe
 #[tokio::test]
 #[ignore = "needs a real Chromium and the test pages (see above)"]
 async fn a_real_chromium_types_only_into_a_processor_frame_directly_in_the_bound_top() {
-    use zephyr::cards_frame::find;
+    use zephyr::cards_frame::Frames;
     use zephyr::vault::Typed;
     if std::env::var("ZEPHYR_CARD_FRAMES_LIVE").as_deref() != Ok("1") {
         return eprintln!("skipping: set ZEPHYR_CARD_FRAMES_LIVE=1 in a side container");
@@ -9343,17 +9408,16 @@ async fn a_real_chromium_types_only_into_a_processor_frame_directly_in_the_bound
     let shop = "https://shop.test";
     // Typed into Stripe's frame directly in the shop, beside a nested Stripe frame.
     open("https://shop.test/one");
-    let found = find(&cfg, shop, "#cardnumber")
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let (at, origin) = frames
+        .find("#cardnumber")
         .await
         .unwrap()
         .expect("the frame");
-    assert_eq!(found.origin, "https://js.stripe.com");
-    assert_eq!(
-        found
-            .type_value(shop, "#cardnumber", "4242424242424242")
-            .await,
-        Typed::Ok
-    );
+    assert_eq!(origin, "https://js.stripe.com");
+    let typed = frames.type_value(at, &origin, "#cardnumber", "4242424242424242");
+    assert_eq!(typed.await, Typed::Ok);
+    frames.close().await;
     let tree = snapshot();
     assert_eq!(
         tree.matches("4242424242424242").count(),
@@ -9362,40 +9426,65 @@ async fn a_real_chromium_types_only_into_a_processor_frame_directly_in_the_bound
     );
     // A referrer policy hides the referrer, not the ancestor origins.
     open("https://shop.test/noref");
-    let found = find(&cfg, shop, "#cardnumber")
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let (at, origin) = frames
+        .find("#cardnumber")
         .await
         .unwrap()
         .expect("the frame");
-    assert_eq!(
-        found
-            .type_value(shop, "#cardnumber", "4000056655665556")
-            .await,
-        Typed::Ok
-    );
+    let typed = frames.type_value(at, &origin, "#cardnumber", "4000056655665556");
+    assert_eq!(typed.await, Typed::Ok);
     assert!(snapshot().contains("4000056655665556"));
     // A sandboxed frame's own origin is opaque.
     open("https://shop.test/sandboxed");
-    let why = find(&cfg, shop, "#cardnumber").await.err().unwrap();
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let why = frames.find("#cardnumber").await.err().unwrap();
     assert!(why.contains("which is not a payment processor's"), "{why}");
     // A frame whose src is Stripe but which went to another site.
     open("https://shop.test/moved");
-    assert!(find(&cfg, shop, "#cardnumber").await.unwrap().is_none());
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    assert!(frames.find("#cardnumber").await.unwrap().is_none());
     // Two frames holding the field.
     open("https://shop.test/two");
-    let why = find(&cfg, shop, "#cardnumber").await.err().unwrap();
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let why = frames.find("#cardnumber").await.err().unwrap();
     assert!(why.contains("more than one payment frame"), "{why}");
-    // Stripe's frame in a page that is not the card's: never looked at for this card.
+    // Stripe's frame in a page that is not the card's: its tab is not on the card's origin.
     open("https://evil.test/");
-    assert!(find(&cfg, shop, "#cardnumber").await.unwrap().is_none());
-    // The top leaves between the look and the typing: the frame is gone, nothing is typed.
+    let why = Frames::open(&cfg, shop).await.err().unwrap();
+    assert!(why.contains("is not on https://shop.test"), "{why}");
+    // A second tab on the checkout: only the active one is looked into.
     open("https://shop.test/one");
-    let found = find(&cfg, shop, "#cardnumber")
+    let out = run(&["tab", "new", "https://shop.test/two"]);
+    assert!(out.status.success(), "{out:?}");
+    std::thread::sleep(Duration::from_secs(2));
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let why = frames.find("#cardnumber").await.err().unwrap();
+    assert!(
+        why.contains("more than one payment frame"),
+        "the /two tab is active: {why}"
+    );
+    let tabs: Value = serde_json::from_slice(&run(&["tab", "list", "--json"]).stdout).unwrap();
+    let one = (tabs["data"]["tabs"].as_array().unwrap().iter())
+        .find(|t| t["url"].as_str().unwrap().ends_with("/one"))
+        .map(|t| t["tabId"].as_str().unwrap().to_string())
+        .unwrap();
+    assert!(run(&["tab", &one]).status.success());
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    assert!(
+        frames.find("#cardnumber").await.unwrap().is_some(),
+        "the /one tab"
+    );
+    // The top leaves between the look and the typing: the frame is gone, nothing is typed.
+    let mut frames = Frames::open(&cfg, shop).await.unwrap();
+    let (at, origin) = frames
+        .find("#cardnumber")
         .await
         .unwrap()
         .expect("the frame");
     open("https://evil.test/");
-    let typed = found
-        .type_value(shop, "#cardnumber", "5555555555554444")
+    let typed = frames
+        .type_value(at, &origin, "#cardnumber", "5555555555554444")
         .await;
     assert!(matches!(typed, Typed::Failed(_)), "{typed:?}");
     assert!(!snapshot().contains("5555555555554444"));

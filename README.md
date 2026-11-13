@@ -1129,7 +1129,7 @@ zephyr config set cards.provider manual                 # or link
   types: the frame's own origin, that its parent is the page, and that the page is on the
   approved address. No other frame is filled (an Adyen or Shopify checkout's card fields are
   not, for now), and the card closes if the page moves away while it types. Until an hour after
-  the card closed, the agent's browser refuses to read that page or that frame's origin back (a
+  the card closed, the agent's browser refuses to read that page back, a frame in it included (a
   field's value, the HTML, a script, a screenshot), and a `snapshot` of the page it typed into
   is refused until the page moves on. `/card` lists your
   cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and

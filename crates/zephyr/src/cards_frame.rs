@@ -3,19 +3,23 @@
 //! which agent-browser 0.41 cannot run a script in (`eval` is always the top document's, and
 //! `frame` reaches a cross-origin frame only to `fill` it, with no check in the same step). So
 //! the daemon opens its own DevTools session on the agent's Chromium (`get cdp-url`), finds the
-//! frame's own target, and runs the check-and-type script there, in an isolated world.
+//! frames of the tab agent-browser is on, and runs the check-and-type script in the frame's own
+//! target, in an isolated world.
 //!
 //! The script refuses unless, in the one evaluation that types: the frame's own origin is on
 //! [`listed`]'s list, its parent is the top, and the top's origin is the card's bound origin
 //! (`location.ancestorOrigins`, which Chromium does not mask under a referrer policy, unlike
 //! `document.referrer`). The DevTools socket is the agent's, as agent-browser's daemon is:
-//! under the threat model that bounds nothing a card's own limits do not.
+//! under the threat model that bounds nothing a card's own limits do not, and what it sends
+//! back is bounded (`MAX_MESSAGE`, `MAX_MESSAGES`, `WAIT`).
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -58,6 +62,11 @@ pub fn listed(origin: &str) -> bool {
             && host.ends_with(STRIPE_SUFFIX))
 }
 
+/// Text of the page's (an origin it reports) as one line of at most 200 characters.
+fn cut(text: &str) -> String {
+    crate::settings::one_line(text, 200)
+}
+
 /// What a frame said about itself, in its own document.
 #[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,7 +85,6 @@ pub struct Facts {
 
 /// Why a frame whose document holds the field is not typed into, or `None` when it may be.
 pub fn judge(f: &Facts, site: &str) -> Option<String> {
-    let cut = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(200).collect() };
     if f.origin != f.self_origin || !listed(&f.origin) {
         return Some(format!(
             "the frame holding it is on {}, which is not a payment processor's card frame \
@@ -129,22 +137,105 @@ return JSON.stringify({{
     )
 }
 
+/// A buffer that holds a card value: allocated once at its full size, so it never moves (and
+/// leaves no copy behind), and wiped when dropped, so a fill whose future is dropped wipes it
+/// too.
+struct Secret(String);
+
+impl Secret {
+    fn with_capacity(n: usize) -> Secret {
+        Secret(String::with_capacity(n))
+    }
+
+    /// Appends `s`; never past the capacity reserved, so the buffer is never reallocated.
+    fn push(&mut self, s: &str) -> Result<(), String> {
+        if self.0.len() + s.len() > self.0.capacity() {
+            return Err("the typing script did not fit its buffer".into());
+        }
+        self.0.push_str(s);
+        Ok(())
+    }
+
+    /// Appends `s` as the inside of a JSON string, which is a JavaScript string too: `"` and
+    /// `\` escaped, control characters and the two JavaScript line separators as `\uXXXX`.
+    fn push_escaped(&mut self, s: &str) -> Result<(), String> {
+        let mut unit = [0u8; 4];
+        for c in s.chars() {
+            let hex;
+            let piece = match c {
+                '"' => "\\\"",
+                '\\' => "\\\\",
+                c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                    hex = format!("\\u{:04x}", c as u32);
+                    &hex
+                }
+                c => c.encode_utf8(&mut unit),
+            };
+            self.push(piece)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        crate::vault::wipe_str(&mut self.0);
+    }
+}
+
+/// The most [`Secret::push_escaped`] makes of `n` bytes: `\u001f` for each.
+fn escaped(n: usize) -> usize {
+    6 * n
+}
+
 /// The script that types one value into the frame's field: [`CHECKS`] first, in the same
 /// evaluation as the typing, so nothing can move between a check and the value it guards.
-fn type_script(want: &str, frame: &str, selector: &str, value: &str) -> String {
-    format!(
-        "(() => {{\nconst want = {};\nconst frame = {};\nconst sel = {};\nconst value = {};\n\
-         {CHECKS}\n{}\nreturn \"ok\";\n}})()",
+fn type_script(want: &str, frame: &str, selector: &str, value: &str) -> Result<Secret, String> {
+    let head = format!(
+        "(() => {{\nconst want = {};\nconst frame = {};\nconst sel = {};\nconst value = \"",
         json!(want),
         json!(frame),
         json!(selector),
-        json!(value),
+    );
+    let tail = format!(
+        "\";\n{CHECKS}\n{}\nreturn \"ok\";\n}})()",
         crate::vault::SET_FIELD
-    )
+    );
+    let mut script = Secret::with_capacity(head.len() + escaped(value.len()) + tail.len());
+    script.push(&head)?;
+    script.push_escaped(value)?;
+    script.push(&tail)?;
+    Ok(script)
 }
 
-/// How long the whole frame step may take: what one agent-browser command may.
+/// How long each frame step may take: what one agent-browser command may.
 const WAIT: Duration = Duration::from_secs(20);
+/// The largest DevTools message or frame read: these replies are a few kilobytes.
+const MAX_MESSAGE: usize = 256 << 10;
+/// The most messages read while waiting for one reply (events in between are skipped).
+const MAX_MESSAGES: usize = 200;
+
+/// `url` (`get cdp-url`'s answer) as the address to connect to: only a `ws://` address with a
+/// port on this machine's loopback.
+fn devtools_addr(url: &str) -> Option<SocketAddr> {
+    let parsed = url::Url::parse(url).ok()?;
+    let port = parsed.port()?;
+    if parsed.scheme() != "ws" {
+        return None;
+    }
+    match parsed.host()? {
+        url::Host::Ipv4(ip) if ip.is_loopback() => Some((ip, port).into()),
+        url::Host::Ipv6(ip) if ip.is_loopback() => Some((ip, port).into()),
+        url::Host::Domain("localhost") => Some(([127, 0, 0, 1], port).into()),
+        _ => None,
+    }
+}
+
+/// A message's `id`, read without building the rest of it.
+#[derive(serde::Deserialize)]
+struct Envelope {
+    id: Option<u64>,
+}
 
 /// One DevTools session over the browser's own socket.
 struct Cdp {
@@ -153,36 +244,54 @@ struct Cdp {
 }
 
 impl Cdp {
-    /// `url` is `get cdp-url`'s answer: only a `ws://` address on this machine's loopback.
     async fn connect(url: &str) -> Result<Cdp, String> {
-        let bad = || "the browser's DevTools address is not on this machine".to_string();
-        let parsed = url::Url::parse(url).map_err(|_| bad())?;
-        let loopback = match parsed.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            Some(url::Host::Domain(d)) => d == "localhost",
-            None => false,
-        };
-        let port = parsed.port().ok_or_else(bad)?;
-        if parsed.scheme() != "ws" || !loopback {
-            return Err(bad());
-        }
-        let addr = match parsed.host() {
-            Some(url::Host::Ipv6(ip)) => std::net::SocketAddr::from((ip, port)),
-            Some(url::Host::Ipv4(ip)) => std::net::SocketAddr::from((ip, port)),
-            _ => std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        };
+        let addr =
+            devtools_addr(url).ok_or("the browser's DevTools address is not on this machine")?;
         let tcp = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connecting to the browser's DevTools: {e}"))?;
-        let (ws, _) = tokio_tungstenite::client_async(url, tcp)
+        let config = WebSocketConfig {
+            max_message_size: Some(MAX_MESSAGE),
+            max_frame_size: Some(MAX_MESSAGE),
+            ..Default::default()
+        };
+        let (ws, _) = tokio_tungstenite::client_async_with_config(url, tcp, Some(config))
             .await
             .map_err(|e| format!("opening the browser's DevTools: {e}"))?;
         Ok(Cdp { ws, next: 0 })
     }
 
+    async fn send(&mut self, text: String) -> Result<(), String> {
+        let sent = self.ws.send(Message::Text(text)).await;
+        sent.map_err(|e| format!("DevTools: {e}"))
+    }
+
+    /// The `result` of the reply to `id`, skipping at most [`MAX_MESSAGES`] others.
+    async fn reply(&mut self, id: u64, method: &str) -> Result<Value, String> {
+        for _ in 0..MAX_MESSAGES {
+            let Some(frame) = self.ws.next().await else {
+                return Err("the browser's DevTools closed".into());
+            };
+            let Message::Text(text) = frame.map_err(|e| format!("DevTools: {e}"))? else {
+                continue;
+            };
+            let Ok(Envelope { id: Some(got) }) = serde_json::from_str(&text) else {
+                continue;
+            };
+            if got != id {
+                continue;
+            }
+            let mut reply: Value =
+                serde_json::from_str(&text).map_err(|_| format!("DevTools garbled {method}"))?;
+            if !reply["error"].is_null() {
+                return Err(format!("DevTools refused {method}"));
+            }
+            return Ok(reply["result"].take());
+        }
+        Err(format!("DevTools sent too much before answering {method}"))
+    }
+
     /// `method` with `params` (on `session`, a target attached with `flatten`): its `result`.
-    /// Events in between are skipped.
     async fn call(
         &mut self,
         method: &str,
@@ -190,44 +299,16 @@ impl Cdp {
         session: Option<&str>,
     ) -> Result<Value, String> {
         self.next += 1;
-        let id = self.next;
-        let mut msg = json!({"id": id, "method": method, "params": params});
+        let mut msg = json!({"id": self.next, "method": method, "params": params});
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        // shortcut: the frame tungstenite builds from this text is freed unwiped, like the
-        // browser's own copies; wiping it needs a writer of our own.
-        let text = msg.to_string();
-        drop(msg);
-        let sent = self.ws.send(Message::Text(text)).await;
-        sent.map_err(|e| format!("DevTools: {e}"))?;
-        while let Some(frame) = self.ws.next().await {
-            let Message::Text(text) = frame.map_err(|e| format!("DevTools: {e}"))? else {
-                continue;
-            };
-            let Ok(mut reply) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            if reply["id"].as_u64() != Some(id) {
-                continue;
-            }
-            if !reply["error"].is_null() {
-                return Err(format!("DevTools refused {method}"));
-            }
-            return Ok(reply["result"].take());
-        }
-        Err("the browser's DevTools closed".into())
+        self.send(msg.to_string()).await?;
+        self.reply(self.next, method).await
     }
 
-    /// `expression`'s value in `world` of `session`, as a string.
-    async fn eval(
-        &mut self,
-        session: &str,
-        world: i64,
-        expression: &str,
-    ) -> Result<String, String> {
-        let params = json!({"expression": expression, "contextId": world, "returnByValue": true});
-        let out = self.call("Runtime.evaluate", params, Some(session)).await?;
+    /// What `out` (a `Runtime.evaluate` result) evaluated to, as a string.
+    fn value(out: &Value) -> Result<String, String> {
         if !out["exceptionDetails"].is_null() {
             return Err("the payment frame refused the script".into());
         }
@@ -236,108 +317,210 @@ impl Cdp {
             .unwrap_or_default()
             .to_string())
     }
-}
 
-/// The one payment frame whose document holds the field, attached and ready to type into.
-pub struct Found {
-    cdp: Cdp,
-    session: String,
-    world: i64,
-    /// The frame's own origin, as it said: what the read-back flag lists before typing.
-    pub origin: String,
-}
+    /// `expression` (which holds no secret) in `world` of `session`.
+    async fn eval(
+        &mut self,
+        session: &str,
+        world: i64,
+        expression: &str,
+    ) -> Result<String, String> {
+        let params = json!({"expression": expression, "contextId": world, "returnByValue": true});
+        Self::value(&self.call("Runtime.evaluate", params, Some(session)).await?)
+    }
 
-/// The payment frame directly in the top page on `site` whose own document holds `selector`:
-/// `Ok(None)` when no listed frame does. A frame that holds it but fails [`judge`] (another
-/// origin, a nested one, a top elsewhere), or two that hold it, refuse the field.
-pub async fn find(cfg: &Config, site: &str, selector: &str) -> Result<Option<Found>, String> {
-    let step = async {
-        let url = crate::vault::browser(cfg, &["get", "cdp-url"])
-            .await
-            .map_err(|e| format!("the page's frames could not be looked into: {e}"))?;
-        let mut cdp = Cdp::connect(url.trim()).await?;
-        let targets = cdp.call("Target.getTargets", json!({}), None).await?;
-        let all = targets["targetInfos"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let on = |t: &Value| crate::vault::origin(t["url"].as_str().unwrap_or_default());
-        let tops: Vec<&str> = (all.iter())
-            .filter(|t| t["type"] == "page")
-            .filter(|t| on(t).is_some_and(|o| o.ascii_serialization() == site))
-            .filter_map(|t| t["targetId"].as_str())
-            .collect();
-        // Only a prefilter: a target's address may be one it is leaving. The frame's own
-        // answer below is what decides.
-        let frames: Vec<String> = (all.iter())
-            .filter(|t| t["type"] == "iframe")
-            .filter(|t| tops.contains(&t["parentFrameId"].as_str().unwrap_or_default()))
-            .filter(|t| on(t).is_some_and(|o| listed(&o.ascii_serialization())))
-            .filter_map(|t| t["targetId"].as_str().map(String::from))
-            .collect();
-        let mut holding: Vec<(String, i64, Facts)> = Vec::new();
-        let probe = probe_script(selector);
-        for frame in frames {
-            let attach = json!({"targetId": frame, "flatten": true});
-            let attached = cdp.call("Target.attachToTarget", attach, None).await?;
-            let session = attached["sessionId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            // An isolated world: the frame's own scripts cannot have changed what this one
-            // reads (its prototypes, `Array.from`).
-            let world = json!({"frameId": frame, "worldName": "zephyr-card"});
-            let world = cdp
-                .call("Page.createIsolatedWorld", world, Some(&session))
-                .await?;
-            let world = world["executionContextId"].as_i64().unwrap_or_default();
-            let said = cdp.eval(&session, world, &probe).await?;
-            let facts: Facts = serde_json::from_str(&said)
-                .map_err(|_| "the payment frame gave no answer".to_string())?;
-            if facts.field == "missing" {
-                let detach = json!({"sessionId": session});
-                let _ = cdp.call("Target.detachFromTarget", detach, None).await;
-                continue;
-            }
-            holding.push((session, world, facts));
-        }
-        if holding.len() > 1 {
-            return Err("that selector matches a field in more than one payment frame".into());
-        }
-        let Some((session, world, facts)) = holding.pop() else {
-            return Ok(None);
-        };
-        if let Some(why) = judge(&facts, site) {
-            return Err(why);
-        }
-        Ok(Some(Found {
-            cdp,
-            session,
-            world,
-            origin: facts.origin,
-        }))
-    };
-    match tokio::time::timeout(WAIT, step).await {
-        Ok(found) => found,
-        Err(_) => Err("the browser's DevTools did not answer in time".into()),
+    /// `script` (which holds a card value) in `world` of `session`: the message is built in a
+    /// [`Secret`] of its own, never a `Value`.
+    async fn eval_secret(
+        &mut self,
+        session: &str,
+        world: i64,
+        script: &Secret,
+    ) -> Result<String, String> {
+        self.next += 1;
+        let head = format!(
+            r#"{{"id":{},"method":"Runtime.evaluate","sessionId":{},"params":{{"contextId":{world},"returnByValue":true,"expression":""#,
+            self.next,
+            json!(session)
+        );
+        let tail = "\"}}";
+        let mut msg = Secret::with_capacity(head.len() + escaped(script.0.len()) + tail.len());
+        msg.push(&head)?;
+        msg.push_escaped(&script.0)?;
+        msg.push(tail)?;
+        // shortcut: tungstenite takes the text by value and frees its copy (and the frame it
+        // builds) unwiped; wiping those needs a writer of our own.
+        self.send(msg.0.clone()).await?;
+        drop(msg);
+        Self::value(&self.reply(self.next, "Runtime.evaluate").await?)
     }
 }
 
-impl Found {
-    /// Types `value` into `selector` of this frame, if the frame is still on its origin,
-    /// directly in a top on `site` (`Typed`).
-    pub async fn type_value(mut self, site: &str, selector: &str, value: &str) -> Typed {
-        let mut script = type_script(site, &self.origin, selector, value);
-        let said = tokio::time::timeout(WAIT, self.cdp.eval(&self.session, self.world, &script));
-        let said = said.await;
-        crate::vault::wipe_str(&mut script);
-        let _ = self.cdp.ws.close(None).await;
-        let said = match said {
-            Ok(Ok(said)) => said,
-            Ok(Err(e)) => return Typed::Failed(e),
-            Err(_) => return Typed::Failed("the browser's DevTools did not answer in time".into()),
+/// A frame of the active tab, attached, with its isolated world.
+struct Frame {
+    session: String,
+    world: i64,
+}
+
+/// The DevTools session of one card fill: the listed frames directly in the tab agent-browser
+/// is on, found once ([`Frames::open`]) and asked about each field ([`Frames::find`]).
+pub struct Frames {
+    cdp: Cdp,
+    site: String,
+    frames: Vec<Frame>,
+}
+
+/// `fut`, or `Err` once [`WAIT`] has passed.
+async fn bounded<T>(
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(WAIT, fut)
+        .await
+        .unwrap_or_else(|_| Err("the browser's DevTools did not answer in time".into()))
+}
+
+/// The target id of the tab agent-browser is on (its `tab` list), which must be on `site`: no
+/// active tab, or more than one, refuses.
+fn active_tab(listing: &str, site: &str) -> Result<String, String> {
+    let listing: Value = serde_json::from_str(listing.trim()).unwrap_or_default();
+    let tabs = listing["data"]["tabs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let active: Vec<&Value> = tabs.iter().filter(|t| t["active"] == true).collect();
+    let [tab] = active.as_slice() else {
+        return Err("agent-browser does not say which one tab it is on".into());
+    };
+    let url = tab["url"].as_str().unwrap_or_default();
+    if crate::vault::origin(url).is_none_or(|o| o.ascii_serialization() != site) {
+        return Err(format!("the tab agent-browser is on is not on {site}"));
+    }
+    match tab["targetId"].as_str() {
+        Some(id) if !id.is_empty() => Ok(id.to_string()),
+        _ => Err("agent-browser does not say which one tab it is on".into()),
+    }
+}
+
+impl Frames {
+    /// Connects to the agent's Chromium and attaches to each frame on a listed origin whose
+    /// parent is the tab agent-browser is on, a page on `site`. A frame that cannot be attached
+    /// is left out. Only a prefilter: a target's address may be one it is leaving, so each
+    /// frame's own answer is what [`Frames::find`] decides on.
+    pub async fn open(cfg: &Config, site: &str) -> Result<Frames, String> {
+        bounded(async {
+            let looked = |e: String| format!("the page's frames could not be looked into: {e}");
+            let tab = crate::vault::browser(cfg, &["tab", "list", "--json"])
+                .await
+                .map_err(looked)?;
+            let tab = active_tab(&tab, site)?;
+            let url = crate::vault::browser(cfg, &["get", "cdp-url"])
+                .await
+                .map_err(looked)?;
+            let mut cdp = Cdp::connect(url.trim()).await?;
+            let targets = cdp.call("Target.getTargets", json!({}), None).await?;
+            let all = targets["targetInfos"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let on = |t: &Value| crate::vault::origin(t["url"].as_str().unwrap_or_default());
+            let page = all.iter().any(|t| {
+                t["type"] == "page"
+                    && t["targetId"] == tab.as_str()
+                    && on(t).is_some_and(|o| o.ascii_serialization() == site)
+            });
+            if !page {
+                return Err(format!("the tab agent-browser is on is not on {site}"));
+            }
+            let ids: Vec<String> = (all.iter())
+                .filter(|t| t["type"] == "iframe" && t["parentFrameId"] == tab.as_str())
+                .filter(|t| on(t).is_some_and(|o| listed(&o.ascii_serialization())))
+                .filter_map(|t| t["targetId"].as_str().map(String::from))
+                .collect();
+            let mut frames = Vec::new();
+            for id in ids {
+                let attach = json!({"targetId": id, "flatten": true});
+                let Ok(attached) = cdp.call("Target.attachToTarget", attach, None).await else {
+                    continue;
+                };
+                let session = attached["sessionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                // An isolated world: the frame's own scripts cannot have changed what this one
+                // reads (its prototypes, `Array.from`).
+                let world = json!({"frameId": id, "worldName": "zephyr-card"});
+                let Ok(world) = cdp
+                    .call("Page.createIsolatedWorld", world, Some(&session))
+                    .await
+                else {
+                    continue;
+                };
+                if let Some(world) = world["executionContextId"].as_i64() {
+                    frames.push(Frame { session, world });
+                }
+            }
+            Ok(Frames {
+                cdp,
+                site: site.to_string(),
+                frames,
+            })
+        })
+        .await
+    }
+
+    /// The one frame whose own document holds `selector`, and its origin: `Ok(None)` when no
+    /// frame does. A frame that cannot be asked is passed over; two that hold it, or one that
+    /// fails [`judge`] (another origin, a nested one, a top elsewhere), refuse the field.
+    pub async fn find(&mut self, selector: &str) -> Result<Option<(usize, String)>, String> {
+        let probe = probe_script(selector);
+        bounded(async {
+            let mut holding: Vec<(usize, Facts)> = Vec::new();
+            for (i, frame) in self.frames.iter().enumerate() {
+                let Ok(said) = self.cdp.eval(&frame.session, frame.world, &probe).await else {
+                    continue;
+                };
+                let Ok(facts) = serde_json::from_str::<Facts>(&said) else {
+                    continue;
+                };
+                if facts.field != "missing" {
+                    holding.push((i, facts));
+                }
+            }
+            if holding.len() > 1 {
+                return Err("that selector matches a field in more than one payment frame".into());
+            }
+            let Some((i, facts)) = holding.pop() else {
+                return Ok(None);
+            };
+            match judge(&facts, &self.site) {
+                Some(why) => Err(why),
+                None => Ok(Some((i, facts.origin))),
+            }
+        })
+        .await
+    }
+
+    /// Types `value` into `selector` of frame `at`, if that frame is still on `origin`,
+    /// directly in a top on the card's site (`Typed`).
+    pub async fn type_value(
+        &mut self,
+        at: usize,
+        origin: &str,
+        selector: &str,
+        value: &str,
+    ) -> Typed {
+        let Some(Frame { session, world }) = self.frames.get(at) else {
+            return Typed::Failed("the payment frame is gone".into());
         };
-        let cut = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(200).collect() };
+        let (session, world) = (session.clone(), *world);
+        let said = bounded(async {
+            let script = type_script(&self.site, origin, selector, value)?;
+            self.cdp.eval_secret(&session, world, &script).await
+        });
+        let said = match said.await {
+            Ok(said) => said,
+            Err(e) => return Typed::Failed(e),
+        };
         match said.as_str() {
             "ok" => Typed::Ok,
             "missing" => Typed::Missing,
@@ -346,19 +529,77 @@ impl Found {
             r => match (r.strip_prefix("moved:"), r.strip_prefix("left:")) {
                 (Some(on), _) => Typed::Moved(cut(on)),
                 (_, Some(on)) => Typed::Failed(format!(
-                    "the payment frame had moved to {}, not {}; nothing was typed",
-                    cut(on),
-                    self.origin
+                    "the payment frame had moved to {}, not {origin}; nothing was typed",
+                    cut(on)
                 )),
                 _ => Typed::Failed("the payment frame gave no answer".into()),
             },
         }
+    }
+
+    /// Ends the session, within [`WAIT`]; the socket is dropped either way.
+    pub async fn close(mut self) {
+        let _ = tokio::time::timeout(WAIT, self.cdp.ws.close(None)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A DevTools server of the agent's that answers with `flood` (a few huge messages, or a
+    /// stream of events that are never the reply): the call fails within a second or two, and
+    /// nothing it sent was kept whole (`MAX_MESSAGE`, `MAX_MESSAGES`).
+    async fn flooded(flood: impl Fn(u64) -> Vec<String> + Send + 'static) -> Result<Value, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let id = serde_json::from_str::<Value>(&text).unwrap()["id"]
+                    .as_u64()
+                    .unwrap();
+                for m in flood(id) {
+                    if ws.send(Message::Text(m)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/x");
+        let mut cdp = Cdp::connect(&url).await.unwrap();
+        let start = std::time::Instant::now();
+        let out = cdp.call("Target.getTargets", json!({}), None).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        out
+    }
+
+    #[tokio::test]
+    async fn a_devtools_server_that_floods_the_daemon_is_dropped_fast() {
+        // One reply of 64 MiB: refused as it comes, never read whole.
+        let huge = flooded(|id| {
+            vec![format!(
+                r#"{{"id":{id},"result":{{"x":"{}"}}}}"#,
+                "a".repeat(64 << 20)
+            )]
+        });
+        assert!(huge.await.is_err());
+        // Events and other replies, and never the one asked for.
+        let events = flooded(|id| {
+            let event = format!(
+                r#"{{"method":"Ev","params":{{"x":"{}"}}}}"#,
+                "a".repeat(1 << 10)
+            );
+            let other = format!(r#"{{"id":{},"result":{{}}}}"#, id + 1);
+            [event, other].into_iter().cycle().take(1000).collect()
+        });
+        assert!(events.await.is_err());
+    }
 
     #[test]
     fn only_the_processors_card_frame_origins_are_listed() {
@@ -426,12 +667,9 @@ mod tests {
 
     #[test]
     fn the_frame_script_checks_everything_before_it_types() {
-        let s = type_script(
-            "https://shop.example",
-            "https://js.stripe.com",
-            "#n",
-            "4242",
-        );
+        let shop = "https://shop.example";
+        let script = type_script(shop, "https://js.stripe.com", "#n", "4\"2\\4\u{2028}2").unwrap();
+        let s = script.0.clone();
         let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}\n{s}"));
         let set = at(".set.call(el, value)");
         for check in [
@@ -446,6 +684,9 @@ mod tests {
                 "{check} is checked before the value is set"
             );
         }
-        assert!(s.contains("const value = \"4242\";"));
+        // The value is one JSON (and JavaScript) string, whatever it holds.
+        let line = s.lines().find(|l| l.starts_with("const value = ")).unwrap();
+        let value: String = serde_json::from_str(&line[14..line.len() - 1]).unwrap();
+        assert_eq!(value, "4\"2\\4\u{2028}2");
     }
 }

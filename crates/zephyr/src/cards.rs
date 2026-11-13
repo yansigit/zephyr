@@ -652,34 +652,7 @@ pub mod live {
         if let Some(h) = all.iter_mut().find(|h| h.state == state && h.card == card) {
             // A page's address holds no tab or line break, as `get url` prints it.
             let page: String = page.chars().filter(|c| !c.is_control()).collect();
-            // A payment frame's line (no page) stays: the number may still be in that frame.
-            let framed: String = (h.filled.iter())
-                .flat_map(|(_, line)| line.lines())
-                .filter(|l| l.ends_with('\t'))
-                .map(|l| format!("\n{l}"))
-                .collect();
-            h.filled = Some((flag.clone(), format!("{origin}\t{page}{framed}")));
-        }
-        write_flag(&flag, &all);
-    }
-
-    /// Card `card`'s number is about to be typed into a payment frame on `origin` (DESIGN
-    /// §4.25): that origin's pages are not read back either, as the top's are not, until the
-    /// number is dropped. A line `origin<TAB>` with no page, so no `snapshot` is refused for it.
-    pub fn framed(cfg: &Config, card: i64, origin: &str) {
-        let flag = crate::drafts::public_dir(cfg).join(FILLED_FILE);
-        let mut all = lock();
-        let state = cfg.state_dir();
-        let origin: String = origin.chars().filter(|c| !c.is_control()).collect();
-        if let Some((_, line)) = (all.iter_mut())
-            .find(|h| h.state == state && h.card == card)
-            .and_then(|h| h.filled.as_mut())
-        {
-            let entry = format!("{origin}\t");
-            if !line.lines().any(|l| l == entry) {
-                line.push('\n');
-                line.push_str(&entry);
-            }
+            h.filled = Some((flag.clone(), format!("{origin}\t{page}")));
         }
         write_flag(&flag, &all);
     }
@@ -1563,7 +1536,9 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
     // one until the number is dropped.
     live::filled(cfg, id, &card.origin, &page);
     let mut done: Vec<&str> = Vec::new();
-    let mut frames: Vec<String> = Vec::new();
+    // The payment frames of the tab, found once, at the first field the page lacks.
+    let mut frames: Option<crate::cards_frame::Frames> = None;
+    let mut inside: Vec<String> = Vec::new();
     let mut last = page.clone();
     for (label, sel) in selectors {
         let Some(sel) = sel else { continue };
@@ -1571,25 +1546,25 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
             return format!("not filled: card #{id} has no {label}; leave `{label}` out");
         };
         let mut typed = crate::vault::type_into(cfg, &card.origin, sel, &value).await;
-        if typed == Typed::Missing {
+        let framed = typed == Typed::Missing;
+        if framed {
             // Not in the page's own document: a payment processor's frame directly in it.
-            typed = match crate::cards_frame::find(cfg, &card.origin, sel).await {
-                Ok(None) => Typed::Missing,
-                Ok(Some(frame)) => {
-                    live::framed(cfg, id, &frame.origin);
-                    let origin = frame.origin.clone();
-                    let typed = frame.type_value(&card.origin, sel, &value).await;
-                    if typed == Typed::Ok && !frames.contains(&origin) {
-                        frames.push(origin);
-                    }
-                    typed
-                }
-                Err(why) => Typed::Failed(format!("not typed: {why}")),
-            };
+            typed = in_frame(cfg, &mut frames, &card.origin, sel, &value, &mut inside).await;
         }
         crate::vault::wipe_str(&mut value);
         if let Typed::Moved(on) = &typed {
             return moved(&done, on);
+        }
+        // A frame that is gone may be one whose checkout left: then the card closes, as when
+        // the page's own document moves.
+        if framed && matches!(typed, Typed::Failed(_)) {
+            let now = crate::vault::page_now(cfg).await;
+            if !now.as_ref().is_some_and(on_site) {
+                let on = (now.as_deref())
+                    .and_then(crate::vault::origin)
+                    .map_or("an unknown page".into(), |o| o.ascii_serialization());
+                return moved(&done, &on);
+            }
         }
         let why = match typed {
             Typed::Missing => Some(format!(
@@ -1626,15 +1601,52 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
         log(db.get().card_filled(id, &last));
     }
     audit(cfg, &db.get(), &card, "fill", "ok");
-    let inside = match frames.is_empty() {
+    if let Some(frames) = frames {
+        frames.close().await;
+    }
+    let inside = match inside.is_empty() {
         true => String::new(),
-        false => format!(", in its payment frame on {}", frames.join(" and ")),
+        false => format!(", in its payment frame on {}", inside.join(" and ")),
     };
     format!(
         "filled the {} of card #{id} (…{}) on {page}{inside}",
         done.join(" and "),
         pan.last4()
     )
+}
+
+/// Types `value` into `selector` in the payment frame of the active tab that holds it,
+/// opening the fill's DevTools session (`frames`) at the first field that needs it. The origin
+/// of a frame typed into joins `inside`.
+async fn in_frame(
+    cfg: &Config,
+    frames: &mut Option<crate::cards_frame::Frames>,
+    site: &str,
+    selector: &str,
+    value: &str,
+    inside: &mut Vec<String>,
+) -> crate::vault::Typed {
+    use crate::vault::Typed;
+    if frames.is_none() {
+        match crate::cards_frame::Frames::open(cfg, site).await {
+            Ok(opened) => *frames = Some(opened),
+            Err(why) => return Typed::Failed(format!("not typed: {why}")),
+        }
+    }
+    let Some(frames) = frames.as_mut() else {
+        return Typed::Missing;
+    };
+    match frames.find(selector).await {
+        Ok(None) => Typed::Missing,
+        Err(why) => Typed::Failed(format!("not typed: {why}")),
+        Ok(Some((at, origin))) => {
+            let typed = frames.type_value(at, &origin, selector, value).await;
+            if typed == Typed::Ok && !inside.contains(&origin) {
+                inside.push(origin);
+            }
+            typed
+        }
+    }
 }
 
 /// The fills in progress, so that closing a card stops one between two fields.

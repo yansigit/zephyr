@@ -138,7 +138,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   DevTools session from `get cdp-url`, the compiled-in `listed` origins, `judge`, and a typing
   script in an isolated world that checks the frame's origin, its parent and
   `ancestorOrigins` in the same evaluation); any other frame is never filled. While
-  a number is kept, the wrapper refuses read-backs of that origin and the frame's (`cards-filled`,
+  a number is kept, the wrapper refuses read-backs of that origin (`cards-filled`,
   `browser_gate::reads_back`). An open card covers exactly one Pay click (`Gate::card_for`,
   `Store::use_card`: `open` → `charging`). `cards::tick` runs on the router's store; issuers
   are asked off the loop and their answers (`Word`) recorded on the next tick; a card's row is
