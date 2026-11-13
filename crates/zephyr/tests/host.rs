@@ -438,10 +438,11 @@ while time.time() < deadline:
         if i >= 0:
             at = i + len(prompt)
             time.sleep(0.2)
-            # The daemon's edit while the owner types: PTY_TEXT appended to PTY_APPEND, once.
-            if os.environ.get("PTY_APPEND"):
-                with open(os.environ.pop("PTY_APPEND"), "a") as f:
-                    f.write(os.environ["PTY_TEXT"])
+            # The daemon's edits while the owner answers this prompt (`pty_edits`).
+            for p, path, text in json.loads(os.environ.get("PTY_EDITS", "[]")):
+                if p == prompt:
+                    with open(path, "a") as f:
+                        f.write(text)
             os.write(fd, keys.encode())
             steps.pop(0)
 if time.time() >= deadline:
@@ -901,35 +902,77 @@ fn init_again_with_a_preset_drops_looser_hand_set_classes() {
     assert!(config.contains("posts = \"ask\""), "as strict: {config}");
 }
 
+/// `mcp add` with a secret asked at a prompt.
+const MCP_ADD: [&str; 7] = [
+    "mcp",
+    "add",
+    "mail",
+    "--secret",
+    "MAIL_KEY",
+    "--",
+    "mail-server",
+];
+
+/// `PTY_EDITS` for `on_a_driven_tty_env`: at each prompt, `text` appended to `path`.
+fn pty_edits(edits: &[(&str, &Path, &str)]) -> String {
+    let edits: Vec<(&str, String, &str)> = (edits.iter())
+        .map(|(p, path, text)| (*p, path.display().to_string(), *text))
+        .collect();
+    serde_json::to_string(&edits).unwrap()
+}
+
+/// Ctrl-C at a secret's prompt leaves every file as it was: nothing is written until every
+/// answer is in.
+#[test]
+fn a_cancelled_secret_prompt_saves_nothing() {
+    let env = Env::new("prompt-cancel");
+    env.init(&["--no-start"]);
+    let read = |name: &str| std::fs::read_to_string(env.daemon().join(name)).ok();
+    let before = (read("zephyr.toml"), read("secrets.env"));
+    let (code, out) = env.on_a_driven_tty(&MCP_ADD, &[("MAIL_KEY (hidden)", "\x03")]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!((read("zephyr.toml"), read("secrets.env")), before, "{out}");
+}
+
+/// The secret is saved before the connector that uses it: the daemon never reloads a
+/// zephyr.toml naming a secret secrets.env does not hold yet, or a new command with an old value.
+#[test]
+fn mcp_add_saves_the_secret_before_the_connector() {
+    let env = Env::new("prompt-order");
+    env.init(&["--no-start"]);
+    env.split();
+    env.calls();
+    let (code, out) = env.on_a_driven_tty(&MCP_ADD, &[("MAIL_KEY (hidden)", "s3cret\r")]);
+    env.unsplit();
+    assert_eq!(code, 0, "{out}");
+    let puts: Vec<String> = (env.calls().into_iter())
+        .filter(|c| c.contains(&"__file".to_string()) && c.contains(&"put".to_string()))
+        .map(|c| c.last().unwrap().clone())
+        .collect();
+    assert_eq!(puts, ["secrets.env", "zephyr.toml"], "{out}");
+}
+
 /// The daemon may write zephyr.toml or vault.toml while the owner types a secret: what it
 /// wrote meanwhile is kept, not undone by a copy read before the prompt.
 #[test]
 fn an_edit_made_while_a_secret_is_typed_survives() {
     let env = Env::new("prompt-edit");
     env.init(&["--no-start"]);
-    let toml = env.daemon().join("zephyr.toml").display().to_string();
+    let toml = env.daemon().join("zephyr.toml");
+    let edits = pty_edits(&[("MAIL_KEY (hidden)", &toml, "\n[tasks]\nparallel = 3\n")]);
     let (code, out) = env.on_a_driven_tty_env(
-        &[
-            "mcp",
-            "add",
-            "mail",
-            "--secret",
-            "MAIL_KEY",
-            "--",
-            "mail-server",
-        ],
+        &MCP_ADD,
         &[("MAIL_KEY (hidden)", "s3cret\r")],
-        &[
-            ("PTY_APPEND", &toml),
-            ("PTY_TEXT", "\n[tasks]\nparallel = 3\n"),
-        ],
+        &[("PTY_EDITS", &edits)],
     );
     assert_eq!(code, 0, "{out}");
     let config = env.config();
     assert!(config.contains("parallel = 3"), "{config}");
     assert!(config.contains("\"mail-server\""), "{config}");
 
-    let vault = env.daemon().join("vault.toml").display().to_string();
+    let vault = env.daemon().join("vault.toml");
+    let token = "[[token]]\nname = \"GH_TOKEN\"\nvalue = \"ghp_x\"\n";
+    let edits = pty_edits(&[("password for github (hidden)", &vault, token)]);
     let (code, out) = env.on_a_driven_tty_env(
         &[
             "vault",
@@ -940,13 +983,7 @@ fn an_edit_made_while_a_secret_is_typed_survives() {
             "https://github.com",
         ],
         &[("password for github (hidden)", "hunter22\r")],
-        &[
-            ("PTY_APPEND", &vault),
-            (
-                "PTY_TEXT",
-                "[[token]]\nname = \"GH_TOKEN\"\nvalue = \"ghp_x\"\n",
-            ),
-        ],
+        &[("PTY_EDITS", &edits)],
     );
     assert_eq!(code, 0, "{out}");
     let list = env.ok(&["vault", "list"]);

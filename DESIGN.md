@@ -775,7 +775,7 @@ The agent edits the projects folder with nobody approving each change, so the ow
 
 The owner keeps website logins and tokens for the agent in a vault (`vault.rs`), so a credential never has to be pasted into a chat, and the agent uses each by name without seeing it.
 
-- **Store.** `<state>/vault.toml` (the daemon dir: root's, 0600, out of the agent's reach, §4.4), one of `DAEMON_FILES`, so the host CLI reaches it through `zephyr __file`. The daemon reads it on every use, so an edit needs no reload or re-exec; it is edited with toml_edit (comments survive) under one in-process lock. The host CLI reads it again after its hidden prompts and `zephyr mcp add` saves `zephyr.toml` before them, so a grant, a bind or a `/set` the daemon writes while the owner types is kept. It is not encrypted at rest: a passphrase would stop unattended restarts.
+- **Store.** `<state>/vault.toml` (the daemon dir: root's, 0600, out of the agent's reach, §4.4), one of `DAEMON_FILES`, so the host CLI reaches it through `zephyr __file`. The daemon reads it on every use, so an edit needs no reload or re-exec; it is edited with toml_edit (comments survive) under one in-process lock. The host CLI reads it again after its hidden prompts, so a grant or a bind the daemon writes while the owner types is kept. `zephyr mcp add` asks every value before it writes anything (Ctrl-C at any prompt leaves every file as it was), saves them to secrets.env first, so the daemon never loads a connector before its secrets, then reads `zephyr.toml` again, makes its edit and saves it with no prompt in between. It is not encrypted at rest: a passphrase would stop unattended restarts.
 
   ```toml
   [[login]]

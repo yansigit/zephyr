@@ -913,15 +913,11 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let rest = a.rest()?;
     // Whether this writes a connector's table by hand (not `add NAME --secret K` alone).
     let by_hand = url.is_some() || !command.is_empty();
-    // The catalog entry's secrets secrets.env lacks, asked for (or named) once it is saved.
-    let mut wanted: Vec<crate::catalog::Secret> = Vec::new();
-    let mut doc = h.data.load()?;
     let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
         let cfg: Config = toml::from_str(&doc.to_string())?;
         cfg.validate()?;
         Ok(cfg)
     };
-    let was = parse(&doc).ok();
     let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | add --catalog NAME [--url URL] [--host HOST].. [--plain] | catalog | list | rm NAME";
     // The image's copy of an entry, read as root by full path (`valid_name` first: it becomes a path).
     let entry_text = |name: &str| -> anyhow::Result<String> {
@@ -948,108 +944,113 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        [add] if add == "add" && catalog.is_some() => {
-            let name = catalog.as_deref().unwrap_or_default();
-            h.need_running()?;
-            let entry = crate::catalog::parse(name, &entry_text(name)?)?;
-            let old = parse(&doc)
-                .ok()
-                .and_then(|c| c.mcp.into_iter().find(|m| m.name == name));
-            // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
-            if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
-                bail!("{why}: add --plain to hand it the real key, which the agent can then read");
-            }
-            let m =
-                crate::catalog::merged(entry.to_mcp(url.as_deref())?, old.as_ref(), &hosts, plain);
-            if let Some(note) = crate::catalog::lost_plain(old.as_ref(), &m) {
-                println!("{name}: {note}");
-            }
-            conf::upsert_mcp(&mut doc, &m)?;
-            let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
-            let lacks = |s: &crate::catalog::Secret| !set.iter().any(|(k, _)| *k == s.name);
-            wanted = (entry.secrets.into_iter())
-                .filter(|s| lacks(s) && !secrets.contains(&s.name))
-                .collect();
-        }
         [list] if list == "list" => {
-            for m in parse(&doc)?.mcp {
+            for m in parse(&h.data.load()?)?.mcp {
                 println!("{}: {}", m.name, m.url.or(m.command).unwrap_or_default());
             }
             return Ok(());
         }
-        [rm, name] if rm == "rm" => {
-            if !conf::remove_mcp(&mut doc, name) {
-                bail!("no connector named {name}");
-            }
-        }
-        [add, name] if add == "add" => {
-            let headers = headers
-                .iter()
-                .map(|h| {
-                    h.split_once('=')
-                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                        .with_context(|| format!("--header {h}: write it as K=V"))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            // D4: added again, a connector keeps the classes the owner gave its tools.
-            let existing = || {
-                let cfg = parse(&doc).ok();
-                cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name))
-            };
-            let classes = || existing().map(|m| m.classes).unwrap_or_default();
-            // And where its secrets go, unless this call says.
-            let old = existing().unwrap_or_default();
-            let mut m = match (url, command.split_first()) {
-                (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
-                (Some(url), None) => Mcp {
-                    name: name.clone(),
-                    url: Some(url),
-                    headers,
-                    classes: classes(),
-                    ..Mcp::default()
-                },
-                (None, Some((cmd, args))) if headers.is_empty() => Mcp {
-                    name: name.clone(),
-                    command: Some(cmd.clone()),
-                    args: args.to_vec(),
-                    classes: classes(),
-                    ..Mcp::default()
-                },
-                (None, Some(_)) => bail!("--header goes with --url"),
-                (None, None) => parse(&doc)?
-                    .mcp
-                    .into_iter()
-                    .find(|m| m.name == *name)
-                    .with_context(|| format!("no connector named {name}\n{usage}"))?,
-            };
-            m.hosts = match hosts.is_empty() {
-                true => old.hosts,
-                false => hosts.join(", "),
-            };
-            m.secrets = match plain {
-                true => Some("plain".into()),
-                false => old.secrets,
-            };
-            // A remote connector can only hold its real secret (rpi's own client cannot use a
-            // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
-            if crate::broker::undecided(&m) {
-                bail!(
-                    "a remote connector's secret is handed to it as it is, where the agent can \
-                     read it (rpi's own client cannot use a stand-in): add --plain to accept that"
-                );
-            }
-            conf::upsert_mcp(&mut doc, &m)?;
-        }
-        _ => bail!("{usage}"),
+        _ => {}
     }
-    let now = parse(&doc)?;
-    // As `/set`: this may not make one secret a connector's own and another's stand-in.
-    // With no config that read before, the new one alone must hold none.
-    let made = match &was {
-        Some(was) => crate::broker::creates_pair(was, &now),
-        None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+    let entry = match (&catalog, &rest[..]) {
+        (Some(name), [add]) if add == "add" => {
+            h.need_running()?;
+            Some(crate::catalog::parse(name, &entry_text(name)?)?)
+        }
+        _ => None,
     };
-    made.map_err(anyhow::Error::msg)?;
+    let headers: std::collections::BTreeMap<String, String> = (headers.iter())
+        .map(|h| {
+            h.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .with_context(|| format!("--header {h}: write it as K=V"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    // The change to zephyr.toml, made on the file as it is, and again on a fresh read after the
+    // prompts. Returns a note to print.
+    let edit = |doc: &mut toml_edit::DocumentMut| -> anyhow::Result<Option<String>> {
+        let was = parse(doc).ok();
+        let mut note = None;
+        match (&entry, &rest[..]) {
+            (Some(entry), _) => {
+                let name = catalog.as_deref().unwrap_or_default();
+                let old = (was.as_ref()).and_then(|c| c.mcp.iter().find(|m| m.name == name));
+                // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
+                if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
+                    bail!(
+                        "{why}: add --plain to hand it the real key, which the agent can then read"
+                    );
+                }
+                let m = crate::catalog::merged(entry.to_mcp(url.as_deref())?, old, &hosts, plain);
+                note = crate::catalog::lost_plain(old, &m).map(|n| format!("{name}: {n}"));
+                conf::upsert_mcp(doc, &m)?;
+            }
+            (None, [rm, name]) if rm == "rm" => {
+                if !conf::remove_mcp(doc, name) {
+                    bail!("no connector named {name}");
+                }
+            }
+            (None, [add, name]) if add == "add" => {
+                // D4: added again, a connector keeps the classes the owner gave its tools.
+                let existing = (was.as_ref()).and_then(|c| c.mcp.iter().find(|m| m.name == *name));
+                let classes = existing.map(|m| m.classes.clone()).unwrap_or_default();
+                // And where its secrets go, unless this call says.
+                let old = existing.cloned().unwrap_or_default();
+                let mut m = match (&url, command.split_first()) {
+                    (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
+                    (Some(url), None) => Mcp {
+                        name: name.clone(),
+                        url: Some(url.clone()),
+                        headers: headers.clone(),
+                        classes,
+                        ..Mcp::default()
+                    },
+                    (None, Some((cmd, args))) if headers.is_empty() => Mcp {
+                        name: name.clone(),
+                        command: Some(cmd.clone()),
+                        args: args.to_vec(),
+                        classes,
+                        ..Mcp::default()
+                    },
+                    (None, Some(_)) => bail!("--header goes with --url"),
+                    (None, None) => parse(doc)?
+                        .mcp
+                        .into_iter()
+                        .find(|m| m.name == *name)
+                        .with_context(|| format!("no connector named {name}\n{usage}"))?,
+                };
+                m.hosts = match hosts.is_empty() {
+                    true => old.hosts,
+                    false => hosts.join(", "),
+                };
+                m.secrets = match plain {
+                    true => Some("plain".into()),
+                    false => old.secrets,
+                };
+                // A remote connector can only hold its real secret (rpi's own client cannot use a
+                // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
+                if crate::broker::undecided(&m) {
+                    bail!(
+                        "a remote connector's secret is handed to it as it is, where the agent can \
+                         read it (rpi's own client cannot use a stand-in): add --plain to accept that"
+                    );
+                }
+                conf::upsert_mcp(doc, &m)?;
+            }
+            _ => bail!("{usage}"),
+        }
+        let now = parse(doc)?;
+        // As `/set`: this may not make one secret a connector's own and another's stand-in.
+        // With no config that read before, the new one alone must hold none.
+        let made = match &was {
+            Some(was) => crate::broker::creates_pair(was, &now),
+            None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+        };
+        made.map_err(anyhow::Error::msg)?;
+        Ok(note)
+    };
+    let mut doc = h.data.load()?;
+    let mut note = edit(&mut doc)?;
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }
@@ -1058,9 +1059,48 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     {
         bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
     }
-    // Saved before the values are asked: the daemon may edit zephyr.toml while the owner types,
-    // which a save after the prompt would undo. Until they are set the connector is left out, as
-    // one added without a terminal is.
+    // The catalog entry's secrets secrets.env lacks, asked for (or named).
+    let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
+    let wanted: Vec<&crate::catalog::Secret> = (entry.iter().flat_map(|e| &e.secrets))
+        .filter(|s| !set.iter().any(|(k, _)| *k == s.name) && !secrets.contains(&s.name))
+        .collect();
+    // Every value is asked before anything is written, so Ctrl-C at any prompt leaves every
+    // file as it was.
+    let mut values: Vec<(&str, String)> = Vec::new();
+    for key in &secrets {
+        let value = Password::new()
+            .with_prompt(format!("{key} (hidden)"))
+            .interact()?;
+        values.push((key, value));
+    }
+    for s in &wanted {
+        println!("{}: {}", s.name, s.help);
+        if !h.interactive {
+            let name = catalog.as_deref().unwrap_or_default();
+            println!(
+                "set it in a terminal with: zephyr mcp add {name} --secret {}",
+                s.name
+            );
+            continue;
+        }
+        let value = Password::new()
+            .with_prompt(format!("{} (hidden)", s.name))
+            .interact()?;
+        values.push((&s.name, value));
+    }
+    // The secrets first, so the daemon never loads the connector before them; then zephyr.toml
+    // read again, edited and saved with no prompt between, so what the daemon wrote while the
+    // owner typed is kept.
+    for (key, value) in &values {
+        h.data.set_secret(key, value.trim())?;
+    }
+    if !values.is_empty() {
+        doc = h.data.load()?;
+        note = edit(&mut doc)?;
+    }
+    if let Some(note) = note {
+        println!("{note}");
+    }
     h.data.save(&doc)?;
     // Which connectors came from the catalog, for doctor's note (DESIGN §4.22): the daemon's
     // file, never zephyr.toml.
@@ -1080,27 +1120,6 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 eprintln!("warn {e:#}: zephyr doctor may not say when a newer catalog entry ships");
             }
         }
-    }
-    for key in &secrets {
-        let value = Password::new()
-            .with_prompt(format!("{key} (hidden)"))
-            .interact()?;
-        h.data.set_secret(key, value.trim())?;
-    }
-    for s in &wanted {
-        println!("{}: {}", s.name, s.help);
-        if !h.interactive {
-            let name = catalog.as_deref().unwrap_or_default();
-            println!(
-                "set it in a terminal with: zephyr mcp add {name} --secret {}",
-                s.name
-            );
-            continue;
-        }
-        let value = Password::new()
-            .with_prompt(format!("{} (hidden)", s.name))
-            .interact()?;
-        h.data.set_secret(&s.name, value.trim())?;
     }
     match &catalog {
         Some(name) => println!("saved the catalog connector {name}"),
