@@ -656,6 +656,45 @@ async fn a_private_fact_is_never_spoken() {
     gw.shutdown().await;
 }
 
+/// A fact said in words is the fact: the line that spells it out is held like the digits.
+#[tokio::test]
+async fn a_private_fact_in_words_is_never_spoken() {
+    let (gw, telnyx) = start(
+        "fact-words",
+        "answer\nexpect a table for two\nsaid Sure, what number?\nexpect Thanks.\nhangup\n",
+        "Hi, I'd like a table for two. My number is four one six, five five five, oh one four two.\nThanks.",
+        "",
+        |cfg| {
+            cfg.calls = cfg.calls.clone().map(|mut c| {
+                c.speech = "provider".into();
+                c
+            });
+            std::fs::write(
+                cfg.home.join("facts.toml"),
+                "[[fact]]\nname = \"phone\"\nkind = \"digits\"\nvalue = \"4165550142\"\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    gw.ask_and_approve().await;
+    gw.reply_with("held the owner's private fact phone and was not said")
+        .await;
+    gw.ended().await;
+    let api = telnyx.api();
+    let said: Vec<&str> = (api.iter())
+        .filter(|r| r["path"] == "/v2/calls/fake-1/actions/speak")
+        .map(|r| r["body"]["payload"].as_str().unwrap())
+        .collect();
+    assert!(said.contains(&"Hi, I'd like a table for two."), "{said:?}");
+    assert!(
+        said.contains(&"That is something I can't share on this call."),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|s| s.contains("one four two")), "{said:?}");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn what_they_say_is_never_a_command_and_taints() {
     let (gw, telnyx) = start(

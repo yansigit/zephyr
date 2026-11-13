@@ -237,15 +237,80 @@ fn folded(view: &[Piece]) -> Vec<Piece> {
 }
 
 /// Whether `c` (after NFKC) can sit between the digits of one written number: spaces, tabs,
-/// slashes, dots, brackets and every kind of dash.
+/// slashes, dots, commas, brackets and every kind of dash.
 fn separator(c: char) -> bool {
     c.to_string().nfkc().all(|n| {
         n.is_whitespace()
             || matches!(
                 n,
-                '-' | '.' | '(' | ')' | '/' | '\u{2010}'..='\u{2015}' | '\u{2212}'
+                '-' | '.' | ',' | '(' | ')' | '/' | '\u{2010}'..='\u{2015}' | '\u{2212}'
             )
     })
+}
+
+/// `view` with each spoken digit read as that digit, so a number said in words is a run too: an
+/// English or French digit word (`zero`/`oh` to `nine`, `zéro` to `neuf`) standing as a whole
+/// word, and each Sino-Korean digit syllable (`영`/`공`, `일` to `구`), which Korean writes with
+/// no space between. The digit keeps the range of the word it stands for.
+fn spoken(view: &[Piece]) -> Vec<Piece> {
+    const WORDS: &[(&str, char)] = &[
+        ("zero", '0'),
+        ("oh", '0'),
+        ("one", '1'),
+        ("two", '2'),
+        ("three", '3'),
+        ("four", '4'),
+        ("five", '5'),
+        ("six", '6'),
+        ("seven", '7'),
+        ("eight", '8'),
+        ("nine", '9'),
+        ("zéro", '0'),
+        ("un", '1'),
+        ("deux", '2'),
+        ("trois", '3'),
+        ("quatre", '4'),
+        ("cinq", '5'),
+        ("sept", '7'),
+        ("huit", '8'),
+        ("neuf", '9'),
+    ];
+    const KOREAN: [(char, char); 11] = [
+        ('영', '0'),
+        ('공', '0'),
+        ('일', '1'),
+        ('이', '2'),
+        ('삼', '3'),
+        ('사', '4'),
+        ('오', '5'),
+        ('육', '6'),
+        ('칠', '7'),
+        ('팔', '8'),
+        ('구', '9'),
+    ];
+    let latin = |c: char| c.is_alphabetic() && !('\u{ac00}'..='\u{d7a3}').contains(&c);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < view.len() {
+        let (c, from, to) = view[i];
+        if !latin(c) {
+            let digit = KOREAN.iter().find(|(k, _)| *k == c).map(|(_, d)| *d);
+            out.push((digit.unwrap_or(c), from, to));
+            i += 1;
+            continue;
+        }
+        let end = view[i..]
+            .iter()
+            .position(|p| !latin(p.0))
+            .map_or(view.len(), |n| i + n);
+        let word: String = view[i..end].iter().map(|p| p.0).collect();
+        match WORDS.iter().find(|(w, _)| *w == norm(&word)) {
+            Some((_, d)) => out.push((*d, from, view[end - 1].2)),
+            None => out.extend_from_slice(&view[i..end]),
+        }
+        i = end;
+    }
+    out
 }
 
 /// The digit runs in `view` as (byte start, byte end, digits): a run is digits with the
@@ -333,7 +398,7 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
     let views = std::iter::once(raw(text)).chain(decoded(text)).map(visible);
     for view in views {
         if f.kind == FactKind::Digits {
-            for (a, b, run) in runs(&view) {
+            for (a, b, run) in runs(&spoken(&view)) {
                 if same_number(&value, &run) {
                     out.push((a, b));
                 }
@@ -758,6 +823,34 @@ mod tests {
         // Other numbers are left alone.
         assert!(found(&phone, "order 5550102346", None).is_empty());
         assert!(found(&phone, "555 0102", None).is_empty());
+    }
+
+    #[test]
+    fn digits_said_as_words_match() {
+        let phone = [fact("phone", FactKind::Digits, "046454286")];
+        for text in [
+            "My number is zero four six four five four two eight six.",
+            "oh four six, four five four, two eight six",
+            "Zero-Four-Six 454 two eight six",
+            "zéro quatre six quatre cinq quatre deux huit six",
+            "공사육 사오사 이팔육이에요",
+            "영사육사오사이팔육",
+            "046, 454, 286",
+        ] {
+            assert_eq!(found(&phone, text, None), ["phone"], "{text}");
+        }
+        assert_eq!(
+            scrub(&phone, "it is oh four six four five four two eight six, ok"),
+            "it is [fact:phone], ok"
+        );
+        // A word only counts whole, and other numbers stay other numbers.
+        for text in [
+            "zero four six four five four two eight seven",
+            "zero four six four five four two eight sixty",
+            "zero four six four five four two eighty six",
+        ] {
+            assert!(found(&phone, text, None).is_empty(), "{text}");
+        }
     }
 
     #[test]
