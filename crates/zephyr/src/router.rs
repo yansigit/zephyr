@@ -331,10 +331,11 @@ pub async fn run<C: Channel>(
     // After the adoption, so an approved action whose command is still running stays running;
     // a delay that came due while down waits for the owner (approvals spec §4.9).
     crate::actions::restore(&router.cfg, &router.store, crate::now());
-    // Over the budget and running: the owner resumed under the rule before this one (DESIGN §4.4).
+    // Once, at this version's first start: over the budget and running, the owner resumed under
+    // the rule before this one (DESIGN §4.4).
     log(router
         .store
-        .budget_at_start(router.cfg.budget.as_ref())
+        .migrate_budget(router.cfg.budget.as_ref())
         .map_err(Into::into));
     // A card's number was in the memory of the daemon before this one: what is still open is
     // closed at its issuer, never filled again (DESIGN §4.25).
