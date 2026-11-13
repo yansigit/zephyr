@@ -3757,6 +3757,29 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
                 .any(|c| words.contains(c));
             assert!(!ci_run && !cargo, "{path:?}:\n{step}");
         }
+        if path.ends_with("rpi-bump.yml") {
+            // The bump's build and tests hold no token at all; the one job that can push runs no
+            // cargo, only on a fresh hosted runner, and checks the build's patch before applying it.
+            let job = |name: &str| block(lines.iter().position(|l| *l == name).unwrap());
+            let build = job("  build:");
+            assert!(build.contains("cargo test"), "{build}");
+            assert!(
+                !build.contains("GH_TOKEN") && !build.contains("token"),
+                "{build}"
+            );
+            let push = job("  push:");
+            let words: Vec<&str> = push
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .collect();
+            assert!(!words.contains(&"cargo"), "{push}");
+            assert!(push.contains("\n    runs-on: ubuntu-latest\n"), "{push}");
+            assert!(!push.contains("zephyr-local"), "{push}");
+            let check = push
+                .find(" .github/bump-check.py ")
+                .expect("an allowlist check");
+            let apply = push.find("run: git apply ").expect("the patch is applied");
+            assert!(check < apply, "{push}");
+        }
     }
     assert!(tokens >= 6, "{tokens}");
     let ci = read(&root.join(".github/ci.sh"));
@@ -3764,6 +3787,64 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
         ci.contains("( unset GH_TOKEN; check \"${name% (*}\" )"),
         "{ci}"
     );
+}
+
+/// rpi-bump's push job applies the build's patch only when it moves the rpi pins and nothing else:
+/// a real bump (tests/fixtures/rpi-bump.patch, made by bump-rpi.sh, its versions swapped for
+/// 9.8.7 and 9.9.0 so a later bump does not rewrite it) passes, and each kind of smuggled change fails.
+#[test]
+fn the_bump_check_passes_only_a_pin_move() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let good = read(&root.join("crates/zephyr/tests/fixtures/rpi-bump.patch"));
+    let dir = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let check = |name: &str, patch: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, patch).unwrap();
+        let out = Command::new("python3")
+            .arg("-I")
+            .arg(root.join(".github/bump-check.py"))
+            .args(["9.8.7", "9.9.0"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    assert_eq!(check("good", &good), (true, String::new()));
+    let pin = "+const RPI_PIN: &str = \"rpi 9.9.\";\n";
+    assert!(good.contains(pin));
+    let bad = [
+        ("other-file", format!("{good}diff --git a/.github/ci.sh b/.github/ci.sh\nindex 1111111..2222222 100755\n--- a/.github/ci.sh\n+++ b/.github/ci.sh\n@@ -1 +1 @@\n-a\n+b\n")),
+        ("extra-line", good.replacen(pin, &format!("{pin}+fn planted() {{}}\n"), 1)),
+        ("git-source", good.replacen(
+            "+source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "+source = \"git+https://example.com/rpi-tui#0\"",
+            1,
+        )),
+        ("other-version", good.replacen(pin, "+const RPI_PIN: &str = \"rpi 9.7.\";\n", 1)),
+        ("new-file", good.replacen(
+            "diff --git a/deploy/release.sh b/deploy/release.sh\n",
+            "diff --git a/deploy/release.sh b/deploy/release.sh\nnew file mode 100755\n",
+            1,
+        )),
+    ];
+    for (name, patch) in &bad {
+        assert_ne!(patch, &good, "{name}");
+        let (ok, err) = check(name, patch);
+        assert!(!ok && err.starts_with("bump-check: "), "{name}: {err}");
+    }
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(root.join(".github/bump-check.py"))
+        .args(["9.8.7", "9.9.0; x"])
+        .arg(dir.join("good"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

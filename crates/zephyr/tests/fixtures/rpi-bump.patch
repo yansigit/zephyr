@@ -1,0 +1,381 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 2543d40..ceb3b47 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -17,7 +17,7 @@ cargo test -p zephyr --test router some_name  # one test by name filter
+ cargo clippy --all-targets && cargo fmt
+ cargo deny check advisories bans               # what CI's deny job runs
+ 
+-# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-9.8.7/bin/rpi
++# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-9.9.0/bin/rpi
+ # (or RPI_BIN=<path>; deploy/bump-rpi.sh rewrites that default path)
+ cargo test -p zephyr --test real_rpi -- --ignored
+ cargo test -p zephyr-policy --test rpi_load -- --ignored
+@@ -57,9 +57,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
+   the outbox (client id = Discord nonce / BlueBubbles tempGuid), budgets, `/stop` `/pause` `/model`
+   `/reload`, and crash reconcile (re-send rows whose text isn't in `get_messages`).
+ - `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
+-  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 9.8.x (`RPI_PIN` in
+-  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=9.8.7"` in zephyr-policy and zephyr-cursor,
+-  and `rpi-tui = "=9.8.7"` in zephyr); `deploy/bump-rpi.sh` moves them all, daily via
++  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 9.9.x (`RPI_PIN` in
++  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=9.9.0"` in zephyr-policy and zephyr-cursor,
++  and `rpi-tui = "=9.9.0"` in zephyr); `deploy/bump-rpi.sh` moves them all, daily via
+   `.github/workflows/rpi-bump.yml`, which merges the bump when the tests and real-rpi suite pass.
+ - `pool.rs`: `[[account]]` failover. Each account gets its own `RPI_CODING_AGENT_DIR` under
+   `<home>/accounts/<name>/`; rate-limit detection reads `agent_settled.error`; cooldowns live in `state.db`.
+diff --git a/Cargo.lock b/Cargo.lock
+index 4111e0c..7cf6b20 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -395,6 +395,31 @@ dependencies = [
+  "strum",
+ ]
+ 
++[[package]]
++name = "crossbeam-deque"
++version = "0.8.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
++
+ [[package]]
+ name = "crossterm"
+ version = "0.27.0"
+@@ -856,6 +881,19 @@ dependencies = [
+  "wasm-bindgen",
+ ]
+ 
++[[package]]
++name = "globset"
++version = "0.4.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f98b0d85522dc0a824cfebbc9594ff4a9b289c568bea0370319dfbdf20ccdd2d"
++dependencies = [
++ "aho-corasick",
++ "bstr",
++ "log",
++ "regex-automata",
++ "regex-syntax",
++]
++
+ [[package]]
+ name = "h2"
+ version = "0.4.20"
+@@ -1136,6 +1174,22 @@ dependencies = [
+  "icu_properties",
+ ]
+ 
++[[package]]
++name = "ignore"
++version = "0.4.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
++dependencies = [
++ "crossbeam-deque",
++ "globset",
++ "log",
++ "memchr",
++ "regex-automata",
++ "same-file",
++ "walkdir",
++ "winapi-util",
++]
++
+ [[package]]
+ name = "indexmap"
+ version = "1.9.3"
+@@ -1962,9 +2016,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rpi-ai"
+-version = "9.8.7"
++version = "9.9.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "53f680b5b0e48a4a2e007c5b6ece7bfbe296947d583a69c8af1928ae41f71abc"
++checksum = "6dfa66bcc0b80fcaf4ef2415f6c120a112864fec64ea0050ff2b1600dd16bf46"
+ dependencies = [
+  "async-trait",
+  "base64 9.9.0",
+@@ -1987,9 +2041,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rpi-plugin-sdk"
+-version = "9.8.7"
++version = "9.9.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b1da91861977502e3151dfa66cb4d58c385e5659e483cee844a0ba690dd15248"
++checksum = "f9cc006eb43220a644c056aa32187febeaf4382c1da8fa37631347de134349e3"
+ dependencies = [
+  "reqwest",
+  "rpi-ai",
+@@ -2000,9 +2054,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rpi-telemetry"
+-version = "9.8.7"
++version = "9.9.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "27e2df15f8e785bde4305be6c5d55c445ac3b63b041cbae41ed9c964d702af3f"
++checksum = "29b6d7461b23b20ffafda233ea160eae453cbbfad301d7fb95212babc9d059bd"
+ dependencies = [
+  "async-trait",
+  "serde",
+@@ -2012,12 +2066,13 @@ dependencies = [
+ 
+ [[package]]
+ name = "rpi-tui"
+-version = "9.8.7"
++version = "9.9.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c6e2f8a780675915d023e1d6997a457ee1449190e1d40a7d89387767c2cf3deb"
++checksum = "fb520d896821ca311e8fca039567af1619d56d8f46212519f1d4a3500f617c5e"
+ dependencies = [
+  "base64 9.9.0",
+  "crossterm",
++ "ignore",
+  "pulldown-cmark",
+  "regex",
+  "serde_json",
+@@ -2128,6 +2183,15 @@ version = "1.0.23"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+ 
++[[package]]
++name = "same-file"
++version = "1.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
++dependencies = [
++ "winapi-util",
++]
++
+ [[package]]
+ name = "schannel"
+ version = "0.1.30"
+@@ -2977,6 +3041,16 @@ version = "0.9.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+ 
++[[package]]
++name = "walkdir"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
++dependencies = [
++ "same-file",
++ "winapi-util",
++]
++
+ [[package]]
+ name = "want"
+ version = "0.3.2"
+@@ -3115,6 +3189,15 @@ version = "0.4.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+ 
++[[package]]
++name = "winapi-util"
++version = "0.1.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "winapi-x86_64-pc-windows-gnu"
+ version = "0.4.0"
+diff --git a/README.md b/README.md
+index 43b191d..e3fc632 100644
+--- a/README.md
++++ b/README.md
+@@ -1267,7 +1267,7 @@ using a subscription unattended; check that your use fits them.
+ 
+ `zephyr up --build` builds `deploy/Dockerfile` from pinned sources: this repo, `rpi-providers` from
+ `yansigit/rpi-package`, the Cursor provider from `crates/zephyr-cursor`, `rpi-claude-agent` from
+-`yansigit/rpi-provider-plugins`, and the upstream `rpi` 9.8.7 release (sha256 checked). Your `gh
++`yansigit/rpi-provider-plugins`, and the upstream `rpi` 9.9.0 release (sha256 checked). Your `gh
+ auth token` goes in as the BuildKit secret `gh_token`, which is never stored in a layer. The
+ provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`);
+ local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
+diff --git a/crates/zephyr-cursor/Cargo.toml b/crates/zephyr-cursor/Cargo.toml
+index 61f0405..563f232 100644
+--- a/crates/zephyr-cursor/Cargo.toml
++++ b/crates/zephyr-cursor/Cargo.toml
+@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
+ [dependencies]
+ # Pinned with the rpi binary (RPI_PIN); bump both together. The `provider` feature is the
+ # streaming-provider bridge this crate exports (DESIGN §4.9).
+-rpi-plugin-sdk = { version = "=9.8.7", features = ["provider"] }
+-rpi-ai = { version = "=9.8.7", features = ["providers"] }
++rpi-plugin-sdk = { version = "=9.9.0", features = ["provider"] }
++rpi-ai = { version = "=9.9.0", features = ["providers"] }
+ anyhow.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+diff --git a/crates/zephyr-cursor/tests/e2e.rs b/crates/zephyr-cursor/tests/e2e.rs
+index 579cc17..5e6eda0 100644
+--- a/crates/zephyr-cursor/tests/e2e.rs
++++ b/crates/zephyr-cursor/tests/e2e.rs
+@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
+ 
+ use support::cursor_service::{self, Observed, Script};
+ 
+-const PINNED: &str = "/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi";
++const PINNED: &str = "/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi";
+ const TIMEOUT: Duration = Duration::from_secs(120);
+ 
+ /// A bearer token the exchange step must pass through untouched: three segments, `exp` far ahead.
+diff --git a/crates/zephyr-policy/Cargo.toml b/crates/zephyr-policy/Cargo.toml
+index ec5be05..b2cf30e 100644
+--- a/crates/zephyr-policy/Cargo.toml
++++ b/crates/zephyr-policy/Cargo.toml
+@@ -10,7 +10,7 @@ publish = false
+ crate-type = ["cdylib", "rlib"]
+ 
+ [dependencies]
+-rpi-plugin-sdk = "=9.8.7"
++rpi-plugin-sdk = "=9.9.0"
+ # Already in the tree (zephyr's): the gate socket's peer uid (SO_PEERCRED; std's is unstable).
+ libc = "0.2"
+ serde.workspace = true
+diff --git a/crates/zephyr-policy/tests/rpi_load.rs b/crates/zephyr-policy/tests/rpi_load.rs
+index aff90b7..78e7e8c 100644
+--- a/crates/zephyr-policy/tests/rpi_load.rs
++++ b/crates/zephyr-policy/tests/rpi_load.rs
+@@ -22,7 +22,7 @@ use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
+ /// fixed path.
+ static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+     std::env::var("RPI_BIN")
+-        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi".into())
++        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi".into())
+ });
+ 
+ /// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
+diff --git a/crates/zephyr/Cargo.toml b/crates/zephyr/Cargo.toml
+index 364a4af..a8803ee 100644
+--- a/crates/zephyr/Cargo.toml
++++ b/crates/zephyr/Cargo.toml
+@@ -47,7 +47,7 @@ data-encoding = "2.11.1"
+ croner = { version = "4", default-features = false, features = ["jiff"] }
+ jiff = "0.2"
+ # Pinned with the rpi binary (DESIGN §3); bump the two together.
+-rpi-tui = "=9.8.7"
++rpi-tui = "=9.9.0"
+ crossterm = { version = "0.27", features = ["bracketed-paste"] }
+ # The public suffix list, compiled in: browser pacing's sites are registrable domains (DESIGN §4.24).
+ psl = "2.1"
+diff --git a/crates/zephyr/src/main.rs b/crates/zephyr/src/main.rs
+index a9d3f24..fbda164 100644
+--- a/crates/zephyr/src/main.rs
++++ b/crates/zephyr/src/main.rs
+@@ -14,7 +14,7 @@ use zephyr::rpc::{Child, USED_COMMANDS};
+ use zephyr::store::Store;
+ 
+ /// The rpi minor this build speaks (DESIGN §3).
+-const RPI_PIN: &str = "rpi 9.8.";
++const RPI_PIN: &str = "rpi 9.9.";
+ 
+ const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair|card|signal-setup>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+ 
+diff --git a/crates/zephyr/tests/attach.rs b/crates/zephyr/tests/attach.rs
+index e66c586..6c9e96d 100644
+--- a/crates/zephyr/tests/attach.rs
++++ b/crates/zephyr/tests/attach.rs
+@@ -864,7 +864,7 @@ fn skip_without_rpi(rpi: impl std::fmt::Display) {
+ #[ignore = "drives the real rpi 9.8.7 --connect client"]
+ async fn stock_rpi_connect_attaches_chats_and_detaches() {
+     let rpi = std::env::var("RPI_BIN")
+-        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi".into());
++        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi".into());
+     let rpi = Path::new(&rpi);
+     if !rpi.exists() {
+         skip_without_rpi(rpi.display());
+diff --git a/crates/zephyr/tests/fake-rpi.py b/crates/zephyr/tests/fake-rpi.py
+index bb47e41..e8e6c41 100755
+--- a/crates/zephyr/tests/fake-rpi.py
++++ b/crates/zephyr/tests/fake-rpi.py
+@@ -127,7 +127,7 @@ import glob, json, os, queue as queues, re, select, socket, struct, sys, threadi
+ 
+ args = sys.argv[1:]
+ if "--version" in args:
+-    print("rpi 9.8.7"); sys.exit(0)
++    print("rpi 9.9.0"); sys.exit(0)
+ CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
+ # zephyr_policy::tools::GATEWAY_COMMANDS
+ GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/goals", "/persona", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
+diff --git a/crates/zephyr/tests/host.rs b/crates/zephyr/tests/host.rs
+index 77d43d0..ce0f305 100644
+--- a/crates/zephyr/tests/host.rs
++++ b/crates/zephyr/tests/host.rs
+@@ -4076,7 +4076,7 @@ fn release_and_runner_scripts_keep_their_defaults() {
+     }
+     let release = read(&deploy.join("release.sh"));
+     assert!(
+-        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi}"),
++        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi}"),
+         "{release}"
+     );
+     assert!(release.contains("export RPI_BIN=\"$rpi\""), "{release}");
+diff --git a/crates/zephyr/tests/real_rpi.rs b/crates/zephyr/tests/real_rpi.rs
+index 7abbcee..27ec9b0 100644
+--- a/crates/zephyr/tests/real_rpi.rs
++++ b/crates/zephyr/tests/real_rpi.rs
+@@ -14,7 +14,7 @@ use zephyr::config::Config;
+ /// fixed path.
+ static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+     std::env::var("RPI_BIN")
+-        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi".into())
++        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi".into())
+ });
+ 
+ /// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
+diff --git a/deploy/Dockerfile b/deploy/Dockerfile
+index 13a842a..82c6dc0 100644
+--- a/deploy/Dockerfile
++++ b/deploy/Dockerfile
+@@ -12,9 +12,9 @@
+ #   --build-arg RPI_PACKAGE_REPO= --build-arg PLUGINS_REPO=
+ # the image has zephyr, the policy plugin, Cursor and rpi's built-in providers only.
+ 
+-ARG RPI_VERSION=9.8.7
+-ARG RPI_SHA256_AMD64=f4477ded68eb49f069d2ec4e197371812d33cafbc7985a3531c4d3cd09ace657
+-ARG RPI_SHA256_ARM64=c05cceff56cefff43c66c9e42c4443fbdaa07988788f71796d07ce640545383e
++ARG RPI_VERSION=9.9.0
++ARG RPI_SHA256_AMD64=bdc9239cf090d6a9208b2b8fb70bf58f754965b5d66336a26017b8ea06c70d5c
++ARG RPI_SHA256_ARM64=2e6384f65c2efcbf392290e5af610cff1a36da8b51e9352e4d65bb6f62b5bac3
+ ARG RPI_PACKAGE_REPO=https://github.com/yansigit/rpi-package.git
+ ARG RPI_PACKAGE_REF=11e8ac183cf582144b8562ea19ec6f2620553cc3 # feat/providers-openai-codex: main cabdb15 + Antigravity, OpenCode Go, Codex
+ ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git
+diff --git a/deploy/release.sh b/deploy/release.sh
+index 9fc1163..4f9637e 100755
+--- a/deploy/release.sh
++++ b/deploy/release.sh
+@@ -35,7 +35,7 @@ cargo test -q
+ 
+ step "testing against the pinned rpi"
+ # The ignored tests drive the real binary: $RPI_BIN, else this fixed path (the tests' RPI consts).
+-rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-9.8.7/bin/rpi}
++rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-9.9.0/bin/rpi}
+ if [ ! -x "$rpi" ] && [ "$(uname -m)" = x86_64 ]; then
+   # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.
+   v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
