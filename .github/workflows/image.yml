@@ -44,8 +44,9 @@ jobs:
   image:
     needs: plan
     runs-on: ${{ needs.plan.outputs.runner }}
-    # A hung build fails after an hour instead of burning GitHub's 6-hour limit in minutes.
-    timeout-minutes: 60
+    # A hung build fails after 90 minutes instead of burning GitHub's 6-hour limit in minutes; a cold
+    # build (no cache, as after a base image moves) takes about an hour on a hosted runner.
+    timeout-minutes: 90
     env:
       MINIMAL: ${{ inputs.providers == 'none' }}
     steps:
