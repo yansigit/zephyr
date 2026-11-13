@@ -367,6 +367,8 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
             if scene == "down" && n > 0 {
                 return;
             }
+            // The connection's ends as the daemon reads them: its peer, then itself.
+            let ends = (stream.peer_addr().unwrap(), stream.local_addr().unwrap());
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             // A setting changed on this connection.
@@ -384,8 +386,12 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         let hex = req["params"]["nonce"].as_str().unwrap();
                         let tui = data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap();
                         let (ours, hex) = zephyr::attach::nonce();
-                        let proof =
-                            zephyr::attach::proof(TOKEN, zephyr::attach::BY_DAEMON, &tui, &ours);
+                        let proof = zephyr::attach::proof(
+                            TOKEN,
+                            zephyr::attach::BY_DAEMON,
+                            (&tui, &ours),
+                            ends,
+                        );
                         nonces = Some((tui, ours));
                         json!({"nonce": hex, "proof": proof})
                     }
@@ -393,7 +399,13 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         let (tui, ours) = nonces.take().unwrap();
                         let given = req["params"]["proof"].as_str().unwrap();
                         let by = zephyr::attach::BY_CLIENT;
-                        assert!(zephyr::attach::proven(TOKEN, by, &tui, &ours, given));
+                        assert!(zephyr::attach::proven(
+                            TOKEN,
+                            by,
+                            (&tui, &ours),
+                            ends,
+                            given
+                        ));
                         json!({"authenticated": true})
                     }
                     "zephyr.hello" => snapshot(scene),

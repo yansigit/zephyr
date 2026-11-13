@@ -424,25 +424,31 @@ pub async fn run(
     }
 }
 
-async fn session(
+/// How long connecting and proving may take, and the longest line read meanwhile: until the
+/// daemon has proved itself, whatever answers may be anyone.
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
+const HANDSHAKE_LINE: u64 = 4096;
+
+/// Connects to `addr` and proves both ways that each side holds `token`, on this connection
+/// (DESIGN §4.3.1). The token never crosses the socket: the daemon proves it holds it first,
+/// so a program holding the attach port while the daemon is down learns nothing, and the TUI
+/// stops there rather than send it the vault's or the facts' values. Both proofs are over the
+/// connection's ends, so a program that relays a real daemon's handshake fails here too.
+async fn connect(
     addr: &str,
     token: &str,
-    out: &mpsc::UnboundedSender<Msg>,
-    prompts: &mut mpsc::UnboundedReceiver<Ask>,
-    carry: &mut Option<(String, bool)>,
-    delay: &mut Duration,
-) -> Result<(), Fail> {
-    let (read, mut write) = TcpStream::connect(addr).await?.into_split();
+) -> Result<(OwnedWriteHalf, Lines<BufReader<OwnedReadHalf>>), Fail> {
+    use crate::attach::{proof, proven, BY_CLIENT, BY_DAEMON};
+    let stream = TcpStream::connect(addr).await?;
+    let ends = (stream.local_addr()?, stream.peer_addr()?);
+    let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut rpc = Rpc {
         write: &mut write,
         lines: &mut lines,
         id: 0,
+        cap: Some(HANDSHAKE_LINE),
     };
-    // The token never crosses the socket (DESIGN §4.3.1): the daemon proves it holds it first,
-    // so a program holding the attach port while the daemon is down learns nothing, and the
-    // TUI stops there rather than send it the vault's or the facts' values.
-    use crate::attach::{proof, proven, BY_CLIENT, BY_DAEMON};
     let impostor = format!(
         "whatever answers on {addr} could not prove it is your zephyr daemon, so nothing was \
          sent to it: another program may hold the attach port (run zephyr restart, then \
@@ -455,13 +461,34 @@ async fn session(
         .and_then(|n| data_encoding::HEXLOWER.decode(n.as_bytes()).ok())
         .filter(|n| n.len() == crate::attach::NONCE);
     let given = said["proof"].as_str().unwrap_or_default();
-    let Some(daemon) = daemon.filter(|d| proven(token, BY_DAEMON, &client, d, given)) else {
+    let proved = |d: &Vec<u8>| proven(token, BY_DAEMON, (&client, d), ends, given);
+    let Some(daemon) = daemon.filter(proved) else {
         return Err(Fail::Fatal(impostor));
     };
-    let mine = proof(token, BY_CLIENT, &client, &daemon);
+    let mine = proof(token, BY_CLIENT, (&client, &daemon), ends);
     rpc.call("zephyr.prove", json!({"proof": mine}))
         .await
         .map_err(|e| fatal(e, "the attach token was refused"))?;
+    Ok((write, lines))
+}
+
+async fn session(
+    addr: &str,
+    token: &str,
+    out: &mpsc::UnboundedSender<Msg>,
+    prompts: &mut mpsc::UnboundedReceiver<Ask>,
+    carry: &mut Option<(String, bool)>,
+    delay: &mut Duration,
+) -> Result<(), Fail> {
+    let (mut write, mut lines) = tokio::time::timeout(HANDSHAKE_WAIT, connect(addr, token))
+        .await
+        .map_err(|_| Fail::Down("zephyr did not answer the handshake in time".into()))??;
+    let mut rpc = Rpc {
+        write: &mut write,
+        lines: &mut lines,
+        id: 2,
+        cap: None,
+    };
     let hello = rpc.call("zephyr.hello", json!({})).await.map_err(|e| {
         fatal(
             e,
@@ -832,10 +859,29 @@ fn fatal(e: Fail, what: &str) -> Fail {
     }
 }
 
+/// One line of at most `max` bytes, `None` at the end; a longer one is no daemon's answer.
+async fn capped(read: &mut BufReader<OwnedReadHalf>, max: u64) -> Result<Option<String>, Fail> {
+    use tokio::io::AsyncReadExt;
+    let mut line = Vec::new();
+    let n = (&mut *read)
+        .take(max + 1)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if line.len() as u64 > max {
+        return Err(Fail::Fatal(format!("it sent a line over {max} bytes")));
+    }
+    Ok(Some(String::from_utf8_lossy(&line).trim_end().to_string()))
+}
+
 struct Rpc<'a> {
     write: &'a mut OwnedWriteHalf,
     lines: &'a mut Lines<BufReader<OwnedReadHalf>>,
     id: u64,
+    /// The longest line [`Rpc::call`] reads, while the daemon has not proved itself yet.
+    cap: Option<u64>,
 }
 
 impl Rpc<'_> {
@@ -850,7 +896,12 @@ impl Rpc<'_> {
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, Fail> {
         let id = self.request(method, params).await?;
         loop {
-            let Some(line) = self.lines.next_line().await? else {
+            let line = match self.cap {
+                // No call is cancelled before the handshake ends, so `lines` holds no part line.
+                Some(max) => capped(self.lines.get_mut(), max).await?,
+                None => self.lines.next_line().await?,
+            };
+            let Some(line) = line else {
                 return Err(Fail::Down("zephyr closed the connection".into()));
             };
             let Some(mut v) = parse(&line) else {
@@ -895,6 +946,8 @@ pub(crate) async fn handshake(
     model: &str,
 ) -> Option<()> {
     use crate::attach::{proof, proven, BY_CLIENT, BY_DAEMON};
+    // As the daemon reads them: its peer, then itself.
+    let ends = (write.peer_addr().ok()?, write.local_addr().ok()?);
     let mut nonces = None;
     for _ in 0..4 {
         let req: Value = serde_json::from_str(&lines.next_line().await.ok()??).ok()?;
@@ -904,14 +957,14 @@ pub(crate) async fn handshake(
                 let hex = req["params"]["nonce"].as_str()?;
                 let client = data_encoding::HEXLOWER.decode(hex.as_bytes()).ok()?;
                 let (daemon, hex) = crate::attach::nonce();
-                let proof = proof(token, BY_DAEMON, &client, &daemon);
+                let proof = proof(token, BY_DAEMON, (&client, &daemon), ends);
                 nonces = Some((client, daemon));
                 json!({"jsonrpc": "2.0", "id": id, "result": {"nonce": hex, "proof": proof}})
             }
             "zephyr.prove" => {
                 let (client, daemon) = nonces.take()?;
                 let given = req["params"]["proof"].as_str()?;
-                match proven(token, BY_CLIENT, &client, &daemon, given) {
+                match proven(token, BY_CLIENT, (&client, &daemon), ends, given) {
                     true => json!({"jsonrpc": "2.0", "id": id, "result": {"authenticated": true}}),
                     false => {
                         json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32001, "message": "invalid proof"}})
@@ -1517,6 +1570,64 @@ mod tests {
             "the token reached the listener: {heard}"
         );
         assert!(heard.contains("zephyr.challenge"), "{heard}");
+    }
+
+    /// Under host networking the agent can keep a TUI's connection, let the daemon bind the
+    /// port again and relay the real handshake between the two sockets. Both proofs are over
+    /// the connection's own addresses, so the TUI refuses the relayed one and never proves.
+    #[tokio::test]
+    async fn a_relay_of_a_real_daemons_handshake_is_refused() {
+        let daemon = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = daemon.local_addr().unwrap();
+        let proved = tokio::spawn(async move {
+            let (s, _) = daemon.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            handshake(&mut lines, &mut w, "tok", "m").await.is_some()
+        });
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = relay.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut tui, _) = relay.accept().await.unwrap();
+            let mut up = TcpStream::connect(at).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut tui, &mut up).await;
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ptx, prx) = mpsc::unbounded_channel();
+        let on = run(addr, "tok".into(), tx, prx);
+        let gone = tokio::time::timeout(Duration::from_secs(10), on).await;
+        assert!(gone.is_ok(), "the TUI took the relayed handshake");
+        assert!(matches!(rx.recv().await, Some(Msg::Fatal(e)) if e.contains("could not prove")));
+        assert!(
+            !proved.await.unwrap(),
+            "the TUI proved itself through the relay"
+        );
+    }
+
+    /// A listener that sends a line with no end, or never answers, does not hold the TUI: the
+    /// handshake's lines are capped and it has 10 s.
+    #[tokio::test]
+    async fn a_listener_that_floods_or_stalls_the_handshake_does_not_hold_the_tui() {
+        // A flood is refused at the cap, at once; silence at the handshake's 10 s.
+        for (flood, within) in [(true, 5), (false, 20)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                if flood {
+                    let _ = s.write_all(&vec![b'x'; 2 << 20]).await;
+                }
+                std::future::pending::<()>().await;
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (_ptx, prx) = mpsc::unbounded_channel();
+            tokio::spawn(run(addr, "tok".into(), tx, prx));
+            let wait = tokio::time::timeout(Duration::from_secs(within), rx.recv()).await;
+            assert!(
+                matches!(wait, Ok(Some(Msg::Down(_) | Msg::Fatal(_)))),
+                "flood {flood}: the TUI is still waiting"
+            );
+        }
     }
 
     /// An impostor that answers the challenge with nothing, or with an error, is no daemon
