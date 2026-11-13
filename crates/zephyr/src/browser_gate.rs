@@ -522,8 +522,8 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     // A card's number is in this page's fields (DESIGN §4.25): the page is not read back.
     let (reads, snap) = (reads_back(&argv.rest), snapshots(&argv.rest));
     if reads || snap {
-        let moved = argv.rest.first().is_some_and(|c| c == "batch") && moves(&argv.rest);
-        if let Some(text) = card_filled(env, &page, reads, snap, moved) {
+        let batch = argv.rest.first().is_some_and(|c| c == "batch");
+        if let Some(text) = card_filled(env, &page, reads, snap, batch) {
             return (Next::Refuse(text), None);
         }
     }
@@ -1019,35 +1019,15 @@ fn snapshots(rest: &[String]) -> bool {
     }
 }
 
-/// Whether `rest` moves to another page or address, or is a `batch` holding a command that does.
-fn moves(rest: &[String]) -> bool {
-    const MOVES: &[&str] = &[
-        "open",
-        "goto",
-        "navigate",
-        "back",
-        "forward",
-        "reload",
-        "tab",
-        "pushstate",
-    ];
-    match rest.split_first() {
-        Some((cmd, _)) if MOVES.contains(&cmd.as_str()) => true,
-        Some((cmd, args)) if cmd == "batch" => args.iter().any(|c| {
-            let words = shell_words_split(c);
-            moves(&words) || moves(&split(&words).rest)
-        }),
-        _ => false,
-    }
-}
-
 /// Why the page may not be read back now (`reads`) or snapshotted (`snap`). Root's
 /// `cards-filled`, beside the gate socket and written by `cards::live`, lists a line per card
 /// whose number zephyr still keeps: the origin it was typed into and the page, tab separated.
 /// A read-back is refused on that origin; a `snapshot` on that page (its `#…` aside) until it
-/// moves on. A batch that also `moved` is judged by the page before it runs, so while any card
-/// is listed it is refused. No file is no card; one that cannot be read refuses.
-fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool, moved: bool) -> Option<String> {
+/// moves on. A `batch` is judged by the page before it runs, and a command in it can move the
+/// page in ways no list catches (`back`, `eval history.back()`, `press Alt+ArrowLeft`), so
+/// while any card is listed every batch that reads back or snapshots is refused. No file is no
+/// card; one that cannot be read refuses.
+fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool, batch: bool) -> Option<String> {
     let flag = public(env).join(crate::cards::FILLED_FILE);
     let listed = match std::fs::read_to_string(&flag) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -1057,10 +1037,10 @@ fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool, moved: bool) -> 
     if listed.trim().is_empty() {
         return None;
     }
-    if moved {
+    if batch {
         return Some(
-            "not run: a virtual card is filled, and this batch moves to another page before it \
-             reads a page back; run the move and the read as commands of their own"
+            "not run: a virtual card is filled, and a batch could move to the card's page before \
+             it reads a page back; run the read as a command of its own"
                 .into(),
         );
     }
@@ -3100,7 +3080,7 @@ cat "$d/$f.json"
                 Next::Refuse(text) => assert!(
                     text.starts_with(
                         "not run: a virtual card is filled on https://mail.example.com;"
-                    ),
+                    ) || (args[0] == "batch" && text.contains("a batch could move")),
                     "{args:?}: {text}"
                 ),
                 Next::Exec => panic!("{args:?} ran"),
@@ -3137,7 +3117,8 @@ cat "$d/$f.json"
         for args in [&["snapshot", "-i"][..], &["batch", "snapshot -i"]] {
             match t.run(args) {
                 Next::Refuse(text) => assert!(
-                    text.starts_with("not run: a virtual card was just typed into this page"),
+                    text.starts_with("not run: a virtual card was just typed into this page")
+                        || (args[0] == "batch" && text.contains("a batch could move")),
                     "{args:?}: {text}"
                 ),
                 Next::Exec => panic!("{args:?} ran"),
@@ -3178,19 +3159,23 @@ cat "$d/$f.json"
         assert_eq!(t.run(&["pushstate", "/pay?x"]), Next::Exec);
     }
 
-    /// A batch is judged by the page before it runs: one that moves to another page and reads
-    /// it back (`back` to the card's form, whose values Chrome restores) is refused while any
-    /// card is filled anywhere.
+    /// A batch is judged by the page before it runs, and a command in it can move the page in
+    /// ways the wrapper cannot list (`back`, `eval history.back()`, `press Alt+ArrowLeft`, a
+    /// link's Enter): while any card is filled anywhere, every batch that reads a page back or
+    /// snapshots it is refused, whatever page it starts on.
     #[test]
-    fn a_batch_that_moves_and_reads_back_is_refused_while_a_card_is_filled() {
+    fn a_batch_that_reads_back_is_refused_while_a_card_is_filled() {
         let t = T::new("bg-card-batch");
         t.page(MAIL, COMPOSE, "");
         let flag = t.dir.join(crate::cards::FILLED_FILE);
-        let cases: [&[&str]; 4] = [
+        let cases: [&[&str]; 7] = [
             &["batch", "back", "get value #cc"],
             &["batch", "open https://shop.example/pay", "snapshot"],
             &["batch", "tab 2", "eval 1"],
             &["batch", "pushstate /x", "diff snapshot"],
+            &["batch", "eval history.back()", "get value #cc"],
+            &["batch", "press Alt+ArrowLeft", "get value #cc"],
+            &["batch", "get value @e1"],
         ];
         for args in cases {
             assert_eq!(t.run(args), Next::Exec, "{args:?}");
@@ -3199,9 +3184,10 @@ cat "$d/$f.json"
         for args in cases {
             assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?} ran");
         }
-        // Moving alone, or reading alone on a page no card is on, still runs.
+        // A batch that reads nothing back still runs, and so does a read alone off the card's
+        // origin.
         assert_eq!(t.run(&["batch", "back", "get text @e1"]), Next::Exec);
-        assert_eq!(t.run(&["batch", "get value @e1"]), Next::Exec);
+        assert_eq!(t.run(&["get", "value", "@e1"]), Next::Exec);
     }
 
     #[test]
