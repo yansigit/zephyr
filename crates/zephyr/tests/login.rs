@@ -370,9 +370,9 @@ async fn a_key_login_records_the_account_and_never_reports_the_key() {
     }
 }
 
-/// Not a test of its own: `a_login_left_running_dies_with_its_test_process` runs it in a process
-/// of its own, where it starts an OAuth sign-in and ends without cancelling it, as a test that
-/// panics midway does. It writes the login's account dir to `$ZEPHYR_LEFT_LOGIN`.
+/// Not a test of its own: `left_login` runs it in a process of its own, where it starts an OAuth
+/// sign-in and leaves it running, as a test that panics midway does. It writes the login's account
+/// dir to `$ZEPHYR_LEFT_LOGIN`, then ends, or with `$ZEPHYR_LEFT_LOGIN_HANG` waits to be killed.
 #[tokio::test]
 #[ignore]
 async fn leave_a_login_running() {
@@ -395,35 +395,54 @@ async fn leave_a_login_running() {
         "the login's rpi child to run",
     )
     .await;
-    std::fs::write(out, dir.display().to_string()).unwrap();
+    let part = PathBuf::from(&out).with_extension("part");
+    std::fs::write(&part, dir.display().to_string()).unwrap();
+    std::fs::rename(&part, &out).unwrap();
+    if std::env::var_os("ZEPHYR_LEFT_LOGIN_HANG").is_some() {
+        std::future::pending::<()>().await;
+    }
 }
 
-#[tokio::test]
-async fn a_login_left_running_dies_with_its_test_process() {
+/// Runs `leave_a_login_running` in a process of its own, killed with SIGKILL once its login runs
+/// when `kill` (as nextest kills a test past its time), and checks that the login's `script` and
+/// the rpi under it died with that process.
+async fn left_login(kill: bool) {
     let out = std::env::temp_dir().join(format!(
-        "zephyr-login-left-{}-{}",
+        "zephyr-login-left-{kill}-{}-{}",
         std::process::id(),
         zephyr::unix_millis()
     ));
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "leave_a_login_running",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-        ])
+    let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
+    helper
+        .args(["leave_a_login_running", "--exact", "--ignored"])
         .env("ZEPHYR_LEFT_LOGIN", &out)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let dir = PathBuf::from(std::fs::read_to_string(&out).expect("the helper's account dir"));
+        .stdout(std::process::Stdio::null());
+    if kill {
+        helper.env("ZEPHYR_LEFT_LOGIN_HANG", "1");
+    }
+    let mut helper = helper.spawn().unwrap();
+    wait_for(|| out.exists(), "the helper's login to run").await;
+    if kill {
+        helper.kill().unwrap();
+    }
+    assert_eq!(helper.wait().unwrap().success(), !kill);
+    let dir = PathBuf::from(std::fs::read_to_string(&out).unwrap());
     let _ = std::fs::remove_file(&out);
-    // The test process is gone: its `script` and the rpi under it went with it.
     wait_for(
         || login_processes(&dir).iter().all(|p| dead(*p)),
         "the left login's processes to die",
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_login_left_running_dies_with_its_test_process() {
+    left_login(false).await;
+}
+
+#[tokio::test]
+async fn a_login_dies_with_a_killed_test_process() {
+    left_login(true).await;
 }
 
 #[tokio::test]

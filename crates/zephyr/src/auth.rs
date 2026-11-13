@@ -843,6 +843,24 @@ fn spawn(cfg: &Config, provider: &str, dir: &Path) -> anyhow::Result<tokio::proc
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     crate::agent::cmd(cmd.as_std_mut());
+    // A login dies with the daemon (or test) that started it: its registry entry, which
+    // `kill_on_drop` hangs on, is never dropped when that process exits or is killed. Killing
+    // `script` hangs up the pty, which ends the rpi under it. The signal comes when the thread
+    // that spawned it ends, which for the daemon's runtime workers is the process's end.
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: prctl and getppid are async-signal-safe, and run after `agent::cmd`'s setuid,
+    // which would clear the setting.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            if libc::getppid() != parent {
+                return Err(std::io::Error::other(
+                    "the daemon ended before the login started",
+                ));
+            }
+            Ok(())
+        });
+    }
     cmd.spawn()
         .with_context(|| format!("running rpi auth login --provider {provider} in a pty"))
 }
