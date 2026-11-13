@@ -97,12 +97,18 @@ pub struct PageAmount {
 
 impl PageAmount {
     /// As a payment's amount: `None` for a value no total can be. R21: an empty currency stays
-    /// empty, so a cap counts it as unknown, never as `approvals.currency`. A bare `$` is
-    /// `home` (`approvals.currency`) when that is a dollar, else unknown too.
-    fn amount(&self, home: &str) -> Option<Amount> {
-        const DOLLARS: &[&str] = &["USD", "CAD", "AUD", "NZD", "HKD", "SGD", "MXN", "TWD"];
+    /// empty, so a cap counts it as unknown, never as `approvals.currency`. A bare `$` is USD
+    /// under a USD `home` (`approvals.currency`), CAD under a CAD one on a `.ca` page (`url`,
+    /// the top document's), and unknown otherwise.
+    fn amount(&self, home: &str, url: &str) -> Option<Amount> {
+        // `$` alone says only "some dollar". USD's own is the likeliest anywhere; CAD's only on
+        // a `.ca` site (a US shop's `$` must not pass a CAD cap); any other reading is unknown.
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase));
+        let canadian = host.is_some_and(|h| h.trim_end_matches('.').ends_with(".ca"));
         let currency = match self.currency.trim().to_uppercase() {
-            c if c == "$" && DOLLARS.contains(&home) => home.to_string(),
+            c if c == "$" && (home == "USD" || (home == "CAD" && canadian)) => home.to_string(),
             c if c == "$" => String::new(),
             c => c,
         };
@@ -830,7 +836,7 @@ impl Call {
                 targets: vec![origin.clone()],
                 summary: summary.clone(),
                 // The page's labelled total, which a money cap compares (A5's carry-over).
-                amount: b.amount.as_ref().and_then(|a| a.amount(home)),
+                amount: b.amount.as_ref().and_then(|a| a.amount(home, &b.url)),
                 replay: policy::Replay::Wait,
                 only_sends: false,
             }),
@@ -2762,10 +2768,12 @@ fn wait_lines(
     }
     if class == Some(Class::Money) {
         let home = approvals::currency(cfg);
-        lines.push(match b.amount.as_ref().and_then(|a| a.amount(&home)) {
-            None => "amount: could not be read".into(),
-            Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
-        });
+        lines.push(
+            match b.amount.as_ref().and_then(|a| a.amount(&home, &b.url)) {
+                None => "amount: could not be read".into(),
+                Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
+            },
+        );
     }
     lines
 }
@@ -5803,21 +5811,36 @@ mod tests {
         assert!(h.store.action_strong(id).unwrap());
     }
 
-    /// A page's bare `$` is `approvals.currency` when that is a dollar, and no currency (held
-    /// as unknown) when it is not; a named currency stays as named.
+    /// A page's bare `$` is USD under a USD `approvals.currency`; CAD under a CAD one only on a
+    /// `.ca` site (a US shop's `$` is US dollars, and must not pass a CAD cap); anything else is
+    /// no currency, held as unknown. A named currency stays as named.
     #[test]
-    fn a_bare_dollar_on_a_page_is_the_owners_dollar() {
+    fn a_bare_dollar_is_read_only_where_it_can_mean_one_dollar() {
         let page = |currency: &str| PageAmount {
             value: 45.0,
             currency: currency.into(),
         };
-        let read = |currency: &str, home: &str| page(currency).amount(home).unwrap().currency;
-        assert_eq!(read("$", "CAD"), "CAD");
-        assert_eq!(read("$", "USD"), "USD");
-        assert_eq!(read("$", "AUD"), "AUD");
-        assert_eq!(read("$", "EUR"), "");
-        assert_eq!(read("USD", "CAD"), "USD");
-        assert_eq!(read("", "CAD"), "");
+        let read = |currency: &str, home: &str, url: &str| {
+            page(currency).amount(home, url).unwrap().currency
+        };
+        let (us, ca) = (
+            "https://www.amazon.com/checkout",
+            "https://www.amazon.ca/checkout",
+        );
+        assert_eq!(read("$", "USD", us), "USD");
+        assert_eq!(read("$", "USD", ca), "USD");
+        assert_eq!(read("$", "CAD", ca), "CAD");
+        assert_eq!(read("$", "CAD", "https://shop.example.CA./pay"), "CAD");
+        assert_eq!(
+            read("$", "CAD", us),
+            "",
+            "a US shop's dollar under a CAD cap"
+        );
+        assert_eq!(read("$", "CAD", "https://ca.example.com/pay"), "");
+        assert_eq!(read("$", "AUD", "https://shop.com.au/pay"), "");
+        assert_eq!(read("$", "EUR", ca), "");
+        assert_eq!(read("USD", "CAD", ca), "USD");
+        assert_eq!(read("", "CAD", ca), "");
     }
 
     /// A connector's amount is a total only when it is finite and not negative: -1000 does
