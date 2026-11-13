@@ -61,6 +61,15 @@ fn override_text(day: &str, limits: &[String]) -> String {
 
 /// The `memory_commits` origin of a `/forget` commit (DESIGN §4.6).
 pub const FORGET_ORIGIN: &str = "you (/forget)";
+/// Notices whose change had already landed but which could not be written, each with the
+/// facts path of the store it is for: [`Store::retry_owed`], on the router's tick, writes them.
+/// shortcut: in memory, so a daemon restart loses what is still owed (`/held` and `/card` still
+/// show the actions and cards); upgrade to a table if notices are lost in practice.
+type Owed = (std::path::PathBuf, String, String, String);
+static OWED: std::sync::Mutex<Vec<Owed>> = std::sync::Mutex::new(Vec::new());
+
+/// The most notices owed at once; past it the oldest is dropped, with a log line.
+const MAX_OWED: usize = 256;
 
 /// The largest amount a payment row holds, in minor units (10 billion in a two-decimal
 /// currency): a larger one is just huge, and many of them still sum within an `i64`.
@@ -1727,6 +1736,43 @@ impl Store {
     /// `(channel, sender)` of the newest message the agent took up: who the main session answers.
     pub fn last_owner(&self) -> rusqlite::Result<Option<(String, String)>> {
         last_owner_in(&self.db)
+    }
+
+    /// A notice for the owner on `channel` (empty: the owner last answered) about a change that
+    /// has landed whatever comes of the notice: one that cannot be written now is owed, and a
+    /// later tick writes it ([`Store::retry_owed`]).
+    pub fn owe_notice(&self, channel: &str, recipient: &str, text: &str) {
+        let told = match channel.is_empty() {
+            true => self.notify_last_owner(text),
+            false => self.notify(channel, recipient, text),
+        };
+        if let Err(e) = told {
+            eprintln!("zephyr: a notice to the owner could not be written, tried again: {e}");
+            let mut owed = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            if owed.len() >= MAX_OWED {
+                owed.remove(0);
+                eprintln!("zephyr: too many notices owed; the oldest is dropped");
+            }
+            owed.push((
+                self.facts.clone(),
+                channel.into(),
+                recipient.into(),
+                text.into(),
+            ));
+        }
+    }
+
+    /// Writes the notices this store's folder owes; one that fails again stays owed.
+    pub fn retry_owed(&self) {
+        let mine: Vec<Owed> = {
+            let mut all = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest) = all.drain(..).partition(|o| o.0 == self.facts);
+            *all = rest;
+            mine
+        };
+        for (_, channel, recipient, text) in mine {
+            self.owe_notice(&channel, &recipient, &text);
+        }
     }
 
     /// Writes a notice to `channel`/`recipient`.

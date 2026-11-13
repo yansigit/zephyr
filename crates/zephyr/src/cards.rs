@@ -923,21 +923,10 @@ fn audit(cfg: &Config, store: &Store, card: &Card, tool: &str, outcome: &str) {
     crate::gate::audit_row(store, "card", tool, &args, &outcome);
 }
 
+/// A notice about `card` for its owner, after its change landed: one that cannot be written now
+/// is owed to a later tick (`Store::owe_notice`).
 fn tell(store: &Store, card: &Card, text: &str) {
-    if let Err(e) = told(store, card, text) {
-        eprintln!(
-            "zephyr: telling the owner about card #{} failed: {e}",
-            card.id
-        );
-    }
-}
-
-/// [`tell`], its failure the caller's: a card's change and its notice go in one write.
-fn told(store: &Store, card: &Card, text: &str) -> rusqlite::Result<()> {
-    match card.channel.is_empty() {
-        true => store.notify_last_owner(text),
-        false => store.notify(&card.channel, &card.sender, text),
-    }
+    store.owe_notice(&card.channel, &card.sender, text);
 }
 
 fn note(store: &Store, card: &Card, word: &str, text: &str) {
@@ -1214,22 +1203,17 @@ pub fn issue_approved(cfg: &Arc<Config>, checked: Checked, ask: CardAsk, a: &cra
             Ok(_) => ("done", "a card was issued".to_string()),
             Err(why) => ("failed", why.clone()),
         };
-        // How it ended and the owner's notice land together.
-        let ended = store.atomically(|store| {
-            store.finish_action(id, status, &result)?;
-            if let Err(why) = &done {
-                let text = format!("the owner approved #{id}, but {why}");
-                store.action_note(id, "not run", &text)?;
-                let why = format!("[zephyr] {why}");
-                match asker.channel.is_empty() {
-                    true => store.notify_last_owner(&why)?,
-                    false => store.notify(&asker.channel, &asker.sender, &why)?,
-                }
-            }
-            Ok(())
-        });
-        if let Err(e) = ended {
+        // How it ended first, so it never stays `running`; a notice that cannot be written now
+        // is owed to a later tick.
+        if let Err(e) = store.finish_action(id, status, &result) {
             eprintln!("zephyr: recording how #{id} ended failed: {e}");
+        }
+        if let Err(why) = done {
+            let text = format!("the owner approved #{id}, but {why}");
+            if let Err(e) = store.action_note(id, "not run", &text) {
+                eprintln!("zephyr: telling the agent about #{id} failed: {e}");
+            }
+            store.owe_notice(&asker.channel, &asker.sender, &format!("[zephyr] {why}"));
         }
     });
 }
@@ -1811,12 +1795,9 @@ fn closed(
              provider's app",
             card.id
         );
-        log(
-            store.atomically(|store| match store.card_told_once(card.id, now)? {
-                true => told(store, card, &text),
-                false => Ok(()),
-            }),
-        );
+        if store.card_told_once(card.id, now).unwrap_or(false) {
+            tell(store, card, &text);
+        }
         return;
     }
     // Its Pay click may have gone: the issuer is asked once more what it was charged, so a
@@ -1860,23 +1841,16 @@ fn closed_now(cfg: &Config, store: &Store, card: &Card, why: &str, now: i64) {
         _ if to == "unknown" => delete_it(card, why),
         _ => format!("[zephyr] card #{} is closed: {why}", card.id),
     };
-    // The card's end and the owner's notice land together.
-    let moved = store.atomically(|store| {
-        if !store.move_card(card.id, &UNSETTLED, to, now)? {
-            return Ok(false);
-        }
-        if to == "unknown" && why != RETRY && why != LANDED {
-            store.card_told(card.id, now)?;
-        }
-        told(store, card, &owner)?;
-        Ok(true)
-    });
-    if !moved.unwrap_or_else(|e| {
-        eprintln!("zephyr: closing card #{} failed: {e}", card.id);
-        false
-    }) {
+    if !store
+        .move_card(card.id, &UNSETTLED, to, now)
+        .unwrap_or(false)
+    {
         return;
     }
+    if to == "unknown" && why != RETRY && why != LANDED {
+        log(store.card_told(card.id, now));
+    }
+    tell(store, card, &owner);
     audit(cfg, store, card, "close", why);
     let text = format!("{why}; the card is closed and cannot be filled");
     note(store, card, "closed", &text);
@@ -1981,10 +1955,8 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     for card in store.cards_in(&["unknown"]).unwrap_or_default() {
         if card.provider == "manual" && card.told_at.is_none_or(|at| at + 86_400 <= now) {
             let text = delete_it(&card, "it is past its time");
-            log(store.atomically(|store| {
-                store.card_told(card.id, now)?;
-                told(store, &card, &text)
-            }));
+            log(store.card_told(card.id, now));
+            tell(store, &card, &text);
         }
     }
     let mut asks: Vec<(Card, Option<&'static str>)> = Vec::new();
@@ -2073,14 +2045,11 @@ fn stated(
         Ok(CardState::Closed) => {
             live::forget(cfg.state_dir(), card.id, now);
             let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
-            let moved = store.atomically(|store| {
-                let moved = store.move_card(card.id, &UNSETTLED, "closed", now)?;
-                if moved && card.status == "closing" {
-                    told(store, &card, &text)?;
-                }
-                Ok(moved)
-            });
+            let moved = store.move_card(card.id, &UNSETTLED, "closed", now);
             if moved.unwrap_or(false) {
+                if card.status == "closing" {
+                    tell(store, &card, &text);
+                }
                 audit(cfg, store, &card, "close", "closed at the issuer");
                 let text = "the issuer closed it; it cannot be filled";
                 note(store, &card, "closed", text);
@@ -2090,14 +2059,9 @@ fn stated(
             live::forget(cfg.state_dir(), card.id, now);
             let why = crate::vault::scrubbed(cfg, why);
             let text = format!("[zephyr] card #{} was not issued: {why}", card.id);
-            let moved = store.atomically(|store| {
-                let moved = store.move_card(card.id, &UNSETTLED, "failed", now)?;
-                if moved {
-                    told(store, &card, &text)?;
-                }
-                Ok(moved)
-            });
+            let moved = store.move_card(card.id, &UNSETTLED, "failed", now);
             if moved.unwrap_or(false) {
+                tell(store, &card, &text);
                 audit(cfg, store, &card, "issue", &why);
                 let text = format!("no card: {why}; ask again if it is still wanted");
                 note(store, &card, "failed", &text);
@@ -2132,7 +2096,8 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
             all.join("; ")
         )
     });
-    // The charge, what the window counts and the owner's notice land together.
+    // The charge and what the window counts land together; the notice follows, owed when it
+    // cannot be written now.
     let charge = store.atomically(|store| {
         let charged = store.card_charged(
             card.id,
@@ -2145,7 +2110,6 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
         )?;
         if charged {
             store.card_paid(card.id, total)?;
-            text.iter().try_for_each(|text| told(store, &card, text))?;
         }
         Ok(charged)
     });
@@ -2155,6 +2119,7 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
     }) {
         return;
     }
+    text.iter().for_each(|text| tell(store, &card, text));
     let what = charged(first);
     audit(cfg, store, &card, "charge", &what);
     let (cfg, mut card) = (cfg.clone(), card);
@@ -2583,6 +2548,63 @@ mod tests {
         assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 1);
         let log = Fake::script(&cfg, |s| s.log.clone());
         assert!(log.iter().any(|l| l.starts_with("close ")), "{log:?}");
+    }
+
+    /// An approved request that issued nothing ends `failed` even when its notice cannot be
+    /// written then; the notice is owed and written on a later tick.
+    #[tokio::test]
+    async fn an_approved_card_that_failed_ends_even_with_no_notice() {
+        let dir = crate::test_dir("cards-approved-owed");
+        let text = format!(
+            "rpi = '/r'\nhome = {dir:?}\n[approvals]\ncurrency = 'CAD'\nmoney = 'ask'\n\
+             [cards]\nprovider = 'fake'\n"
+        );
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "card".into(),
+            args: serde_json::json!({"action": "request", "site": "https://shop.example/pay",
+                "merchant": "Shop", "amount": "10", "currency": "CAD"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let held = crate::gate::decide(&cfg, &store, &req, owner, crate::now());
+        let crate::gate::Verdict::Hold { id, .. } = held else {
+            panic!("{held:?}")
+        };
+        let a = store.take_approved(id).unwrap().unwrap();
+        let (checked, ask) = crate::gate::approved_card(&cfg, &store, &a).unwrap();
+        Fake::script(&cfg, |s| s.fail_issue = Some("declined".into()));
+        let db = store.db_for_test();
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        db.execute_batch(block).unwrap();
+        let before = store.pending_outbox().unwrap().len();
+        issue_approved(&cfg, checked, ask, &a);
+        let status = || store.action(id).unwrap().unwrap().status;
+        for _ in 0..100 {
+            if status() != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(status(), "failed");
+        db.execute_batch("DROP TRIGGER no_outbox").unwrap();
+        store.retry_owed();
+        let out = store.pending_outbox().unwrap();
+        assert_eq!(out.len(), before + 1);
+        assert!(
+            out.last().unwrap().text.contains("was not issued"),
+            "{:?}",
+            out.last()
+        );
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the

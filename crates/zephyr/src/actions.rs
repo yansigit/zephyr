@@ -493,6 +493,7 @@ pub fn held(cfg: &Config, store: &Store) -> String {
 /// told; a browser wait whose action ended is denied.
 pub fn tick(ctx: &Ctx, now: i64, held: bool) {
     let store = ctx.store;
+    store.retry_owed();
     // A store error counts as paused: nothing goes on a guess.
     let paused = store.pause_reason().map_or(true, |p| p.is_some());
     if held || paused {
@@ -557,25 +558,23 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     }
 }
 
-/// Delayed action `a` waits for the owner again, who is told `notices` in the same write: a
-/// notice that cannot be written leaves it delayed, and the next tick tries again.
+/// Delayed action `a` waits for the owner again, who is then told `notices`: the change comes
+/// first, and a notice that cannot be written is owed to a later tick ([`tell`]).
 fn re_ask(cfg: &Config, store: &Store, a: &Action, notices: &[&str]) {
-    let back = store.atomically(|store| {
-        if !store.unschedule(a.id)? {
-            return Ok(false);
+    match store.unschedule(a.id) {
+        Ok(true) => {
+            audit(cfg, store, a, "re-asked");
+            notices.iter().for_each(|text| tell(store, a, text));
         }
-        notices.iter().try_for_each(|text| told(store, a, text))?;
-        Ok(true)
-    });
-    match back {
-        Ok(true) => audit(cfg, store, a, "re-asked"),
         Ok(false) => {}
         Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
     }
 }
 
-/// Moves the actions `change` returns and tells each one's owner `notice` in the same write, so
-/// none is moved with its owner never told; each is then audited as `outcome`.
+/// Moves the actions `change` returns, then audits each as `outcome` and tells its owner
+/// `notice`. The change is what keeps the owner safe (nothing delayed goes after `/stop`,
+/// nothing dead stays `running` after a start), so it never waits on the notice, which is owed
+/// to a later tick when it cannot be written ([`tell`]).
 fn moved(
     cfg: &Config,
     store: &Store,
@@ -583,12 +582,10 @@ fn moved(
     change: impl FnOnce(&Store) -> rusqlite::Result<Vec<Action>>,
     notice: impl Fn(&Action) -> String,
 ) -> rusqlite::Result<()> {
-    let back = store.atomically(|store| {
-        let back = change(store)?;
-        back.iter().try_for_each(|a| told(store, a, &notice(a)))?;
-        Ok(back)
-    })?;
-    back.iter().for_each(|a| audit(cfg, store, a, outcome));
+    for a in change(store)? {
+        audit(cfg, store, &a, outcome);
+        tell(store, &a, &notice(&a));
+    }
     Ok(())
 }
 
@@ -652,13 +649,12 @@ const RESTARTED: &str = "zephyr restarted while the browser waited";
 /// A notice about `a` for the owner of the run that asked (else the owner last answered). The
 /// gate socket tells this way of a browser action the owner let go that did not run. What it
 /// says shows `a`'s summary as [`summary`] gives it (R70).
+/// One that cannot be written now is owed, and a later tick writes it (`Store::owe_notice`).
 pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
-    if let Err(e) = told(store, a, text) {
-        eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
-    }
+    store.owe_notice(&a.origin.channel, &a.origin.sender, text);
 }
 
-/// [`tell`], its failure the caller's.
+/// [`tell`], its failure the caller's: for a change that must not land without its notice.
 pub(crate) fn told(store: &Store, a: &Action, text: &str) -> rusqlite::Result<()> {
     match a.origin.channel.is_empty() {
         true => store.notify_last_owner(text),
@@ -912,12 +908,13 @@ mod tests {
         );
     }
 
-    /// A delay that waits for the owner again does so only with its notice (as the let-go
-    /// ending, #55): a notice that cannot be written leaves it delayed, for the next try, both
-    /// on the tick and at start.
+    /// At `/stop` and at start the change is what keeps the owner safe, so it never waits on
+    /// the notice: with no notice writable, `/stop` still takes every delay out of the schedule
+    /// (no tick sends it), a start still ends a dead action, and the notices owed are written
+    /// on a later tick.
     #[test]
-    fn a_delay_waits_again_only_with_its_notice() {
-        let (cfg, store) = setup("actions-reask-told", "[approvals]\nmessages = 'delay 5'\n");
+    fn stop_and_start_change_the_status_even_when_no_notice_can_be_written() {
+        let (cfg, store) = setup("actions-stop-owed", "[approvals]\nmessages = 'delay 5'\n");
         let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
         let ctx = Ctx {
             cfg: &cfg,
@@ -927,34 +924,37 @@ mod tests {
             steers: &steers,
             calls: &crate::calls::live::Calls::idle(),
         };
-        for _ in 0..crate::store::MAX_RUNNING_PROCS {
-            store.add_proc("sleep 9", "chat", "o").unwrap().unwrap();
-        }
         let now = crate::now();
-        let r = hold(&store, ActionKind::Run, SEND, &[], Some(now - 1));
+        let later = hold(&store, ActionKind::Run, SEND, &[], Some(now + 60));
+        let ran = hold(&store, ActionKind::Run, SEND, &[], None);
+        assert!(store.take_action(ran, "running").unwrap().is_some());
         let status = |id| store.action(id).unwrap().unwrap().status;
         let db = store.db_for_test();
         let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
                      BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
         db.execute_batch(block).unwrap();
-        tick(&ctx, now, false);
+        stop(&cfg, &store, &waits);
         assert_eq!(
-            status(r),
-            "scheduled",
-            "waiting again, and the owner never told"
+            status(later),
+            "pending",
+            "a delay still scheduled after /stop"
         );
+        tick(&ctx, now + 120, false);
+        assert_eq!(status(later), "pending", "the tick sent it after /stop");
         restore(&cfg, &store, now);
         assert_eq!(
-            status(r),
-            "scheduled",
-            "asked again at start, and the owner never told"
+            status(ran),
+            "unknown",
+            "a dead action still running after a start"
         );
+        assert!(told(&store).is_empty());
         db.execute_batch("DROP TRIGGER no_outbox").unwrap();
-        tick(&ctx, now, false);
-        assert_eq!(status(r), "pending");
-        assert!(told(&store)
-            .iter()
-            .any(|t| t.contains("commands are running")));
+        tick(&ctx, now + 120, false);
+        let told = told(&store);
+        assert!(
+            told.iter().any(|t| t.contains(&format!("#{later}"))),
+            "{told:?}"
+        );
     }
 
     /// Spec §4.6: the session that asked is told to make the call again, steered in while its
