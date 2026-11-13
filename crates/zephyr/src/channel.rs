@@ -12,6 +12,10 @@ pub struct Inbound {
     /// `voice` when `inbox::append` added a transcript to `text` (DESIGN §4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<String>,
+    /// When the platform says it was sent (unix seconds), on a row read back after the
+    /// adapter was away (a backfill); `None` on one that came live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
 }
 
 /// A reply to send. `client_id` lets the platform drop a retried duplicate.
@@ -131,6 +135,51 @@ impl Drop for Answer {
     }
 }
 
+/// The typing refresher per recipient (iMessage, Signal, Telegram): one task each, until its
+/// `stop`, or until the last clone is dropped (its adapter goes). Clones share it.
+#[derive(Clone, Default)]
+pub struct Typing(std::sync::Arc<Refreshers>);
+
+#[derive(Default)]
+struct Refreshers(std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>);
+
+impl Drop for Refreshers {
+    fn drop(&mut self) {
+        let all = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+        all.drain().for_each(|(_, task)| task.abort());
+    }
+}
+
+impl Typing {
+    /// Runs `refresh` for `to`, unless one runs already.
+    pub fn start(&self, to: &str, refresh: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut all = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        if !all.contains_key(to) {
+            all.insert(to.to_string(), tokio::spawn(refresh).abort_handle());
+        }
+    }
+
+    /// Ends `to`'s refresher; whether one ran.
+    pub fn stop(&self, to: &str) -> bool {
+        let task = self
+            .0
+             .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(to);
+        task.map(|t| t.abort()).is_some()
+    }
+}
+
+/// `map[k] = v`, in a map of at most `cap` entries. shortcut: forgets every entry when full,
+/// enough for a pairing notice, which reads the name it just stored; an LRU if names matter more.
+pub fn remember<V>(map: &mut std::collections::HashMap<String, V>, cap: usize, k: &str, v: V) {
+    if map.len() >= cap && !map.contains_key(k) {
+        map.clear();
+    }
+    map.insert(k.to_string(), v);
+}
+
 /// Splits `text` into pieces of at most `max` UTF-16 units, breaking after newlines where possible.
 /// UTF-16 is counted because it is never smaller than the code-point count, so a piece that fits
 /// here fits whichever way a platform counts (Discord, Telegram, Signal). shortcut: a line longer than `max` is hard-split by char.
@@ -160,7 +209,7 @@ pub fn chunks(text: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// What a channel with no client nonce (Telegram, Signal) delivered of each reply, so a retry
+/// What a channel with no lasting client nonce (Telegram, Signal, iMessage) delivered of each reply, so a retry
 /// starts after it. The router stops waiting on a send after its timeout, but the platform may
 /// still take what was asked: so a send runs in a task of its own (`detach`; `Sending` moves into
 /// it) and records each piece the platform took. While it goes, a retry of that reply answers
@@ -433,6 +482,19 @@ impl Channel for AnyChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_typing_ends_its_refreshers() {
+        let typing = Typing::default();
+        let (alive, mut ended) = tokio::sync::mpsc::unbounded_channel::<()>();
+        typing.clone().start("55", async move {
+            let _alive = alive;
+            std::future::pending::<()>().await
+        });
+        drop(typing);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), ended.recv()).await;
+        assert_eq!(gone, Ok(None), "the task ended, and its sender with it");
+    }
 
     #[test]
     fn a_retry_starts_after_what_went_and_waits_for_a_send_still_going() {

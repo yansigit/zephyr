@@ -11,7 +11,11 @@ it sent before: the read offset is kept in feed.offset). Answers: `listAccounts`
 "SUCCESS", or "IDENTITY_FAILURE" while an `untrusted` file exists in D; `sendTyping` and `trust` {};
 in multi-account mode (no -a), `register` and `verify` {} when they name an "account"; anything else
 a JSON-RPC error -32601. An `exit` file in D makes it exit 0 (the file removed). A `slow_send`
-file holds the seconds each `send` waits before it is answered (it is logged at once).
+file holds the seconds each `send` waits before it is answered (it is logged at once). With a
+`stdout_child` file at start it leaves a child asleep that holds its stdout open (its pid in
+`stdout_child.pid`), as a JVM's helper might. A `close_stdin` file makes it close its stdin
+(the file removed, {"type": "stdin_closed"} logged) and read no more requests, so the next one
+zephyr writes fails.
 """
 
 import json
@@ -85,12 +89,28 @@ def feed():
 env = open("/proc/self/environ", "rb").read().split(b"\0")
 log({"type": "start", "argv": argv,
      "env": sorted(e.split(b"=", 1)[0].decode() for e in env if e)})
+if os.path.exists(path("stdout_child")):
+    sleeper = os.fork()
+    if sleeper == 0:
+        time.sleep(600)
+        os._exit(0)
+    with open(path("stdout_child.pid"), "w") as f:
+        f.write(str(sleeper))
 buf = b""
+reading = True
 while True:
     if os.path.exists(path("exit")):
         os.remove(path("exit"))
         sys.exit(0)
+    if reading and os.path.exists(path("close_stdin")):
+        os.remove(path("close_stdin"))
+        os.close(0)
+        reading = False
+        log({"type": "stdin_closed"})
     feed()
+    if not reading:
+        time.sleep(0.05)
+        continue
     ready, _, _ = select.select([0], [], [], 0.05)
     if not ready:
         continue

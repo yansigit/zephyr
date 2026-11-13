@@ -75,6 +75,7 @@ impl Channel for ChatChannel {
                         sender: uid.clone(),
                         text: text.into(),
                         derived: None,
+                        sent_at: None,
                     };
                     if tx.send(m).await.is_err() {
                         break;

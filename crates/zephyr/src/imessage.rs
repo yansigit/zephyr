@@ -6,23 +6,19 @@
 
 use crate::channel::{Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 
 /// Chat style 43 is a group chat (BlueBubbles `Chat.isGroup`). v1 ignores them, as Discord guilds are ignored.
 const GROUP_STYLE: i64 = 43;
@@ -30,10 +26,9 @@ const GROUP_STYLE: i64 = 43;
 const MAX_BODY: usize = 64 * 1024;
 /// Webhook connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
-/// How long a webhook connection has to send its request head.
-const HEAD_WAIT: Duration = Duration::from_secs(10);
-/// shortcut: a fixed 60 s guess for a send that waits on AppleScript; not measured, raise it if real sends time out.
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most one BlueBubbles request may take (a backfill, a file either way); a whole send has
+/// `channel::SEND_CAP`.
+const REQUEST_WAIT: Duration = Duration::from_secs(120);
 /// Wait before retrying a failed backfill, e.g. while the Mac is asleep.
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
 /// How often an active typing indicator is sent again, so it stays up while the reply is worked on.
@@ -63,11 +58,11 @@ pub struct Config {
     pub typing: bool,
 }
 
-fn default_lookback_hours() -> u64 {
+pub(crate) fn default_lookback_hours() -> u64 {
     24
 }
 
-fn default_backfill_limit() -> u32 {
+pub(crate) fn default_backfill_limit() -> u32 {
     200
 }
 
@@ -82,12 +77,14 @@ pub struct IMessage {
     http: reqwest::Client,
     typing: bool,
     /// The refresh task for each recipient whose indicator is on. Clones share it, so any clone can stop it.
-    typing_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    typing_tasks: crate::channel::Typing,
     /// Set by the first typing error of the run, so later ones are not logged.
     typing_warned: Arc<AtomicBool>,
     typing_refresh: Duration,
     /// Owners and home, for saving the files an owner sends (`inbox`).
     live: crate::inbox::Live,
+    /// The pieces of each reply BlueBubbles took. Clones share it.
+    delivered: Arc<crate::channel::Delivered>,
 }
 
 /// Refuses an unspecified bind address unless the operator said so.
@@ -134,6 +131,8 @@ struct Message {
     associated_message_guid: Option<String>,
     item_type: Option<i64>,
     attachments: Option<Vec<Attachment>>,
+    /// When it was sent, unix milliseconds.
+    date_created: Option<i64>,
 }
 
 /// A file on a message, fetched from `/api/v1/attachment/{guid}/download`.
@@ -199,6 +198,7 @@ fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
         sender: handle.address,
         text,
         derived: None,
+        sent_at: None,
     };
     Some((inbound, files))
 }
@@ -219,7 +219,9 @@ async fn backfill(this: &IMessage, tx: &mpsc::Sender<Inbound>) -> anyhow::Result
         let Ok(m) = serde_json::from_value::<Message>(raw) else {
             continue;
         };
-        if let Some((inbound, files)) = message_to_inbound(m) {
+        let sent_at = m.date_created.map(|ms| ms / 1000);
+        if let Some((mut inbound, files)) = message_to_inbound(m) {
+            inbound.sent_at = sent_at;
             if tx
                 .send(this.with_files(inbound, files).await)
                 .await
@@ -251,10 +253,11 @@ async fn webhook(req: Request<Incoming>, queue: Queue, secret: String) -> Respon
     if !given.is_some_and(|g| bool::from(g.as_bytes().ct_eq(secret.as_bytes()))) {
         return status(StatusCode::UNAUTHORIZED);
     }
-    let Ok(body) = Limited::new(req.into_body(), MAX_BODY).collect().await else {
-        return status(StatusCode::BAD_REQUEST);
+    let body = match crate::web::body(req, MAX_BODY).await {
+        Ok(body) => body,
+        Err(code) => return status(code),
     };
-    match to_inbound(&body.to_bytes()) {
+    match to_inbound(&body) {
         Ok(Some(row)) => {
             // A closed queue means run() is returning. BlueBubbles does not retry a webhook.
             let sent = queue.send(row).is_ok();
@@ -290,34 +293,12 @@ async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, this: IMessage)
             }
         }
     });
-    // Anything that reaches the port can connect (the agent too, under host networking): a cap,
-    // so idle sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            continue; // dropped, so closed at once
-        };
+    let svc = service_fn(move |req| {
         let (queue, secret) = (queue.clone(), secret.clone());
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let (queue, secret) = (queue.clone(), secret.clone());
-                async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
-            });
-            // One request per connection, so the head deadline bounds an idle one too.
-            let _ = http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEAD_WAIT)
-                .keep_alive(false)
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-            drop(slot);
-        });
-    }
+        async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
+    });
+    // One request per connection.
+    crate::web::listen(listener, MAX_CONNS, false, svc).await
 }
 
 fn redact(text: &str, password: &str) -> String {
@@ -342,12 +323,13 @@ impl IMessage {
             secret: env(&cfg.secret_env)?,
             lookback: Duration::from_secs(cfg.lookback_hours * 3600),
             backfill_limit: cfg.backfill_limit,
-            http: reqwest::Client::builder().timeout(SEND_TIMEOUT).build()?,
+            http: reqwest::Client::builder().timeout(REQUEST_WAIT).build()?,
             typing: cfg.typing,
             typing_tasks: Default::default(),
             typing_warned: Default::default(),
             typing_refresh: TYPING_REFRESH,
             live: Default::default(),
+            delivered: Default::default(),
         })
     }
 
@@ -396,12 +378,8 @@ impl IMessage {
 
     /// Starts the refresh for `to`, unless one is running already.
     fn keep_refreshing(&self, to: &str) {
-        let mut tasks = self.typing_tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if tasks.contains_key(to) {
-            return;
-        }
         let (me, chat) = (self.clone(), to.to_string());
-        let task = tokio::spawn(async move {
+        self.typing_tasks.start(to, async move {
             loop {
                 if let Err(e) = me.typing_request(Method::POST, &chat).await {
                     me.typing_error(e);
@@ -409,25 +387,16 @@ impl IMessage {
                 tokio::time::sleep(me.typing_refresh).await;
             }
         });
-        tasks.insert(to.to_string(), task.abort_handle());
     }
 
     /// Ends the refresh for `to` and clears its indicator. Nothing is sent if none was on.
     async fn stop_typing(&self, to: &str) -> anyhow::Result<()> {
-        let Some(task) = self.take_refresh(to) else {
+        if !self.typing_tasks.stop(to) {
             return Ok(());
-        };
-        task.abort();
+        }
         self.typing_request(Method::DELETE, to)
             .await
             .map_err(|e| self.typing_error(e))
-    }
-
-    fn take_refresh(&self, to: &str) -> Option<AbortHandle> {
-        self.typing_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(to)
     }
 
     async fn typing_request(&self, method: Method, to: &str) -> anyhow::Result<()> {
@@ -493,40 +462,59 @@ impl Channel for IMessage {
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
         // The indicator clears before the reply, so it never outlasts it. A failure here does not block the reply.
         let _ = self.set_typing(&msg.recipient, false).await;
-        let body = serde_json::json!({
-            // One-to-one iMessage chat. BlueBubbles maps the `iMessage` prefix to `any` on macOS Tahoe.
-            "chatGuid": chat_guid(&msg.recipient),
-            "message": msg.text,
-            "method": "apple-script",
-            "tempGuid": msg.client_id,
+        let text = (!msg.text.is_empty() || msg.attachment.is_none()).then(|| {
+            serde_json::json!({
+                // One-to-one iMessage chat. BlueBubbles maps the `iMessage` prefix to `any` on macOS Tahoe.
+                "chatGuid": chat_guid(&msg.recipient),
+                "message": msg.text,
+                "method": "apple-script",
+                "tempGuid": msg.client_id,
+            })
         });
-        if !msg.text.is_empty() || msg.attachment.is_none() {
-            self.post("/api/v1/message/text", &body).await?;
-        }
-        if let Some(path) = &msg.attachment {
-            let name = path
-                .file_name()
-                .map_or("file".into(), |n| n.to_string_lossy().into_owned());
-            let file = tokio::fs::read(path)
-                .await
-                .context("reading the file to send")?;
-            let form = reqwest::multipart::Form::new()
-                .text("chatGuid", chat_guid(&msg.recipient))
-                .text("tempGuid", format!("{}-f", msg.client_id))
-                .text("name", name.clone())
-                .text("method", "apple-script")
-                .part(
-                    "attachment",
-                    reqwest::multipart::Part::bytes(file).file_name(name),
-                );
-            self.request(
-                Method::POST,
-                "/api/v1/message/attachment",
-                Payload::Form(form),
-            )
-            .await?;
-        }
-        Ok(())
+        // Read before the send begins: one that cannot be read must not hold the chat's turn.
+        let file = match msg.attachment.as_ref() {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map_or("file".into(), |n| n.to_string_lossy().into_owned());
+                let file = tokio::fs::read(path)
+                    .await
+                    .context("reading the file to send")?;
+                let form = reqwest::multipart::Form::new()
+                    .text("chatGuid", chat_guid(&msg.recipient))
+                    .text("tempGuid", format!("{}-f", msg.client_id))
+                    .text("name", name.clone())
+                    .text("method", "apple-script")
+                    .part(
+                        "attachment",
+                        reqwest::multipart::Part::bytes(file).file_name(name),
+                    );
+                Some(form)
+            }
+            None => None,
+        };
+        // The text and the file are the reply's pieces: tempGuid drops no retry once a send is
+        // over, so a retry starts after what BlueBubbles took (`channel::Delivered`).
+        let texts = usize::from(text.is_some());
+        let mut sending = (self.delivered).begin("imessage", &msg.recipient, &msg.client_id)?;
+        sending.total = texts + usize::from(file.is_some());
+        let file = file.filter(|_| sending.before < sending.total);
+        // In a task of its own: AppleScript can take longer than the router waits.
+        let this = self.clone();
+        let send = move |sending: crate::channel::Sending| async move {
+            if let Some(body) = text.filter(|_| sending.before == 0) {
+                this.post("/api/v1/message/text", &body).await?;
+                sending.sent(1);
+            }
+            if let Some(form) = file {
+                let path = "/api/v1/message/attachment";
+                this.request(Method::POST, path, Payload::Form(form))
+                    .await?;
+                sending.sent(texts + 1);
+            }
+            anyhow::Ok(())
+        };
+        crate::channel::detach(sending, crate::channel::SEND_CAP, send).await
     }
 
     fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {
@@ -603,6 +591,9 @@ impl IMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
 
     const NEW: &str = include_str!("../tests/fixtures/bluebubbles/new-message.json");
     const FROM_ME: &str = include_str!("../tests/fixtures/bluebubbles/from-me.json");
@@ -622,6 +613,7 @@ mod tests {
                 sender: "+15551234567".into(),
                 text: "hello from my phone".into(),
                 derived: None,
+                sent_at: None,
             }
         );
     }
@@ -742,7 +734,10 @@ mod tests {
         );
     }
 
-    /// Captures each request's `METHOD path?query` and body, then answers with `reply`.
+    const UPLOAD_TAKES: Duration = Duration::from_secs(15);
+
+    /// Captures each request's `METHOD path?query` and body, then answers with `reply`; an
+    /// upload after `UPLOAD_TAKES`, then captured as `uploaded`.
     async fn stub(status: u16, reply: &'static str) -> (String, mpsc::Receiver<(String, String)>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -760,9 +755,15 @@ mod tests {
                             let uri = format!("{} {}", req.method(), req.uri());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let file = uri.starts_with("GET /api/v1/attachment/");
+                            let upload = uri.starts_with("POST /api/v1/message/attachment");
                             let _ = cap_tx
                                 .send((uri, String::from_utf8_lossy(&body).into()))
                                 .await;
+                            if upload {
+                                // AppleScript sending a file, slower than the router waits.
+                                tokio::time::sleep(UPLOAD_TAKES).await;
+                                let _ = cap_tx.send(("uploaded".into(), String::new())).await;
+                            }
                             if file {
                                 // BlueBubbles serves a HEIC photo converted to JPEG, slowly.
                                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -802,12 +803,20 @@ mod tests {
             typing_warned: Default::default(),
             typing_refresh: TYPING_REFRESH,
             live: Default::default(),
+            delivered: Default::default(),
         }
     }
 
     /// The next request a `stub` saw. Fails the test instead of hanging when none arrives.
     async fn next(cap: &mut mpsc::Receiver<(String, String)>) -> (String, String) {
-        tokio::time::timeout(Duration::from_secs(5), cap.recv())
+        next_within(cap, Duration::from_secs(5)).await
+    }
+
+    async fn next_within(
+        cap: &mut mpsc::Receiver<(String, String)>,
+        wait: Duration,
+    ) -> (String, String) {
+        tokio::time::timeout(wait, cap.recv())
             .await
             .expect("no request arrived")
             .expect("stub closed")
@@ -870,7 +879,10 @@ mod tests {
         let after = json["after"].as_u64().unwrap();
         assert!(before - day <= after && after <= crate::unix_millis() as u64 - day);
 
-        assert_eq!(rx.recv().await.unwrap().platform_msg_id, "AAAA-older");
+        let older = rx.recv().await.unwrap();
+        assert_eq!(older.platform_msg_id, "AAAA-older");
+        // Marked with when it was sent (`dateCreated`), so a stale command is not carried out.
+        assert_eq!(older.sent_at, Some(1_798_000_000));
         assert_eq!(rx.recv().await.unwrap().platform_msg_id, "BBBB-newer");
     }
 
@@ -912,6 +924,64 @@ mod tests {
         assert_eq!(json["message"], "hi there");
         assert_eq!(json["method"], "apple-script");
         assert_eq!(json["tempGuid"], "client-1");
+    }
+
+    #[tokio::test]
+    async fn a_slow_upload_sends_the_text_once() {
+        let (base, mut cap) = stub(200, r#"{"status":200,"message":"ok"}"#).await;
+        let dir = crate::test_dir("imessage-slow-upload");
+        let file = dir.join("report.pdf");
+        std::fs::write(&file, b"pdf!").unwrap();
+        let msg = Outbound {
+            attachment: Some(file),
+            ..outbound()
+        };
+        let im = adapter(base);
+        // As the router does: it stops waiting after 10 s, then retries the row.
+        for _ in 0..2 {
+            let sent = tokio::time::timeout(Duration::from_secs(10), im.send(&msg)).await;
+            assert!(sent.is_err() || sent.unwrap().is_err(), "not sent yet");
+        }
+        let mut seen = Vec::new();
+        while seen.last().is_none_or(|s| s != "uploaded") {
+            seen.push(next_within(&mut cap, UPLOAD_TAKES).await.0);
+        }
+        // Done once the upload's answer is back, a moment after the stub sent it.
+        let done = loop {
+            match im.send(&msg).await {
+                Err(e) if e.is::<crate::channel::StillGoing>() => {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                done => break done,
+            }
+        };
+        done.expect("sent");
+        while let Ok((uri, _)) = cap.try_recv() {
+            seen.push(uri);
+        }
+        let texts = seen.iter().filter(|s| s.contains("/message/text")).count();
+        let uploads = seen
+            .iter()
+            .filter(|s| s.contains("/message/attachment"))
+            .count();
+        assert_eq!((texts, uploads), (1, 1), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_holds_up_no_other_reply() {
+        let (base, _cap) = stub(200, r#"{"status":200,"message":"ok"}"#).await;
+        let im = adapter(base);
+        let gone = Outbound {
+            client_id: "c-gone".into(),
+            attachment: Some("/nonexistent/zephyr/report.pdf".into()),
+            ..outbound()
+        };
+        assert!(im.send(&gone).await.is_err());
+        let next = Outbound {
+            client_id: "c-next".into(),
+            ..outbound()
+        };
+        im.send(&next).await.expect("the chat's turn is free");
     }
 
     #[tokio::test]

@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 
 /// `[telegram]` takes Discord's three keys: `token_env`, `progress`, `progress_after_secs`.
 pub use crate::discord::Config;
@@ -119,16 +118,10 @@ impl Api {
     }
 }
 
-/// A recipient's run in progress: typing refreshes until the run is dropped.
+/// A recipient's run in progress; its typing refreshes in `Telegram::typing` until `finish`.
+#[derive(Default)]
 struct Run {
-    typing: AbortHandle,
     progress: Progress<i64>,
-}
-
-impl Drop for Run {
-    fn drop(&mut self) {
-        self.typing.abort();
-    }
 }
 
 pub struct Telegram {
@@ -145,6 +138,8 @@ pub struct Telegram {
     live: crate::inbox::Live,
     /// The router's answers for the rows sent to it (`Channel::acks`).
     acks: std::sync::OnceLock<Arc<crate::channel::Acks>>,
+    /// The typing refresher per chat.
+    typing: crate::channel::Typing,
     /// Set by the first typing error, so later ones are not logged.
     typing_warned: Arc<AtomicBool>,
     /// How long a 409 (another client polling this bot) waits before the next poll.
@@ -181,6 +176,7 @@ impl Telegram {
             names: Default::default(),
             live: Default::default(),
             acks: Default::default(),
+            typing: Default::default(),
             typing_warned: Default::default(),
             conflict_wait: Duration::from_secs(30),
             backoff: Duration::from_secs(5),
@@ -345,15 +341,12 @@ impl Telegram {
 
     fn remember(&self, sender: &str, name: String) {
         let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
-        // shortcut: forgets every name at 1000 senders; a pairing reads the name it just stored.
-        if names.len() >= MAX_NAMES && !names.contains_key(sender) {
-            names.clear();
-        }
-        names.insert(sender.to_string(), name);
+        crate::channel::remember(&mut names, MAX_NAMES, sender, name);
     }
 
     /// Ends `chat`'s run: stops typing and deletes the progress note.
     async fn finish(&self, chat: i64) {
+        self.typing.stop(&chat.to_string());
         let Some(mut run) = self.runs.lock().await.remove(&chat) else {
             return;
         };
@@ -464,7 +457,7 @@ impl Channel for Telegram {
                     return Ok(());
                 }
                 let (api, warned) = (self.api.clone(), self.typing_warned.clone());
-                let typing = tokio::spawn(async move {
+                self.typing.start(&chat.to_string(), async move {
                     loop {
                         let body = json!({"chat_id": chat, "action": "typing"});
                         if let Err(e) = api.json("sendChatAction", body).await {
@@ -475,11 +468,7 @@ impl Channel for Telegram {
                         tokio::time::sleep(TYPING_EVERY).await;
                     }
                 });
-                let run = Run {
-                    typing: typing.abort_handle(),
-                    progress: Progress::default(),
-                };
-                runs.insert(chat, run);
+                runs.insert(chat, Run::default());
             }
             Activity::Progress { elapsed, tools, .. } => {
                 let mut runs = self.runs.lock().await;
@@ -639,6 +628,7 @@ fn sort(u: Update) -> Sorted {
         sender: from.id.to_string(),
         text,
         derived: None,
+        sent_at: None,
     };
     Sorted::Row(row, docs, name(&from))
 }
@@ -697,6 +687,7 @@ mod tests {
                 sender: "55".into(),
                 text: "hi".into(),
                 derived: None,
+                sent_at: None,
             }
         );
         assert!(docs.is_empty());

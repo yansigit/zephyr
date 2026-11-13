@@ -24,7 +24,7 @@ use crate::store::{Action, Store};
 use crate::voice::Heard;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
@@ -44,8 +44,8 @@ type Socket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 /// Connections the listener holds at once; one more is closed at once.
 const MAX_CONNS: usize = 16;
-/// How long a connection has to send its request head.
-const HEAD_WAIT: Duration = Duration::from_secs(10);
+/// How long a frame may take to send on the media socket.
+const SEND_WAIT: Duration = Duration::from_secs(10);
 /// The longest webhook body read.
 const MAX_EVENT: usize = 64 * 1024;
 /// The longest media frame taken: Telnyx's are a few hundred bytes.
@@ -416,36 +416,17 @@ async fn serve(cfgs: watch::Receiver<Arc<Config>>, calls: Calls) {
             return std::future::pending().await;
         }
     };
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     // One client for every request: it keeps Telnyx's public key until the vault changes, so
     // a stranger's request costs no file read and no new HTTP client.
     let telnyx = Telnyx::new(&cfg);
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            continue; // dropped, so closed at once
-        };
-        let (cfgs, calls, telnyx) = (cfgs.clone(), calls.clone(), telnyx.clone());
-        tokio::spawn(async move {
-            let svc = hyper::service::service_fn(move |req| {
-                let (cfg, calls, telnyx) = (cfgs.borrow().clone(), calls.clone(), telnyx.clone());
-                async move {
-                    let res = handle(req, &cfg, &calls, &telnyx).await;
-                    Ok::<_, std::convert::Infallible>(res)
-                }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEAD_WAIT)
-                .serve_connection(TokioIo::new(stream), svc)
-                .with_upgrades()
-                .await;
-            drop(slot);
-        });
-    }
+    let svc = hyper::service::service_fn(move |req| {
+        let (cfg, calls, telnyx) = (cfgs.borrow().clone(), calls.clone(), telnyx.clone());
+        async move {
+            let res = handle(req, &cfg, &calls, &telnyx).await;
+            Ok::<_, std::convert::Infallible>(res)
+        }
+    });
+    crate::web::listen(listener, MAX_CONNS, true, svc).await
 }
 
 /// One request: Telnyx's media socket for a waiting call, or one of its webhooks; anything
@@ -470,10 +451,10 @@ async fn handle(mut req: Request<Incoming>, cfg: &Config, calls: &Calls, telnyx:
     }
     let now = crate::now();
     if events {
-        let Ok(body) = Limited::new(req.into_body(), MAX_EVENT).collect().await else {
-            return status(StatusCode::PAYLOAD_TOO_LARGE);
+        let body = match crate::web::body(req, MAX_EVENT).await {
+            Ok(body) => body,
+            Err(code) => return status(code),
         };
-        let body = body.to_bytes();
         if !telnyx.verify(&stamp, &signature, &body, now) {
             return status(StatusCode::FORBIDDEN);
         }
@@ -1141,7 +1122,7 @@ impl<'a> Live<'a> {
         match self.socket.as_mut() {
             None => self.unsent.push(frame),
             Some(socket) => {
-                let sent = tokio::time::timeout(HEAD_WAIT, socket.send(Message::Text(frame))).await;
+                let sent = tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(frame))).await;
                 if !matches!(sent, Ok(Ok(()))) {
                     // The next read finds it closed, which is their hang-up.
                     let _ = self.tx.send(Event::TheirHangup);

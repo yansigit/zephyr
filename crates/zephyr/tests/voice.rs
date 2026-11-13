@@ -162,6 +162,7 @@ impl Gateway {
             sender: "owner".into(),
             text: text.into(),
             derived: derived.map(String::from),
+            sent_at: None,
         };
         self.say.send(m).await.unwrap();
     }

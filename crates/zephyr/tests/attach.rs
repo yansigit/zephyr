@@ -116,6 +116,7 @@ impl Gateway {
             sender: "owner".into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         self.chat.send(m).await.unwrap();
     }

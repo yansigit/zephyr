@@ -1096,6 +1096,7 @@ mod tests {
             sender: "owner".into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         command(store, &cfg(None), &m, true).expect("a /job command")
     }
@@ -1179,6 +1180,7 @@ mod tests {
             sender: "o".into(),
             text: "/jobs please".into(),
             derived: None,
+            sent_at: None,
         };
         assert_eq!(command(&mut s, &cfg(None), &not_job, true), None);
         assert!(say(&mut s, "/job add a | 61 * * * * | hi").contains("bad schedule"));
@@ -1280,6 +1282,7 @@ mod tests {
             sender: "o".into(),
             text: "/job add d | 0 8 * * * | hi".into(),
             derived: None,
+            sent_at: None,
         };
         let reply = command(&mut s, &cfg(Some("Asia/Seoul")), &m, true).unwrap();
         assert!(reply.contains("T08:00:00+09:00[Asia/Seoul]"), "{reply}");

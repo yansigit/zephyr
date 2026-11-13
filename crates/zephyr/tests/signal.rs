@@ -441,6 +441,177 @@ async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_stale_one_is_ignored()
     gw.shutdown().await;
 }
 
+/// A hold lets signal-cli go, but the envelopes it handed over are still taken: Signal's
+/// server gave them to it once and will not again.
+#[tokio::test]
+async fn a_hold_still_takes_what_signal_cli_handed_over() {
+    let home = dir("hold-drain");
+    let mut cfg = config(&home, None, &[OWNER]);
+    cfg.voice_dir = voice_fakes::fakes(&home);
+    cfg.voice_off_floor = true;
+    // The note's transcription holds the taker up past the hold, then gives up.
+    std::fs::write(cfg.voice_dir.join("hang"), "").unwrap();
+    cfg.voice_wait = Duration::from_secs(6);
+    let gw = start(cfg);
+    gw.up().await;
+    let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
+    note["dataMessage"]["attachments"][0]["contentType"] = json!("audio/aac");
+    gw.feed(note);
+    wait(|| home.join("voice/hang.pid").exists()).await;
+    gw.feed(message(OWNER, 1700000000999, "after the note"));
+    let fed = || {
+        std::fs::metadata(gw.d.join("feed.jsonl"))
+            .unwrap()
+            .len()
+            .to_string()
+    };
+    wait(|| std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())).await;
+    hold(&gw.d);
+    let rows = || {
+        let counts = Store::open(&home.join("state.db"))
+            .unwrap()
+            .counts()
+            .unwrap();
+        (counts.iter())
+            .filter(|(t, _, _)| t == "inbox")
+            .map(|c| c.2)
+            .sum::<i64>()
+    };
+    wait(|| rows() == 2).await;
+    assert_eq!(gw.log("start").len(), 1, "held, so not started again");
+    gw.shutdown().await;
+}
+
+/// A stop that is not a hold (signal-cli stopped reading, so a request could not be written)
+/// still takes the envelopes it handed over.
+#[tokio::test]
+async fn a_failed_write_still_takes_what_signal_cli_handed_over() {
+    let home = dir("write-drain");
+    let mut cfg = config(&home, None, &[OWNER]);
+    cfg.voice_dir = voice_fakes::fakes(&home);
+    cfg.voice_off_floor = true;
+    std::fs::write(cfg.voice_dir.join("hang"), "").unwrap();
+    cfg.voice_wait = Duration::from_secs(6);
+    let gw = start(cfg);
+    gw.up().await;
+    let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
+    note["dataMessage"]["attachments"][0]["contentType"] = json!("audio/aac");
+    gw.feed(note);
+    wait(|| home.join("voice/hang.pid").exists()).await;
+    gw.feed(message(OWNER, 1700000000999, "after the note"));
+    let fed = || {
+        std::fs::metadata(gw.d.join("feed.jsonl"))
+            .unwrap()
+            .len()
+            .to_string()
+    };
+    wait(|| std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())).await;
+    std::fs::write(gw.d.join("close_stdin"), "").unwrap();
+    wait(|| !gw.log("stdin_closed").is_empty()).await;
+    // A request to write: the trust of a new safety number.
+    std::fs::write(gw.d.join(".trust"), OWNER).unwrap();
+    let rows = || {
+        let counts = Store::open(&home.join("state.db"))
+            .unwrap()
+            .counts()
+            .unwrap();
+        (counts.iter())
+            .filter(|(t, _, _)| t == "inbox")
+            .map(|c| c.2)
+            .sum::<i64>()
+    };
+    wait(|| rows() == 2).await;
+    gw.shutdown().await;
+}
+
+/// A held signal-cli that leaves something holding its output open is still stopped: its
+/// envelopes get a bounded time, then its process group is killed.
+#[tokio::test]
+async fn a_hold_ends_even_when_signal_clis_output_stays_open() {
+    let home = dir("hold-open");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("stdout_child"), "").unwrap();
+    let gw = start(cfg);
+    gw.up().await;
+    let sleeper: i32 = std::fs::read_to_string(d.join("stdout_child.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    hold(&d);
+    // The 10 s drain, then the group's kill: `.ok` goes once the child is over.
+    wait(|| !d.join(".ok").exists()).await;
+    let gone = || {
+        let stat = std::fs::read_to_string(format!("/proc/{sleeper}/stat")).unwrap_or_default();
+        stat.is_empty()
+            || stat[stat.rfind(')').unwrap() + 1..]
+                .trim_start()
+                .starts_with('Z')
+    };
+    wait(gone).await;
+    std::fs::remove_file(d.join("stdout_child")).unwrap();
+    std::fs::remove_file(d.join(".hold")).unwrap();
+    gw.shutdown().await;
+}
+
+/// Files signal-cli saved for envelopes that were never taken (a crash) go at the next start.
+#[tokio::test]
+async fn a_start_empties_signal_clis_attachments() {
+    let home = dir("attachments");
+    let cfg = config(&home, None, &[OWNER]);
+    let stray = zephyr::signal::data_dir(&cfg).join("attachments/left-over.png");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"png").unwrap();
+    let gw = start(cfg);
+    gw.up().await;
+    assert!(!stray.exists());
+    gw.shutdown().await;
+}
+
+/// A reply ends the typing it answers, before it goes, as on the other channels: the router's
+/// own `Stop` may come after it.
+#[tokio::test]
+async fn a_reply_stops_typing_before_it_is_sent() {
+    let home = dir("typing");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    let signal = Arc::new(Signal::new(&cfg).unwrap());
+    let (tx, _rx) = mpsc::channel(16);
+    let run = {
+        let signal = signal.clone();
+        tokio::spawn(async move { signal.run(tx).await })
+    };
+    wait(|| d.join(".ok").exists()).await;
+    let requests = || -> Vec<Value> {
+        let log = std::fs::read_to_string(d.join("log.jsonl")).unwrap_or_default();
+        (log.lines())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["type"] == "request")
+            .map(|v| v["request"].clone())
+            .filter(|r| r["method"] == "sendTyping" || r["method"] == "send")
+            .collect()
+    };
+    signal.activity(OWNER, &Activity::Start).await.unwrap();
+    wait(|| !requests().is_empty()).await;
+    let msg = Outbound {
+        channel: "signal".into(),
+        recipient: OWNER.into(),
+        client_id: "z1".into(),
+        text: "done".into(),
+        attachment: None,
+        reply_to: None,
+    };
+    signal.send(&msg).await.unwrap();
+    let methods = requests();
+    let send = methods.iter().position(|r| r["method"] == "send").unwrap();
+    assert!(
+        methods[..send].iter().any(|r| r["params"]["stop"] == true),
+        "{methods:#?}"
+    );
+    run.abort();
+}
+
 #[tokio::test]
 async fn a_daemon_starting_during_a_hold_starts_no_signal_cli() {
     let home = dir("hold-start");

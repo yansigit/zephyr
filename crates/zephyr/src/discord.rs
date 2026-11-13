@@ -4,11 +4,11 @@ use crate::channel::{chunks, Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serenity::async_trait;
-use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage, GetMessages};
 use serenity::client::{Client, Context, EventHandler};
 use serenity::http::{Http, Typing};
 use serenity::model::channel::{Message, Nonce};
-use serenity::model::gateway::GatewayIntents;
+use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +30,12 @@ pub struct Config {
     pub progress: bool,
     #[serde(default = "default_progress_after_secs")]
     pub progress_after_secs: u64,
+    /// How far back a backfill reads (`[imessage]`'s key and default).
+    #[serde(default = "crate::imessage::default_lookback_hours")]
+    pub lookback_hours: u64,
+    /// The most DMs of one owner a backfill feeds, the newest (`[imessage]`'s key and default).
+    #[serde(default = "crate::imessage::default_backfill_limit")]
+    pub backfill_limit: u32,
 }
 
 fn yes() -> bool {
@@ -38,6 +44,16 @@ fn yes() -> bool {
 
 fn default_progress_after_secs() -> u64 {
     20
+}
+
+/// How long a backfill may take, its fetches and downloads together.
+const BACKFILL_WAIT: Duration = Duration::from_secs(60);
+/// Discord's epoch (2015-01-01) in unix milliseconds: a snowflake counts its time from it.
+const DISCORD_EPOCH: u64 = 1_420_070_400_000;
+
+/// The smallest snowflake of unix millisecond `ms`.
+fn snowflake(ms: u64) -> u64 {
+    ms.saturating_sub(DISCORD_EPOCH) << 22
 }
 
 /// The progress note is edited at most this often.
@@ -146,6 +162,9 @@ pub struct Discord {
     live: crate::inbox::Live,
     /// Fetches attachments from Discord's CDN.
     files: reqwest::Client,
+    /// A backfill's reach: how far back, and how many DMs an owner.
+    lookback: Duration,
+    limit: usize,
 }
 
 impl Discord {
@@ -165,6 +184,8 @@ impl Discord {
             files: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .build()?,
+            lookback: Duration::from_secs(cfg.lookback_hours * 3600),
+            limit: cfg.backfill_limit as usize,
         })
     }
 
@@ -211,6 +232,7 @@ pub fn to_inbound(
         sender: author_id.to_string(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     })
 }
 
@@ -221,9 +243,149 @@ struct Handler {
     /// Held while a message's files are fetched, so the next message (a caption sent after a
     /// photo) queues behind it. serenity runs each event on a task of its own.
     order: Mutex<()>,
+    /// The first message the live path took since the last `ready`: what it stored is newer
+    /// than anything missed, so no row from it is a backfill's cutoff, whichever task ran first.
+    first_live: std::sync::Mutex<Option<u64>>,
+    /// Messages being taken now, by the live path or a backfill: one both see is fetched once.
+    taking: std::sync::Mutex<std::collections::HashSet<u64>>,
+    lookback: Duration,
+    limit: usize,
+}
+
+/// A message being taken, until dropped (`Handler::taking`).
+struct Taking<'a>(&'a Handler, u64);
+
+impl Drop for Taking<'_> {
+    fn drop(&mut self) {
+        let mut taking = self.0.taking.lock().unwrap_or_else(|e| e.into_inner());
+        taking.remove(&self.1);
+    }
 }
 
 impl Handler {
+    fn new(
+        tx: mpsc::Sender<Inbound>,
+        live: crate::inbox::Live,
+        files: reqwest::Client,
+        lookback: Duration,
+        limit: usize,
+    ) -> Self {
+        Self {
+            tx,
+            live,
+            files,
+            order: Mutex::default(),
+            first_live: Default::default(),
+            taking: Default::default(),
+            lookback,
+            limit,
+        }
+    }
+
+    /// Feeds each owner's DMs newer than the newest of that owner's stored rows, within
+    /// `lookback` and at most `limit` of them: what came while the gateway was away, which a
+    /// fresh session never replays (DESIGN §4.3). Nothing for an owner with no row yet. The
+    /// cutoffs are read under `order`, with no live message half taken, and the fetches go
+    /// without it, so live messages flow meanwhile; the inbox's dedupe drops what both took.
+    async fn backfill(&self, http: &Http) {
+        let owners = self.live.get().map(|rx| {
+            let cfg = rx.borrow();
+            cfg.owners.get("discord").cloned().unwrap_or_default()
+        });
+        let mut cutoffs = Vec::new();
+        {
+            let _order = self.order.lock().await;
+            let below = self
+                .first_live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            for owner in owners.unwrap_or_default() {
+                let Ok(user) = owner.parse::<u64>() else {
+                    continue;
+                };
+                let newest = crate::inbox::newest(&self.live, "discord", &owner, below).await;
+                cutoffs.extend(newest.map(|after| (UserId::new(user), after)));
+            }
+        }
+        let oldest = snowflake(
+            (crate::unix_millis() as u64).saturating_sub(self.lookback.as_millis() as u64),
+        );
+        let all = async {
+            for (user, after) in cutoffs {
+                if let Err(e) = self.backfill_dm(http, user, after.max(oldest)).await {
+                    eprintln!("zephyr: discord backfill of {user}'s DMs failed: {e}");
+                }
+            }
+        };
+        if tokio::time::timeout(BACKFILL_WAIT, all).await.is_err() {
+            eprintln!(
+                "zephyr: discord backfill gave up after {} s",
+                BACKFILL_WAIT.as_secs()
+            );
+        }
+    }
+
+    /// `user`'s DMs newer than `after`, the newest `limit` of them, fed oldest first.
+    async fn backfill_dm(&self, http: &Http, user: UserId, after: u64) -> anyhow::Result<()> {
+        const PAGE: u8 = 100;
+        let dm = user.create_dm_channel(http).await?;
+        // Newest first, page by page back to `after`.
+        let mut got: Vec<Message> = Vec::new();
+        loop {
+            let mut ask = GetMessages::new().limit(PAGE);
+            if let Some(m) = got.last() {
+                ask = ask.before(m.id);
+            }
+            let mut page = dm.id.messages(http, ask).await?;
+            page.sort_by_key(|m| std::cmp::Reverse(m.id));
+            let full = page.len() == PAGE as usize;
+            let before = page.len();
+            page.retain(|m| m.id.get() > after);
+            let reached = page.len() < before;
+            got.extend(page);
+            if reached || !full || got.len() >= self.limit {
+                break;
+            }
+        }
+        got.truncate(self.limit);
+        for msg in got.iter().rev() {
+            // Read back, so a stale command is not carried out (`router::stale`).
+            let sent_at = msg.timestamp.unix_timestamp();
+            anyhow::ensure!(self.deliver(msg, Some(sent_at)).await, "the router stopped");
+        }
+        Ok(())
+    }
+
+    /// Hands `msg`'s row to the router; `false` once it stopped taking them. A message the
+    /// other path is taking now is left to it, so its files are fetched once.
+    async fn deliver(&self, msg: &Message, sent_at: Option<i64>) -> bool {
+        let id = msg.id.get();
+        if !self
+            .taking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id)
+        {
+            return true;
+        }
+        let _taking = Taking(self, id);
+        let Some(mut inbound) = self.inbound(msg).await else {
+            return true;
+        };
+        inbound.sent_at = sent_at;
+        self.tx.send(inbound).await.is_ok()
+    }
+
+    /// A gateway message, in arrival order (`order`).
+    async fn live_message(&self, msg: &Message) {
+        let _order = self.order.lock().await;
+        let id = msg.id.get();
+        (self.first_live.lock().unwrap_or_else(|e| e.into_inner())).get_or_insert(id);
+        // A closed receiver means run() is returning; the error comes from there.
+        self.deliver(msg, None).await;
+    }
+
     /// The row for `msg`, its attachments saved (an owner's only) and listed in its text.
     async fn inbound(&self, msg: &Message) -> Option<Inbound> {
         let mut inbound = to_inbound(
@@ -247,12 +409,13 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
+    /// Each new gateway session; a resumed one replays what it missed itself.
+    async fn ready(&self, ctx: Context, _: Ready) {
+        self.backfill(&ctx.http).await;
+    }
+
     async fn message(&self, _ctx: Context, msg: Message) {
-        let _order = self.order.lock().await;
-        if let Some(inbound) = self.inbound(&msg).await {
-            // A closed receiver means run() is returning; the error comes from there.
-            let _ = self.tx.send(inbound).await;
-        }
+        self.live_message(&msg).await;
     }
 }
 
@@ -264,12 +427,13 @@ impl Channel for Discord {
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         // DIRECT_MESSAGES only. DM content arrives without MESSAGE_CONTENT (privileged).
         let mut client = Client::builder(&self.token, GatewayIntents::DIRECT_MESSAGES)
-            .event_handler(Handler {
-                tx: tx.clone(),
-                live: self.live.clone(),
-                files: self.files.clone(),
-                order: Mutex::default(),
-            })
+            .event_handler(Handler::new(
+                tx.clone(),
+                self.live.clone(),
+                self.files.clone(),
+                self.lookback,
+                self.limit,
+            ))
             .await?;
         tokio::select! {
             r = client.start() => r?,
@@ -410,6 +574,7 @@ mod tests {
                 sender: "222".into(),
                 text: "hi".into(),
                 derived: None,
+                sent_at: None,
             }
         );
     }
@@ -427,6 +592,8 @@ mod tests {
             token_env: "ZEPHYR_DISCORD_TEST_UNSET_VAR".into(),
             progress: true,
             progress_after_secs: 20,
+            lookback_hours: 24,
+            backfill_limit: 200,
         };
         let err = Discord::new(&cfg).err().expect("missing env var must fail");
         assert!(err.to_string().contains("ZEPHYR_DISCORD_TEST_UNSET_VAR"));
@@ -521,12 +688,7 @@ mod tests {
     }
 
     fn handler(live: crate::inbox::Live) -> Handler {
-        Handler {
-            tx: mpsc::channel(1).0,
-            live,
-            files: reqwest::Client::new(),
-            order: Mutex::default(),
-        }
+        backfill_handler(live).0
     }
 
     #[tokio::test]
@@ -550,6 +712,196 @@ mod tests {
         assert_eq!(std::fs::read(&png).unwrap(), b"png!");
         assert!(seen.recv().await.unwrap().contains("/screenshot.png?ex="));
         assert!(seen.try_recv().is_err(), "the pdf is over 25 MB");
+    }
+
+    /// A DM from the owner, as the gateway or the REST API gives it.
+    fn dm(id: u64, text: &str) -> Message {
+        let mut m: serde_json::Value = serde_json::from_str(DM_FILES).unwrap();
+        m["id"] = id.to_string().into();
+        m["content"] = text.into();
+        m["attachments"] = serde_json::json!([]);
+        serde_json::from_value(m).unwrap()
+    }
+
+    /// A snowflake from `secs` seconds ago, plus `n`.
+    fn ago(secs: u64, n: u64) -> u64 {
+        snowflake(crate::unix_millis() as u64 - secs * 1000) + n
+    }
+
+    /// Discord's REST API on a loopback port, for `Http`'s proxy: the owner's DM is channel
+    /// 77 and its messages are `msgs` (ids and texts), all of them on one page, after `wait`.
+    /// Reports each request's `METHOD path?query`.
+    async fn rest_stub(
+        msgs: Vec<(u64, &'static str)>,
+        wait: Duration,
+    ) -> (Http, mpsc::UnboundedReceiver<String>) {
+        use http_body_util::Full;
+        use hyper::body::{Bytes, Incoming};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen, rx) = mpsc::unbounded_channel();
+        let msg = |(id, text): &(u64, &str)| {
+            let mut m: serde_json::Value = serde_json::from_str(DM_FILES).unwrap();
+            m["id"] = id.to_string().into();
+            m["channel_id"] = "77".into();
+            m["content"] = (*text).into();
+            m["attachments"] = serde_json::json!([]);
+            m
+        };
+        let page = serde_json::Value::from(msgs.iter().map(msg).collect::<Vec<_>>()).to_string();
+        let owner = msg(&(1, ""))["author"].clone();
+        let dm = serde_json::json!({"id": "77", "type": 1, "recipients": [owner]}).to_string();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (seen, page, dm) = (seen.clone(), page.clone(), dm.clone());
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let _ = seen.send(format!("{} {}", req.method(), req.uri()));
+                    let body = if req.uri().path().ends_with("/messages") {
+                        page.clone()
+                    } else {
+                        dm.clone()
+                    };
+                    async move {
+                        tokio::time::sleep(wait).await;
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc),
+                );
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("Bot test")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        (http, rx)
+    }
+
+    fn backfill_handler(live: crate::inbox::Live) -> (Handler, mpsc::Receiver<Inbound>) {
+        let (tx, rx) = mpsc::channel(16);
+        let day = Duration::from_secs(24 * 3600);
+        (Handler::new(tx, live, reqwest::Client::new(), day, 200), rx)
+    }
+
+    fn store_row(live: &crate::inbox::Live, id: u64, sender: u64) {
+        let db = live.get().unwrap().borrow().db_path();
+        let row = to_inbound(true, false, id, sender, "seen", false).unwrap();
+        crate::store::Store::open(&db)
+            .unwrap()
+            .insert_inbox(&row)
+            .unwrap();
+    }
+
+    fn ids(rx: &mut mpsc::Receiver<Inbound>) -> Vec<u64> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|m| m.platform_msg_id.parse().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ready_feeds_the_owners_dms_newer_than_their_newest_stored_row_oldest_first() {
+        let home = crate::test_dir("discord-backfill");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let s = ago(600, 0);
+        // The owner's newest row, an older one ("99" sorts after "100" as text), and a
+        // stranger's newer one, which says nothing of what the owner sent.
+        for (id, sender) in [(s, 2000), (s - 1, 2000), (s + 10, 9999)] {
+            store_row(&live, id, sender);
+        }
+        let (h, mut rx) = backfill_handler(live.clone());
+        // A live message of the new session, taken and stored before the backfill reads its
+        // cutoff: it must not hide what came while the gateway was away.
+        h.live_message(&dm(s + 5, "live")).await;
+        assert_eq!(ids(&mut rx), [s + 5]);
+        store_row(&live, s + 5, 2000);
+        let page = vec![
+            (s + 5, "live"),
+            (s + 3, "second"),
+            (s + 1, "first"),
+            (s, "seen"),
+        ];
+        let (http, mut seen) = rest_stub(page, Duration::ZERO).await;
+        h.backfill(&http).await;
+        assert_eq!(seen.try_recv().unwrap(), "POST /api/v10/users/@me/channels");
+        assert_eq!(
+            seen.try_recv().unwrap(),
+            "GET /api/v10/channels/77/messages?&limit=100"
+        );
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            got.iter().all(|m| m.sent_at == Some(1_793_437_964)),
+            "when sent"
+        );
+        let got: Vec<u64> = got
+            .iter()
+            .map(|m| m.platform_msg_id.parse().unwrap())
+            .collect();
+        assert_eq!(got, [s + 1, s + 3, s + 5]);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_reads_back_a_day_at_most_and_the_newest_of_them() {
+        let home = crate::test_dir("discord-backfill-limits");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        store_row(&live, ago(3 * 24 * 3600, 0), 2000);
+        let (tx, mut rx) = mpsc::channel(16);
+        let day = Duration::from_secs(24 * 3600);
+        let h = Handler::new(tx, live, reqwest::Client::new(), day, 2);
+        let (newest, newer, new, old) = (ago(60, 0), ago(120, 0), ago(180, 0), ago(25 * 3600, 0));
+        let page = vec![(newest, "c"), (newer, "b"), (new, "a"), (old, "a day old")];
+        let (http, _seen) = rest_stub(page, Duration::ZERO).await;
+        h.backfill(&http).await;
+        assert_eq!(ids(&mut rx), [newer, newest]);
+    }
+
+    #[tokio::test]
+    async fn live_messages_go_on_while_a_backfill_fetches() {
+        let home = crate::test_dir("discord-backfill-slow");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let s = ago(600, 0);
+        store_row(&live, s, 2000);
+        let (h, mut rx) = backfill_handler(live);
+        let (http, _seen) = rest_stub(vec![(s + 1, "away")], Duration::from_secs(3)).await;
+        let live = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let now = dm(s + 2, "now");
+            let took = tokio::time::timeout(Duration::from_secs(1), h.live_message(&now));
+            assert!(took.await.is_ok(), "not held up by the backfill's fetch");
+        };
+        tokio::join!(h.backfill(&http), live);
+        assert_eq!(ids(&mut rx), [s + 2, s + 1]);
+    }
+
+    #[tokio::test]
+    async fn a_message_both_paths_take_at_once_is_fetched_once() {
+        let home = crate::test_dir("discord-once");
+        let (base, mut seen) = crate::inbox::tests::file_stub(200, "image/png", b"png!").await;
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let (h, mut rx) = backfill_handler(live);
+        let msg = dm_with_files(&base);
+        let (a, b) = tokio::join!(h.deliver(&msg, None), h.deliver(&msg, Some(1)));
+        assert!(a && b);
+        assert_eq!(ids(&mut rx).len(), 1);
+        assert!(seen.recv().await.unwrap().contains("/screenshot.png?ex="));
+        assert!(seen.try_recv().is_err(), "fetched once");
+    }
+
+    #[tokio::test]
+    async fn ready_fetches_nothing_before_the_first_stored_row() {
+        let home = crate::test_dir("discord-backfill-none");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let (http, mut seen) = rest_stub(vec![(101, "first")], Duration::ZERO).await;
+        let (h, mut rx) = backfill_handler(live);
+        h.backfill(&http).await;
+        assert!(seen.try_recv().is_err(), "no request");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

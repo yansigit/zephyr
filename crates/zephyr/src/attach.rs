@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -387,7 +388,8 @@ impl Conn {
         }
         if method == "authenticate" {
             let given = params["token"].as_str().unwrap_or_default();
-            if !same(given, &self.token) {
+            // Constant time, so the token can't be guessed byte by byte.
+            if !bool::from(given.as_bytes().ct_eq(self.token.as_bytes())) {
                 return (vec![error(id, UNAUTHORIZED, "invalid token")], true);
             }
             self.authed = true;
@@ -712,6 +714,7 @@ impl Conn {
                 sender: "token".into(),
                 text,
                 derived: None,
+                sent_at: None,
             };
             // zephyr's words, not the owner's: never through `inbound`, which marks the owner's.
             let _ = self.router.send(AttachRequest::Notice(m)).await;
@@ -1024,6 +1027,7 @@ impl Conn {
             sender: sender(self.channel).into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         let sent = match cmd["followUp"] == true {
             true => self.router.send(AttachRequest::FollowUp(m)).await.is_ok(),
@@ -1190,13 +1194,4 @@ fn next_msg_id() -> String {
         crate::unix_millis(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// Constant-time compare, so the token can't be guessed byte by byte.
-fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0, |acc, (x, y)| acc | (x ^ y))
-            == 0
 }

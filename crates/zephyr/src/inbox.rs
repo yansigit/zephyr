@@ -58,19 +58,44 @@ pub fn owner(live: &Live, inbound: &Inbound) -> bool {
 /// `Store::open`, which may migrate and takes write locks. A database that is not there yet or
 /// cannot be read says "not stored".
 pub async fn stored(live: &Live, inbound: &Inbound) -> bool {
-    use rusqlite::{Connection, OpenFlags, OptionalExtension};
-    let Some(db) = live.get().map(|rx| rx.borrow().db_path()) else {
-        return false;
-    };
+    use rusqlite::OptionalExtension;
     let key = [inbound.channel.clone(), inbound.platform_msg_id.clone()];
-    let ask = move || -> rusqlite::Result<bool> {
+    let sql = "SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2";
+    let row = ask(live, move |db| {
+        db.query_row(sql, key, |_| Ok(())).optional()
+    });
+    matches!(row.await, Some(Some(())))
+}
+
+/// The newest of `sender`'s rows on `channel` by its numeric platform id (Discord's
+/// snowflakes), below `below` if given, read as `stored` reads; `None` with no such row.
+pub async fn newest(live: &Live, channel: &str, sender: &str, below: Option<u64>) -> Option<u64> {
+    let below = below.map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
+    let key = (channel.to_string(), sender.to_string(), below);
+    let sql = "SELECT MAX(CAST(platform_msg_id AS INTEGER)) FROM inbox \
+               WHERE channel = ?1 AND sender = ?2 AND CAST(platform_msg_id AS INTEGER) < ?3";
+    let max = ask(live, move |db| {
+        db.query_row(sql, rusqlite::params![key.0, key.1, key.2], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+    });
+    max.await.flatten().and_then(|n| u64::try_from(n).ok())
+}
+
+/// `f` on a read-only connection to the live config's database, off the async threads; `None`
+/// before the config is handed over, or when it cannot be read.
+async fn ask<T: Send + 'static>(
+    live: &Live,
+    f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+) -> Option<T> {
+    use rusqlite::{Connection, OpenFlags};
+    let db = live.get().map(|rx| rx.borrow().db_path())?;
+    let ask = move || -> rusqlite::Result<T> {
         let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(Duration::from_secs(2))?;
-        let sql = "SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2";
-        let row = db.query_row(sql, key, |_| Ok(())).optional()?;
-        Ok(row.is_some())
+        f(&db)
     };
-    matches!(tokio::task::spawn_blocking(ask).await, Ok(Ok(true)))
+    tokio::task::spawn_blocking(ask).await.ok()?.ok()
 }
 
 /// Appends a line per file to `inbound.text`, saving each file first when the sender is an owner.
@@ -408,6 +433,7 @@ pub(crate) mod tests {
             sender: "2".into(),
             text: String::new(),
             derived: None,
+            sent_at: None,
         };
         let (mut first, mut again) = (row(), row());
         append(&live, &mut first, vec![file()]).await;
@@ -452,6 +478,7 @@ pub(crate) mod tests {
             sender: sender.into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         }
     }
 
@@ -672,6 +699,7 @@ pub(crate) mod tests {
             sender: "+1".into(),
             text: "look".into(),
             derived: None,
+            sent_at: None,
         };
         let f = File {
             name: "a.pdf".into(),
@@ -714,6 +742,7 @@ pub(crate) mod tests {
             sender: sender.into(),
             text: String::new(),
             derived: None,
+            sent_at: None,
         };
         let live = live(&home, "signal = ['u']");
         let mut stranger = row("x");

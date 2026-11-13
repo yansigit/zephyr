@@ -3859,6 +3859,7 @@ table inet zephyr {
                 sender: "owner-1".into(),
                 text: "hi".into(),
                 derived: None,
+                sent_at: None,
             };
             store.insert_inbox(&said).unwrap();
             let row = store.inbox_with_status("new").unwrap().remove(0);

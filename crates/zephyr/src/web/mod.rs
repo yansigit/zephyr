@@ -35,8 +35,10 @@ use tokio_tungstenite::WebSocketStream;
 
 /// Connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
-/// How long a connection has to send its request head.
+/// How long a connection has to send each request head, on every listener (`listen`).
 const HEAD_WAIT: Duration = Duration::from_secs(10);
+/// How long a request has to send its body once its head is in (`body`).
+const BODY_WAIT: Duration = Duration::from_secs(10);
 /// Web sockets open at once; one more gets 503.
 const MAX_SOCKETS: usize = 4;
 /// Requests a socket may send in a minute; one more closes it.
@@ -425,18 +427,40 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
     };
     eprintln!("zephyr: web app listening on {addr}");
     let app = Arc::new(App { web, handles, hub });
-    // Anything on the host can connect (the agent too, under host networking): a cap, so idle
-    // sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
-    // Beside the listener: a takeover nobody ends goes back by itself.
-    let watchdog = vnc::watchdog(app.clone());
-    tokio::pin!(watchdog);
+    let svc = {
+        let app = app.clone();
+        service_fn(move |req| {
+            let app = app.clone();
+            async move { Ok::<_, Infallible>(handle(req, app).await) }
+        })
+    };
+    // Keep-alive stays on: with it off hyper adds `close` to the 101's `Connection: Upgrade`,
+    // which a WebSocket client need not accept.
+    tokio::select! {
+        () = listen(listener, MAX_CONNS, true, svc) => {}
+        // Beside the listener: a takeover nobody ends goes back by itself.
+        () = vnc::watchdog(app) => {}
+    }
+    std::future::pending().await
+}
+
+/// Serves `svc` on each connection `listener` takes, for ever: the one loop of the web app,
+/// the iMessage webhook and the calls listener. Anything that reaches the port can connect
+/// (the agent too, under host networking), so at most `max_conns` are served at once (one
+/// more is closed as it arrives) and each request head has `HEAD_WAIT`, which bounds an idle
+/// connection too. `keep_alive` false serves one request a connection. Upgrades are served.
+pub(crate) async fn listen<S, B>(listener: TcpListener, max_conns: usize, keep_alive: bool, svc: S)
+where
+    S: hyper::service::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(max_conns));
     loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
-            () = &mut watchdog => continue,
-        };
-        let Ok((stream, _)) = accepted else {
+        let Ok((stream, _)) = listener.accept().await else {
             // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
@@ -444,23 +468,30 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             continue; // dropped, so closed at once
         };
-        let app = app.clone();
+        let svc = svc.clone();
         tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let app = app.clone();
-                async move { Ok::<_, Infallible>(handle(req, app).await) }
-            });
-            // Keep-alive stays on: with it off hyper adds `close` to the 101's `Connection: Upgrade`,
-            // which a WebSocket client need not accept. The head deadline runs again for each
-            // request on the connection, so it bounds an idle one too.
             let _ = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(HEAD_WAIT)
+                .keep_alive(keep_alive)
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades()
                 .await;
             drop(slot);
         });
+    }
+}
+
+/// A request's body, at most `limit` bytes, within `BODY_WAIT` of its head: hyper bounds only
+/// the head, so a body that never came would hold its connection's slot for good. `Err` is
+/// the status to answer: 408 for a body too slow, 413 for one too large or cut off.
+pub(crate) async fn body(req: Request<Incoming>, limit: usize) -> Result<Bytes, StatusCode> {
+    use http_body_util::BodyExt;
+    let read = http_body_util::Limited::new(req.into_body(), limit).collect();
+    match tokio::time::timeout(BODY_WAIT, read).await {
+        Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
+        Ok(Err(_)) => Err(StatusCode::PAYLOAD_TOO_LARGE),
+        Ok(Ok(body)) => Ok(body.to_bytes()),
     }
 }
 
@@ -494,8 +525,9 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
             if let Some(res) = app.closed(path != "/api/login/start") {
                 return res;
             }
-            let Some(body) = body(req).await else {
-                return error(StatusCode::BAD_REQUEST, "the request is malformed");
+            let body = match json_body(req).await {
+                Ok(body) => body,
+                Err(res) => return res,
             };
             match path {
                 "/api/enrol/start" => app.enrol_start(&body).await,
@@ -514,8 +546,9 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
                 return app.push_key();
             }
             let add = req.method() == Method::POST;
-            let Some(body) = body(req).await else {
-                return error(StatusCode::BAD_REQUEST, "the request is malformed");
+            let body = match json_body(req).await {
+                Ok(body) => body,
+                Err(res) => return res,
             };
             match path {
                 "/api/push" => app.push_save(add, session.passkey, &body),
@@ -528,14 +561,22 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
     }
 }
 
-/// A request's JSON object, of at most `MAX_BODY` bytes.
-async fn body(req: Request<Incoming>) -> Option<serde_json::Value> {
-    use http_body_util::BodyExt;
-    let body = http_body_util::Limited::new(req.into_body(), MAX_BODY);
-    let bytes = body.collect().await.ok()?.to_bytes();
-    serde_json::from_slice(&bytes)
-        .ok()
+/// A request's JSON object, of at most `MAX_BODY` bytes; `Err` is the refusal to answer.
+async fn json_body(req: Request<Incoming>) -> Result<serde_json::Value, Res> {
+    let malformed = || error(StatusCode::BAD_REQUEST, "the request is malformed");
+    let bytes = match body(req, MAX_BODY).await {
+        Ok(bytes) => bytes,
+        Err(StatusCode::REQUEST_TIMEOUT) => {
+            return Err(error(
+                StatusCode::REQUEST_TIMEOUT,
+                "the request took too long",
+            ))
+        }
+        Err(_) => return Err(malformed()),
+    };
+    (serde_json::from_slice(&bytes).ok())
         .filter(serde_json::Value::is_object)
+        .ok_or_else(malformed)
 }
 
 fn file(req: &Request<Incoming>, path: &str) -> Res {

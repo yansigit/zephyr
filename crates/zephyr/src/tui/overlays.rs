@@ -2063,6 +2063,7 @@ mod tests {
                         sender: "me".into(),
                         text: text.clone(),
                         derived: None,
+                        sent_at: None,
                     };
                     crate::scheduler::command(&mut store, &cfg, &m, true)
                         .is_some_and(|r| !r.contains("usage:"))

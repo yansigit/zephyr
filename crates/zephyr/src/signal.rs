@@ -47,6 +47,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TYPING_EVERY: Duration = Duration::from_secs(10);
 /// How often `D/.trust` (dropped by `zephyr signal-setup trust`) is looked for.
 const TRUST_EVERY: Duration = Duration::from_secs(2);
+/// How long a stopping signal-cli's handed-over envelopes may take to be taken.
+const DRAIN_WAIT: Duration = Duration::from_secs(10);
 /// Names remembered for `known_as`.
 const NAMES: usize = 256;
 /// Root's PATH for signal-cli: nothing the agent can write.
@@ -101,6 +103,11 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// `sendTyping`'s params that clear `to`'s indicator.
+fn typing_off(to: &str) -> Value {
+    json!({"recipient": [to], "stop": true})
 }
 
 /// A Signal ACI: a UUID, `8-4-4-4-12` hex digits.
@@ -165,6 +172,7 @@ fn to_inbound(env: &Value, account: &str, own: Option<&str>) -> Option<(Inbound,
         sender: from.into(),
         text: text.into(),
         derived: None,
+        sent_at: None,
     };
     Some((row, files))
 }
@@ -267,7 +275,7 @@ pub struct Signal {
     /// For an ACI whose notice reached only some owners: who, so a retry tells only the rest.
     reached: Mutex<HashMap<String, HashSet<(String, String)>>>,
     /// The typing refresher per recipient.
-    typing: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    typing: crate::channel::Typing,
 }
 
 impl Signal {
@@ -288,7 +296,7 @@ impl Signal {
             delivered: Arc::default(),
             told: Mutex::default(),
             reached: Mutex::default(),
-            typing: Mutex::default(),
+            typing: Default::default(),
         })
     }
 
@@ -296,14 +304,24 @@ impl Signal {
     async fn child(&self, tx: &mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         private_dir(&self.dir)?;
         let _ = std::fs::remove_file(self.dir.join(OK_FILE));
+        // Files of envelopes never taken (a crash): `take` deletes the rest as it goes.
+        for file in std::fs::read_dir(self.dir.join("attachments"))
+            .into_iter()
+            .flatten()
+        {
+            let _ = file.map(|f| std::fs::remove_file(f.path()));
+        }
         let own = self.own_aci();
+        // In a process group of its own, so what it leaves behind can be killed with it.
         let mut child = command(&self.cli, &self.dir)
             .args(["-a", &self.account, "jsonRpc"])
             .args(["--ignore-stories", "--ignore-avatars", "--ignore-stickers"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .process_group(0)
             .spawn()
             .with_context(|| format!("starting {}", self.cli.display()))?;
+        let group = child.id().map(|pid| pid as i32);
         let (mut stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
         let (lines_tx, mut lines) = mpsc::unbounded_channel::<String>();
         *self.rpc.writer.lock().unwrap() = Some(lines_tx);
@@ -345,14 +363,31 @@ impl Signal {
                 self.trust().await;
             }
         };
-        tokio::select! {
-            (r, ()) = async { tokio::join!(reader, taker) } => r?,
-            r = writer => r?,
+        let taken = async { tokio::join!(reader, taker) };
+        tokio::pin!(taken);
+        let (ended, drained) = tokio::select! {
+            (r, ()) = &mut taken => (r, true),
+            r = writer => (r, false),
             () = side => {
                 eprintln!("zephyr: signal-cli stops while zephyr signal-setup holds the account");
-                let _ = child.start_kill();
+                (Ok(()), false)
+            }
+        };
+        if !drained {
+            let _ = child.start_kill();
+            // What it handed over is still taken, whichever way it ends: Signal's server will
+            // not give it again. Bounded, as something it left may hold its output open. The
+            // next start empties the attachments only after this, so none a row needs is gone.
+            if tokio::time::timeout(DRAIN_WAIT, &mut taken).await.is_err() {
+                eprintln!("zephyr: signal-cli's output did not end; killing its process group");
+                if let Some(group) = group {
+                    // SAFETY: a plain kill of the group this spawn made.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut taken).await;
             }
         }
+        ended?;
         let status = child.wait().await?;
         eprintln!("zephyr: signal-cli exited ({status})");
         Ok(())
@@ -403,11 +438,7 @@ impl Signal {
         if let Some((mut row, files)) = row {
             if let Some(name) = named(&env) {
                 let mut names = self.names.lock().unwrap();
-                // shortcut: forgets every name when full, enough for a pairing notice; an LRU if names matter more.
-                if names.len() >= NAMES && !names.contains_key(&row.sender) {
-                    names.clear();
-                }
-                names.insert(row.sender.clone(), name);
+                crate::channel::remember(&mut names, NAMES, &row.sender, name);
             }
             let files = files.iter().map(|a| {
                 let id = a["id"].as_str().unwrap_or_default();
@@ -556,6 +587,12 @@ impl Channel for Signal {
             parts.push(String::new());
         }
         let last = parts.len().saturating_sub(1);
+        // The indicator clears before the reply, so it never outlasts it; briefly waited for,
+        // well inside the router's send timeout.
+        if self.typing.stop(&msg.recipient) {
+            let off = self.rpc.call("sendTyping", typing_off(&msg.recipient));
+            let _ = tokio::time::timeout(Duration::from_secs(2), off).await;
+        }
         let mut sending = (self.delivered).begin("signal", &msg.recipient, &msg.client_id)?;
         sending.total = parts.len();
         // In a task of its own: the router stops waiting after its timeout, but signal-cli sends
@@ -599,12 +636,8 @@ impl Channel for Signal {
         }
         match a {
             Activity::Start => {
-                let mut typing = self.typing.lock().unwrap();
-                if typing.contains_key(to) {
-                    return Ok(());
-                }
                 let (rpc, recipient) = (self.rpc.clone(), json!([to]));
-                let task = tokio::spawn(async move {
+                self.typing.start(to, async move {
                     loop {
                         let _ = rpc
                             .call("sendTyping", json!({"recipient": recipient}))
@@ -612,18 +645,13 @@ impl Channel for Signal {
                         tokio::time::sleep(TYPING_EVERY).await;
                     }
                 });
-                typing.insert(to.to_string(), task.abort_handle());
             }
             Activity::Progress { .. } => {}
-            Activity::Stop => {
-                let Some(task) = self.typing.lock().unwrap().remove(to) else {
-                    return Ok(());
-                };
-                task.abort();
-                let params = json!({"recipient": [to], "stop": true});
-                let rpc = self.rpc.clone();
+            Activity::Stop if self.typing.stop(to) => {
+                let (rpc, params) = (self.rpc.clone(), typing_off(to));
                 tokio::spawn(async move { rpc.call("sendTyping", params).await });
             }
+            Activity::Stop => {}
         }
         Ok(())
     }

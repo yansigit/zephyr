@@ -169,6 +169,7 @@ impl Gateway {
             sender: sender.into(),
             text: text.into(),
             derived: None,
+            sent_at: None,
         };
         self.feeds[channel].send(m).await.unwrap();
     }
@@ -435,6 +436,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
                 sender: "owner".into(),
                 text: text.into(),
                 derived: None,
+                sent_at: None,
             })
             .unwrap()
             .unwrap();
@@ -624,6 +626,7 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
             sender: "owner".into(),
             text: "hi".into(),
             derived: None,
+            sent_at: None,
         })
         .unwrap()
         .unwrap();
@@ -685,6 +688,45 @@ async fn pause_aborts_the_run_and_holds_new_messages_until_resume() {
             "echo: [chat #3] held"
         ]
     );
+    gw.shutdown().await;
+}
+
+/// A command read back after an adapter was away (a backfill: Discord's and iMessage's) that
+/// was sent over 10 minutes ago is stored but not carried out, and the owner is told; a fresh
+/// one runs.
+#[tokio::test]
+async fn a_stale_backfilled_command_is_stored_but_skipped() {
+    let home = home("stale-backfill");
+    let mut cfg = config(&home);
+    cfg.owners.insert("imessage".into(), vec!["iowner".into()]);
+    let gw = start_on(cfg, &["discord", "imessage"]);
+    let old = zephyr::now() - 11 * 60;
+    let backfilled = |channel: &str, sender: &str, id: &str, text: &str, at: i64| Inbound {
+        channel: channel.into(),
+        platform_msg_id: id.into(),
+        sender: sender.into(),
+        text: text.into(),
+        derived: None,
+        sent_at: Some(at),
+    };
+    for (channel, sender) in [("discord", "downer"), ("imessage", "iowner")] {
+        let pause = backfilled(channel, sender, "p1", "/pause", old);
+        gw.feeds[channel].send(pause).await.unwrap();
+        let replies = gw.wait_replies_on(channel, 1).await;
+        assert!(
+            replies[0].starts_with("[zephyr] skipped /pause: it was sent 11 min ago"),
+            "{replies:?}"
+        );
+    }
+    assert_eq!(inbox_status(&home, "done"), 2, "stored");
+    // Not paused: an old message that is no command still goes to the agent.
+    let hi = backfilled("discord", "downer", "m1", "while you were away", old);
+    gw.feeds["discord"].send(hi).await.unwrap();
+    let replies = gw.wait_replies_on("discord", 2).await;
+    assert_eq!(replies[1], "echo: [discord #3] while you were away");
+    let fresh = backfilled("discord", "downer", "p2", "/pause", zephyr::now() - 60);
+    gw.feeds["discord"].send(fresh).await.unwrap();
+    assert_eq!(gw.wait_replies_on("discord", 3).await[2], PAUSED);
     gw.shutdown().await;
 }
 
@@ -1544,6 +1586,7 @@ async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
             sender: "owner".into(),
             text: "in flight".into(),
             derived: None,
+            sent_at: None,
         })
         .unwrap()
         .unwrap();
@@ -4954,6 +4997,7 @@ async fn a_continuation_waiting_at_a_restart_still_goes_as_one() {
             sender: "owner".into(),
             text: "[unfinished] research".into(),
             derived: None,
+            sent_at: None,
         })
         .unwrap()
         .unwrap();

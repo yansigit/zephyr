@@ -4165,6 +4165,7 @@ mod tests {
             sender: "1000".into(),
             text: "hi".into(),
             derived: None,
+            sent_at: None,
         }
     }
 
