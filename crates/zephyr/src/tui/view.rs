@@ -426,55 +426,79 @@ impl View {
 }
 
 /// Text from the daemon, and so from the agent, safe to reach the terminal: no escape sequence
-/// (CSI, OSC such as 52's clipboard write, DCS and the rest), no C0 or C1 control but `\n` and
-/// `\t` (`\r` becomes a line break, as a pty's redraw means), and no character that turns the
-/// direction of what follows (the embeddings, overrides and isolates the plugin refuses in rule
-/// text, and the marks), so nothing can paint over the screen or pass for other text. `conn`
-/// runs every string the daemon sends through it before any widget, copy or `/copy` sees it.
+/// (CSI, OSC such as 52's clipboard write, DCS and the rest; one left open ends at its line),
+/// no C0 or C1 control but `\n` and `\t` (`\r` becomes a line break, as a pty's redraw means),
+/// and nothing [`invisible`], so nothing can paint over the screen or pass for other text.
+/// `conn` runs every string the daemon sends through it before any widget, copy or `/copy`
+/// sees it.
 pub(super) fn safe(text: &str) -> String {
-    let turns = |c: char| {
-        matches!(c,
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            | '\u{200e}' | '\u{200f}' | '\u{061c}')
-    };
+    cleaned(text, None)
+}
+
+/// [`safe`] for an object's key: each thing dropped leaves U+FFFD in its place (`\r` too), so
+/// two keys never clean to one (`command` and `command` with a mark after it).
+pub(super) fn safe_key(text: &str) -> String {
+    cleaned(text, Some('\u{fffd}'))
+}
+
+/// What turns the direction of what follows or is not drawn at all: every format character
+/// (general category Cf, Unicode 15: the bidi embeddings, overrides, isolates and marks, zero
+/// widths, the soft hyphen, tags) but the zero-width joiner, which emoji need; the line and
+/// paragraph separators; and the Hangul fillers, blank but not spaces.
+fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0xad | 0x600..=0x605 | 0x61c | 0x6dd | 0x70f | 0x890..=0x891 | 0x8e2 | 0x180e
+        | 0x200b..=0x200c | 0x200e..=0x200f | 0x202a..=0x202e | 0x2060..=0x2064
+        | 0x2066..=0x206f | 0xfeff | 0xfff9..=0xfffb | 0x110bd | 0x110cd | 0x13430..=0x1343f
+        | 0x1bca0..=0x1bca3 | 0x1d173..=0x1d17a | 0xe0001 | 0xe0020..=0xe007f
+        | 0x2028 | 0x2029 | 0x115f | 0x3164)
+}
+
+/// [`safe`], each dropped character or sequence replaced by `mark` when there is one.
+fn cleaned(text: &str, mark: Option<char>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => match chars.next() {
-                // CSI: up to its final byte.
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c) {
-                            break;
+        let kept = match c {
+            '\x1b' => {
+                match chars.next() {
+                    // CSI: up to its final byte, or the first byte no CSI holds.
+                    Some('[') => {
+                        while let Some(c) = chars.next_if(|c| ('\x20'..='\x7e').contains(c)) {
+                            if ('\x40'..='\x7e').contains(&c) {
+                                break;
+                            }
                         }
                     }
-                }
-                // OSC, DCS, SOS, PM, APC: up to BEL or ST.
-                Some(']' | 'P' | 'X' | '^' | '_') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\x07' {
-                            break;
-                        }
-                        if c == '\x1b' {
-                            chars.next_if_eq(&'\\');
-                            break;
+                    // OSC, DCS, SOS, PM, APC: up to BEL or ST, or the end of the line.
+                    Some(']' | 'P' | 'X' | '^' | '_') => {
+                        while let Some(c) = chars.next_if(|c| *c != '\n') {
+                            if c == '\x07' {
+                                break;
+                            }
+                            if c == '\x1b' {
+                                chars.next_if_eq(&'\\');
+                                break;
+                            }
                         }
                     }
+                    // Intermediate bytes, then one final byte (`ESC ( B`, `ESC 7`, `ESC c`).
+                    Some(c) if ('\x20'..='\x2f').contains(&c) => {
+                        while chars.next_if(|c| ('\x20'..='\x2f').contains(c)).is_some() {}
+                        chars.next();
+                    }
+                    _ => {}
                 }
-                // Intermediate bytes, then one final byte (`ESC ( B`, `ESC 7`, `ESC c`).
-                Some(c) if ('\x20'..='\x2f').contains(&c) => {
-                    while chars.next_if(|c| ('\x20'..='\x2f').contains(c)).is_some() {}
-                    chars.next();
-                }
-                _ => {}
-            },
-            '\r' if chars.peek() == Some(&'\n') => {}
-            '\r' => out.push('\n'),
-            '\n' | '\t' => out.push(c),
-            c if c.is_control() || turns(c) => {}
-            c => out.push(c),
-        }
+                None
+            }
+            '\r' if mark.is_some() => None,
+            '\r' if chars.peek() == Some(&'\n') => continue,
+            '\r' => Some('\n'),
+            '\n' | '\t' => Some(c),
+            c if c.is_control() || invisible(c) => None,
+            c => Some(c),
+        };
+        out.extend(kept.or(mark));
     }
     out
 }
@@ -1358,6 +1382,39 @@ impl Component for SystemCard {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Invisible format characters, line and paragraph separators and the Hangul fillers go
+    /// too (the zero-width joiner stays: emoji need it), and an escape string left open ends
+    /// at its line, so it never eats the daemon's words after it.
+    #[test]
+    fn safe_drops_invisible_characters_and_ends_an_open_escape_at_its_line() {
+        for c in [
+            '\u{200b}',
+            '\u{2060}',
+            '\u{feff}',
+            '\u{00ad}',
+            '\u{e0041}',
+            '\u{180e}',
+            '\u{206a}',
+            '\u{fff9}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{115f}',
+            '\u{3164}',
+            '\u{061c}',
+            '\u{202e}',
+        ] {
+            assert_eq!(safe(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+        }
+        assert_eq!(safe("👩\u{200d}💻"), "👩\u{200d}💻");
+        assert_eq!(
+            safe("Pay \"x\x1b]\"\nto evil.example for $500"),
+            "Pay \"x\nto evil.example for $500"
+        );
+        assert_eq!(safe("x\x1bP1;2\nok"), "x\nok");
+        assert_eq!(safe("x\x1b[12\nok"), "x\nok");
+        assert_eq!(safe("a\x1b]0;title\x07b"), "ab");
+    }
 
     fn text(view: &View, width: usize) -> String {
         let lines = view.root.render(width);
