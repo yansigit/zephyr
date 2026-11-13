@@ -16,8 +16,8 @@ reviewed (the new rpi binary, the new crates' build scripts), so the patch is un
         replaced by NEW (and OLD's minor by NEW's), and the Dockerfile's two rpi sha256s replaced
         by the release's own (the caller fetches them). Cargo.lock, parsed, keeps every package
         that is not an rpi-* crate exactly as it was, keyed by (name, version, source) with no key
-        twice, and every package it gains, and every rpi-* one, comes from crates.io with a
-        checksum.
+        twice, and every package it gains, and every rpi-* one (at NEW), comes from crates.io with a
+        checksum; no crate has more versions in it than in main's lock (a new crate, one).
 
 Exits 1, naming the first problem, when the patch is anything else."""
 import os
@@ -163,19 +163,29 @@ def packages(text, which):
     return {k: v for k, v in lock.items() if k != "package"}, by
 
 
-def check_lock(before, after):
+def check_lock(before, after, new):
     rest_was, was = packages(before, "the original")
     rest_now, now = packages(after, "the written")
     if rest_was != rest_now:
         fail("Cargo.lock: something besides its packages changed")
     crates_io = lambda p: p.get("source") == REGISTRY and SHA.fullmatch(str(p.get("checksum", "")))
+    rpi = lambda key: str(key[0]).startswith("rpi-")
     for key, p in was.items():
-        if not str(key[0]).startswith("rpi-") and now.get(key) != p:
+        if not rpi(key) and now.get(key) != p:
             fail(f"Cargo.lock: {key[0]} {key[1]} is moved or changed, and only the rpi crates may move; "
                  "this bump waits for a person")
     for key, p in now.items():
-        if (str(key[0]).startswith("rpi-") or key not in was) and not crates_io(p):
+        if (rpi(key) or key not in was) and not crates_io(p):
             fail(f"Cargo.lock: {key[0]} {key[1]} does not come from crates.io with a checksum")
+        if rpi(key) and key[1] != new:
+            fail(f"Cargo.lock: {key[0]} is at {key[1]}, not {new}")
+    # No crate gains a second version beside main's: a new one is a new name, once.
+    count = lambda lock: {n: sum(k[0] == n for k in lock) for n in {k[0] for k in lock}}
+    had, has = count(was), count(now)
+    for name, n in has.items():
+        if n > max(had.get(name, 0), 1):
+            fail(f"Cargo.lock: {name} is there {n} times, main's lock has it {had.get(name, 0)}; "
+                 "this bump waits for a person")
 
 
 def verify(old, new, amd64, arm64):
@@ -208,7 +218,7 @@ def verify(old, new, amd64, arm64):
         except UnicodeDecodeError:
             fail(f"{path}: what was written is not UTF-8")
         if path == "Cargo.lock":
-            check_lock(before, written)
+            check_lock(before, written, new)
         elif written != pinned(before, path, old, new, amd64, arm64):
             fail(f"{path}: what was written is not the move from rpi {old} to {new}")
 

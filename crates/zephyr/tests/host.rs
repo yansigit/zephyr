@@ -3994,6 +3994,27 @@ fn the_bump_check_passes_only_a_pin_move() {
             lines[n - 1]
         ),
     );
+    // A second serde beside main's, from crates.io with a checksum: still one version too many.
+    let second_serde = lock_hunk(
+        n,
+        &format!(
+            "@@ -{},3 +{},9 @@\n {}\n {}\n {}\n+\n+[[package]]\n+name = \"serde\"\n+version = \"1.0.999\"\n+{source}\n+checksum = \"{}\"\n",
+            n - 2,
+            n - 2,
+            lines[n - 3],
+            lines[n - 2],
+            lines[n - 1],
+            "0".repeat(64)
+        ),
+    );
+    // An rpi crate moved, but not to the new version.
+    let lock_pin = "+version = \"9.9.0\"\n";
+    assert!(good[section..end].contains(lock_pin));
+    let rpi_elsewhere = format!(
+        "{}{}",
+        &good[..section],
+        good[section..].replacen(lock_pin, "+version = \"9.9.1\"\n", 1)
+    );
     // The reviewer's: a `\ No newline` after a line of release.sh's hunk joins it to the next
     // (lines 40 and 41), which here hides the fetch's `v=` in a comment.
     let comment = "  # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.";
@@ -4016,6 +4037,8 @@ fn the_bump_check_passes_only_a_pin_move() {
         ("joined-lines", joined, "verify"),
         ("misplaced-lock-hunk", misplaced, "verify"),
         ("duplicate-git-serde", duplicate, "verify"),
+        ("second-serde", second_serde, "verify"),
+        ("rpi-not-at-new", rpi_elsewhere, "verify"),
         ("moved-serde", moved_serde, "verify"),
         (
             "git-source",
@@ -4056,11 +4079,19 @@ fn the_bump_check_passes_only_a_pin_move() {
         assert_eq!(at, *stage, "{name}: {err}");
         assert!(err.starts_with("bump-check: "), "{name}: {err}");
     }
-    let (_, err) = try_patch("moved-serde", &cases[3].1, pins);
+    let refusal = |name: &str| {
+        let (_, patch, _) = cases.iter().find(|c| c.0 == name).unwrap();
+        try_patch(name, patch, pins).1
+    };
+    let err = refusal("moved-serde");
     assert!(
-        err.contains("serde") && err.contains("waits for a person"),
+        err.contains("serde 1.0.") && err.contains("waits for a person"),
         "{err}"
     );
+    let err = refusal("second-serde");
+    assert!(err.contains("serde is there 2 times"), "{err}");
+    let err = refusal("rpi-not-at-new");
+    assert!(err.contains("is at 9.9.1, not 9.9.0"), "{err}");
     // The release's own sha256s, which the push job fetches, must be the ones written.
     let (at, err) = try_patch("good", &good, ["9.8.7", "9.9.0", &"1".repeat(64), &arm64]);
     assert_eq!(at, "verify", "{err}");
