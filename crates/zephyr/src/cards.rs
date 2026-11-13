@@ -1074,6 +1074,7 @@ async fn issue_card(
             eprintln!("zephyr: recording card #{id}'s close failed: {e}");
         }
         poll_now(cfg, id);
+        close_in_hand(cfg, id);
         let said = close_at_issuer(cfg, &mut card).await;
         say(cfg, card, Word::Closed(LANDED.into(), said));
         return Err(format!("card #{id} was not issued: {LANDED}"));
@@ -1773,6 +1774,10 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
     live::forget(cfg.state_dir(), card.id, now);
     // This close is in hand: the tick's retry waits its turn.
     poll_now(cfg, card.id);
+    // One already at the issuer is the close; its answer is recorded as any other.
+    if !close_in_hand(cfg, card.id) {
+        return;
+    }
     let (cfg, why) = (cfg.clone(), why.to_string());
     let mut card = card;
     tokio::spawn(async move {
@@ -1927,6 +1932,34 @@ fn poll_due(cfg: &Config, id: i64) -> bool {
     }
 }
 
+/// The cards with a close at their issuer in hand, by state folder: from when it is asked until
+/// its answer (`Word::Closed`, `Word::UsedClosed`) is recorded, whatever it takes, no other close
+/// or state of the card is asked.
+static CLOSES: Mutex<Vec<(PathBuf, i64)>> = Mutex::new(Vec::new());
+
+/// Notes a close of card `id` in hand; `false` when one already is, and none must be asked.
+fn close_in_hand(cfg: &Config, id: i64) -> bool {
+    let mut all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    let state = cfg.state_dir();
+    if all.iter().any(|(s, c)| s == state && *c == id) {
+        return false;
+    }
+    all.push((state.to_path_buf(), id));
+    true
+}
+
+/// Whether a close of card `id` is in hand.
+fn closing_now(cfg: &Config, id: i64) -> bool {
+    let all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter().any(|(s, c)| s == cfg.state_dir() && *c == id)
+}
+
+/// The close of card `id` was answered, and its word is being recorded.
+fn close_answered(cfg: &Config, id: i64) {
+    let mut all = CLOSES.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(s, c)| !(s == cfg.state_dir() && *c == id));
+}
+
 /// Notes that card `id` is polled now, whatever its last poll: a close or an ask in hand puts
 /// the tick's next one a full interval off, so it never asks for a second close meanwhile.
 fn poll_now(cfg: &Config, id: i64) {
@@ -1970,8 +2003,14 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     for (card, word) in words {
         match word {
             Word::State(state) => stated(cfg, store, card, state, now),
-            Word::Closed(why, said) => closed(cfg, store, &card, &why, said, now),
-            Word::UsedClosed(what, said) => used_closed(cfg, store, &card, &what, said),
+            Word::Closed(why, said) => {
+                close_answered(cfg, card.id);
+                closed(cfg, store, &card, &why, said, now)
+            }
+            Word::UsedClosed(what, said) => {
+                close_answered(cfg, card.id);
+                used_closed(cfg, store, &card, &what, said)
+            }
             Word::Settled(why, state) => match state {
                 Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
                 _ => closed_now(cfg, store, &card, &why, now),
@@ -1988,9 +2027,12 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
         // A close the issuer refused is asked again; a card that may have been charged is
         // asked about first, so a charge is not missed ([`stated`] closes it again).
         if card.status == "closing" {
-            if card.provider_ref.is_some() && poll_due(cfg, card.id) {
-                let state = chargeable(cfg, &card);
-                asks.push((card, (!state).then_some(RETRY)));
+            // A close at the issuer now is answered first, however long it takes.
+            if card.provider_ref.is_some() && !closing_now(cfg, card.id) && poll_due(cfg, card.id) {
+                let close = (!chargeable(cfg, &card)).then_some(RETRY);
+                if close.is_none() || close_in_hand(cfg, card.id) {
+                    asks.push((card, close));
+                }
             }
             continue;
         }
@@ -2005,7 +2047,9 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
                 true => "expired unused",
                 false => "it is past its time",
             };
-            asks.push((card, Some(why)));
+            if close_in_hand(cfg, card.id) {
+                asks.push((card, Some(why)));
+            }
             continue;
         }
         // A card the issuer has not made yet is not asked about: its issue is in hand.
@@ -2064,6 +2108,9 @@ fn stated(
             let Some(mut card) = fresh.filter(|c| c.status == "closing") else {
                 return;
             };
+            if !close_in_hand(cfg, card.id) {
+                return;
+            }
             poll_now(cfg, card.id);
             let cfg = cfg.clone();
             tokio::spawn(async move {
@@ -2151,6 +2198,9 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
     text.iter().for_each(|text| tell(store, &card, text));
     let what = charged(first);
     audit(cfg, store, &card, "charge", &what);
+    if !close_in_hand(cfg, card.id) {
+        return;
+    }
     let (cfg, mut card) = (cfg.clone(), card);
     tokio::spawn(async move {
         let said = close_at_issuer(&cfg, &mut card).await;
@@ -2723,6 +2773,50 @@ mod tests {
             .filter(|o| o.text.contains("delete the card there"))
             .count();
         assert_eq!(reminders, 1);
+    }
+
+    /// A close slower than the poll interval is still the one close at the issuer: while it
+    /// is in hand, no tick asks for another.
+    #[tokio::test]
+    async fn a_slow_close_is_asked_once() {
+        let dir = crate::test_dir("cards-close-slow");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        cfg.tick = std::time::Duration::from_millis(100);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        // 1.5 s at the issuer, past two and a half poll intervals (6 ticks of 100 ms).
+        Fake::script(&cfg, |s| {
+            s.close_delay = std::time::Duration::from_millis(1500)
+        });
+        ask_close(
+            &cfg,
+            &store,
+            store.card(id).unwrap().unwrap(),
+            "the owner said it is done",
+        );
+        for _ in 0..9 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tick(&cfg, &store, crate::now());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tick(&cfg, &store, crate::now());
+        let closes = Fake::script(&cfg, |s| {
+            s.log.iter().filter(|l| l.starts_with("close")).count()
+        });
+        assert_eq!(closes, 1);
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the
