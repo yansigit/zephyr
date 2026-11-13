@@ -374,6 +374,9 @@ mod tests {
             "create_repository_ruleset",
             "custom_properties_write",
             "projects_write",
+            "hide_pull_request_review",
+            "unhide_pull_request_review",
+            "issue_artifact_write",
         ];
         let notion = [
             "API-patch-page",
