@@ -288,7 +288,11 @@ fn spoken(view: &[Piece]) -> Vec<Piece> {
         ('팔', '8'),
         ('구', '9'),
     ];
-    let latin = |c: char| c.is_alphabetic() && !('\u{ac00}'..='\u{d7a3}').contains(&c);
+    // A combining mark belongs to its word, so a decomposed `zéro` is one word.
+    let latin = |c: char| {
+        (c.is_alphabetic() || unicode_normalization::char::is_combining_mark(c))
+            && !('\u{ac00}'..='\u{d7a3}').contains(&c)
+    };
     let mut out = Vec::new();
     let mut i = 0;
     while i < view.len() {
@@ -303,8 +307,24 @@ fn spoken(view: &[Piece]) -> Vec<Piece> {
             .iter()
             .position(|p| !latin(p.0))
             .map_or(view.len(), |n| i + n);
-        let word: String = view[i..end].iter().map(|p| p.0).collect();
-        match WORDS.iter().find(|(w, _)| *w == norm(&word)) {
+        // No digit word is over 6 letters (with a decomposed accent, 7 characters): a longer
+        // word is never built and normalized.
+        let letters = &view[i..end];
+        let digit = match letters.len() {
+            2..=7 if letters.iter().all(|p| p.0.is_ascii()) => WORDS.iter().find(|(w, _)| {
+                w.len() == letters.len()
+                    && w.bytes()
+                        .zip(letters)
+                        .all(|(b, p)| p.0.eq_ignore_ascii_case(&char::from(b)))
+            }),
+            2..=7 => {
+                let w: String = letters.iter().flat_map(|p| p.0.to_lowercase()).collect();
+                let w: String = w.nfc().collect();
+                WORDS.iter().find(|(word, _)| *word == w)
+            }
+            _ => None,
+        };
+        match digit {
             Some((_, d)) => out.push((*d, from, view[end - 1].2)),
             None => out.extend_from_slice(&view[i..end]),
         }
@@ -313,9 +333,16 @@ fn spoken(view: &[Piece]) -> Vec<Piece> {
     out
 }
 
-/// The digit runs in `view` as (byte start, byte end, digits): a run is digits with the
-/// separators phone numbers and card numbers are written with between them.
-fn runs(view: &[Piece]) -> Vec<(usize, usize, String)> {
+/// One run of digits: each digit's byte range, the digits, and whether a `+` is right before it.
+struct Run {
+    at: Vec<(usize, usize)>,
+    digits: String,
+    plus: bool,
+}
+
+/// The digit runs in `view`: a run is digits with the separators phone numbers and card
+/// numbers are written with between them.
+fn runs(view: &[Piece]) -> Vec<Run> {
     let digit = |c: char| -> Option<char> {
         let mut it = c.to_string().nfkc().collect::<Vec<_>>().into_iter();
         match (it.next(), it.next()) {
@@ -324,17 +351,25 @@ fn runs(view: &[Piece]) -> Vec<(usize, usize, String)> {
         }
     };
     let mut out = Vec::new();
-    let mut cur: Option<(usize, usize, String)> = None;
+    let mut cur: Option<Run> = None;
+    let mut before = None;
     for &(c, from, to) in view {
         match (digit(c), &mut cur) {
             (Some(d), Some(run)) => {
-                run.1 = to;
-                run.2.push(d);
+                run.at.push((from, to));
+                run.digits.push(d);
             }
-            (Some(d), None) => cur = Some((from, to, d.to_string())),
+            (Some(d), None) => {
+                cur = Some(Run {
+                    at: vec![(from, to)],
+                    digits: d.to_string(),
+                    plus: before == Some('+'),
+                })
+            }
             (None, Some(_)) if separator(c) => {}
             (None, _) => out.extend(cur.take()),
         }
+        before = Some(c);
     }
     out.extend(cur);
     out
@@ -351,12 +386,32 @@ fn untrunked(digits: &str) -> &str {
     }
 }
 
-/// Whether the digits `run` are the digits `value` written another way: one inside the other, or
-/// one the other with a country code (up to three digits) in front, trunk zeros aside
-/// (`+82 10…` is `010…`).
-fn same_number(value: &str, run: &str) -> bool {
-    let (v, r) = (untrunked(value), untrunked(run));
-    r.contains(v) || (r.len() >= MIN_DIGITS && v.ends_with(r) && v.len() <= r.len() + 3)
+/// Where in `run` (a range of its digits) the digits `value` are, written another way: the value
+/// inside the run, the run the value without a country code (up to three digits), or the value
+/// without its country code inside the run, trunk zeros aside (`+82 10…` is `010…`). The range
+/// takes in the trunk zeros before it, and the country code of a run written `+CC…`.
+fn same_number(value: &str, run: &Run) -> Option<(usize, usize)> {
+    let (v, r) = (untrunked(value), untrunked(&run.digits));
+    let zeros = run.digits.len() - r.len();
+    if r.len() >= MIN_DIGITS && v.ends_with(r) && v.len() <= r.len() + 3 {
+        return Some((0, run.digits.len()));
+    }
+    let (at, len) = std::iter::once(v)
+        .chain(
+            (1..=3)
+                .filter(|k| v.len() >= k + MIN_DIGITS)
+                .map(|k| &v[k..]),
+        )
+        .find_map(|v| r.find(v).map(|at| (zeros + at, v.len())))?;
+    let digits = run.digits.as_bytes();
+    let mut from = at;
+    while from > 0 && digits[from - 1] == b'0' {
+        from -= 1;
+    }
+    if run.plus && from <= 3 {
+        from = 0;
+    }
+    Some((from, at + len))
 }
 
 /// Whether the fact's value is long enough to be looked for at all.
@@ -398,9 +453,9 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
     let views = std::iter::once(raw(text)).chain(decoded(text)).map(visible);
     for view in views {
         if f.kind == FactKind::Digits {
-            for (a, b, run) in runs(&spoken(&view)) {
-                if same_number(&value, &run) {
-                    out.push((a, b));
+            for run in runs(&spoken(&view)) {
+                if let Some((from, to)) = same_number(&value, &run) {
+                    out.push((run.at[from].0, run.at[to - 1].1));
                 }
             }
         }
@@ -851,6 +906,49 @@ mod tests {
         ] {
             assert!(found(&phone, text, None).is_empty(), "{text}");
         }
+    }
+
+    /// PR #70 review: a digit beside the number (a spoken one, one after a comma) makes the run
+    /// longer; the number in it is still found, and only the number is scrubbed.
+    #[test]
+    fn a_number_inside_a_longer_run_is_found_and_scrubbed_alone() {
+        let ca = [fact("phone", FactKind::Digits, "+1 416 555 0142")];
+        for (text, scrubbed) in [
+            (
+                "Table for two. 416 555 0142.",
+                "Table for two. [fact:phone].",
+            ),
+            ("Table for 2. 416 555 0142.", "Table for 2. [fact:phone]."),
+            ("Call 416-555-0142, 2 people", "Call [fact:phone], 2 people"),
+            ("Ann,416-555-0142,3", "Ann,[fact:phone],3"),
+            ("416 555 0142 one more thing", "[fact:phone] one more thing"),
+            (
+                "mon numéro: 416 555 0142 un instant",
+                "mon numéro: [fact:phone] un instant",
+            ),
+            // The country code said too is the whole value.
+            ("one, 416 555 0142", "[fact:phone]"),
+            ("call +1 (416) 555-0142 now", "call +[fact:phone] now"),
+        ] {
+            assert_eq!(found(&ca, text, None), ["phone"], "{text}");
+            assert_eq!(scrub(&ca, text), scrubbed, "{text}");
+        }
+        let kr = [fact("phone", FactKind::Digits, "+82 10-1234-5678")];
+        for (text, scrubbed) in [
+            (
+                "제 번호는 010-1234-5678이에요",
+                "제 번호는 [fact:phone]이에요",
+            ),
+            ("이 010-1234-5678 번호로", "이 [fact:phone] 번호로"),
+            ("010-1234-5678입니다", "[fact:phone]입니다"),
+        ] {
+            assert_eq!(found(&kr, text, None), ["phone"], "{text}");
+            assert_eq!(scrub(&kr, text), scrubbed, "{text}");
+        }
+        // A decomposed accent is the same word.
+        let phone = [fact("phone", FactKind::Digits, "4165550142")];
+        let nfd = "quatre un six cinq cinq cinq ze\u{301}ro un quatre deux";
+        assert_eq!(found(&phone, nfd, None), ["phone"]);
     }
 
     #[test]
