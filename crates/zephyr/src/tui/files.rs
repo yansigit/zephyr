@@ -23,7 +23,7 @@ const FIRST_LINE_BYTES: u64 = 4 * 1024;
 /// not a regular file: opened without following a link or waiting on a FIFO's writer, and
 /// checked on the open descriptor, so a FIFO cannot hang the UI loop nor a sparse 20 GB file
 /// fill its memory.
-fn read_capped(path: &Path, cap: u64) -> Option<String> {
+pub(super) fn read_capped(path: &Path, cap: u64) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = (std::fs::OpenOptions::new().read(true))
