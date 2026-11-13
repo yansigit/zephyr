@@ -923,6 +923,19 @@ fn audit(cfg: &Config, store: &Store, card: &Card, tool: &str, outcome: &str) {
     crate::gate::audit_row(store, "card", tool, &args, &outcome);
 }
 
+/// A reminder to delete hand-made `card`, and the mark that it went (`told_at`), in one write:
+/// a reminder sent with no mark would go again on every tick, so neither lands without the
+/// other, and the tick tries again.
+fn remind(store: &Store, card: &Card, text: &str, now: i64) {
+    log(store.atomically(|store| {
+        store.card_told(card.id, now)?;
+        match card.channel.is_empty() {
+            true => store.notify_last_owner(text),
+            false => store.notify(&card.channel, &card.sender, text),
+        }
+    }));
+}
+
 /// A notice about `card` for its owner, after its change landed: one that cannot be written now
 /// is owed to a later tick (`Store::owe_notice`).
 fn tell(store: &Store, card: &Card, text: &str) {
@@ -1848,10 +1861,10 @@ fn closed_now(cfg: &Config, store: &Store, card: &Card, why: &str, now: i64) {
     {
         return;
     }
-    if to == "unknown" && why != RETRY && why != LANDED {
-        log(store.card_told(card.id, now));
+    match to == "unknown" && why != RETRY && why != LANDED {
+        true => remind(store, card, &owner, now),
+        false => tell(store, card, &owner),
     }
-    tell(store, card, &owner);
     audit(cfg, store, card, "close", why);
     let text = format!("{why}; the card is closed and cannot be filled");
     note(store, card, "closed", &text);
@@ -1967,9 +1980,7 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     }
     for card in store.cards_in(&["unknown"]).unwrap_or_default() {
         if card.provider == "manual" && card.told_at.is_none_or(|at| at + 86_400 <= now) {
-            let text = delete_it(&card, "it is past its time");
-            log(store.card_told(card.id, now));
-            tell(store, &card, &text);
+            remind(store, &card, &delete_it(&card, "it is past its time"), now);
         }
     }
     let mut asks: Vec<(Card, Option<&'static str>)> = Vec::new();
@@ -2667,6 +2678,51 @@ mod tests {
             s.log.iter().filter(|l| l.starts_with("close")).count()
         });
         assert_eq!(closes, 1);
+    }
+
+    /// A reminder to delete a hand-made card and the mark that it was sent are one write: when
+    /// the mark cannot be written, no reminder goes, so the next tick does not send another.
+    #[tokio::test]
+    async fn a_reminder_goes_only_with_its_mark() {
+        let dir = crate::test_dir("cards-reminder-told");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'manual'\n");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "manual".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            channel: "chat".into(),
+            sender: "o".into(),
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store
+            .move_card(id, &["waiting"], "unknown", crate::now())
+            .unwrap());
+        let block = "CREATE TRIGGER no_told BEFORE UPDATE OF told_at ON cards \
+                     BEGIN SELECT RAISE(ABORT, 'no told'); END";
+        store.db_for_test().execute_batch(block).unwrap();
+        tick(&cfg, &store, crate::now());
+        tick(&cfg, &store, crate::now());
+        let reminders = (store.pending_outbox().unwrap().into_iter())
+            .filter(|o| o.text.contains("delete the card there"))
+            .count();
+        assert_eq!(reminders, 0);
+        store
+            .db_for_test()
+            .execute_batch("DROP TRIGGER no_told")
+            .unwrap();
+        tick(&cfg, &store, crate::now());
+        tick(&cfg, &store, crate::now());
+        let reminders = (store.pending_outbox().unwrap().into_iter())
+            .filter(|o| o.text.contains("delete the card there"))
+            .count();
+        assert_eq!(reminders, 1);
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the
