@@ -779,6 +779,35 @@ async fn hangup_ends_the_call_at_once() {
     gw.shutdown().await;
 }
 
+/// Telnyx stops reading the media socket mid-line: the first send that cannot go drops the
+/// socket, so the rest of the line does not wait out a send each and the call ends at once.
+#[tokio::test]
+async fn a_media_socket_that_stops_reading_ends_the_call() {
+    let (gw, _telnyx) = start("deaf", "stream\ndeaf\nanswer\n", "Hello.", "", |cfg| {
+        // The opening line is far more audio than the socket's buffers hold.
+        std::fs::write(cfg.voice_dir.join("piper_pad"), "8000000").unwrap();
+    })
+    .await;
+    gw.ask_and_approve().await;
+    let store = gw.store();
+    wait(120, || {
+        let lines = store.call_lines(1).unwrap();
+        lines
+            .iter()
+            .any(|l| l.2.starts_with("Hello, this is an AI assistant"))
+    })
+    .await;
+    let opened = std::time::Instant::now();
+    gw.typed("h", "/hangup").await;
+    let ended = gw.ended().await;
+    assert!(
+        opened.elapsed() < Duration::from_secs(45),
+        "{ended} after {:?}",
+        opened.elapsed()
+    );
+    gw.shutdown().await;
+}
+
 /// A `/hangup` that comes after the `/ok` but before the dial: nobody is rung.
 #[tokio::test]
 async fn a_hangup_before_the_dial_dials_nobody() {

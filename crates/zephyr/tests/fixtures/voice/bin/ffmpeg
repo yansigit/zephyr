@@ -21,6 +21,8 @@ line for each utterance or line they answer, all with the one pid, and write tha
   setsid      the same in a session of its own, out of the process group; `setsid.pid`
   slow        whisper takes 0.3 s, so two runs would overlap if they could
   piper_fail  Piper exits 1; the warm one at its next line
+  piper_pad   the warm Piper adds that many bytes of audio to each line (a line that takes long
+              to send)
 
 Keep the argv this reads and the lines it prints in step with voice.rs (`whisper_args`,
 `detected`, `piper_args`, `decode_args`, `encode_args`, `server_args`, `PIPER_LINES`, `ask_ear`).
@@ -160,7 +162,7 @@ elif prog == "python" and "-c" in argv:
         data = json.loads(line).encode()
         if marker("piper_fail") is not None:
             sys.exit(1)
-        pcm = b"pcm:" + data
+        pcm = b"pcm:" + data + b"\xff" * int(marker("piper_pad", "0"))
         sys.stdout.buffer.write(struct.pack("<I", len(pcm)) + pcm)
         sys.stdout.buffer.flush()
         done(data)

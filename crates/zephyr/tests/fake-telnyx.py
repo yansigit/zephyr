@@ -40,6 +40,8 @@ Script steps (default script: `stream`, `answer`):
   said TEXT     Telnyx heard the other party say TEXT: a signed `call.transcription` webhook
                 (Telnyx's own speech, `calls.speech = "provider"`)
   wait SECS     sleep
+  deaf          stop reading the media socket (after the frame being read), so zephyr's sends
+                block once the socket's buffers are full
   expect TEXT   wait (up to 120 s) until what zephyr said on the line holds TEXT
   hangup        the other party hangs up: `stop` on the socket, it closes, `call.hangup` is posted
   (end of script) the socket stays open, silent, until zephyr hangs up through the API
@@ -154,6 +156,7 @@ class Stream:
     def __init__(self, call, how="", reuse=None):
         url = call["stream_url"]
         self.call, self.sock, self.open, self.send_lock = call, None, False, threading.Lock()
+        self.deaf = False
         self.headers = reuse or headers(url.encode(), how)
         path = "/calls/nowhere" if how == "badpath" else path_of(url)
         status = 0
@@ -206,6 +209,8 @@ class Stream:
     def reader(self):
         try:
             while True:
+                while self.deaf:
+                    time.sleep(0.05)
                 b = self.file.read(2)
                 if len(b) < 2:
                     break
@@ -237,6 +242,7 @@ class Stream:
         log("events.jsonl", {"closed": True})
 
     def close(self, stop=False):
+        self.deaf = False
         if self.sock is None:
             return
         if stop and self.open:
@@ -278,6 +284,8 @@ def run(call):
         elif step[0] == "said":
             webhook(call, "call.transcription", more={"transcription_data": {
                 "transcript": line.split(None, 1)[1], "is_final": True, "confidence": 0.93}})
+        elif step[0] == "deaf" and stream:
+            stream.deaf = True
         elif step[0] == "wait":
             call["over"].wait(float(step[1]))
         elif step[0] == "expect":
