@@ -71,6 +71,18 @@ static OWED: std::sync::Mutex<Vec<Owed>> = std::sync::Mutex::new(Vec::new());
 /// The most notices owed at once; past it the oldest is dropped, with a log line.
 const MAX_OWED: usize = 256;
 
+/// Writes `owed` in order with `write`, and returns what is still owed: from the first that
+/// fails on, untried, since the next one would fail the same way.
+fn retry<T>(owed: Vec<T>, mut write: impl FnMut(&T) -> bool) -> Vec<T> {
+    let mut owed = owed.into_iter();
+    for o in owed.by_ref() {
+        if !write(&o) {
+            return std::iter::once(o).chain(owed).collect();
+        }
+    }
+    Vec::new()
+}
+
 /// The largest amount a payment row holds, in minor units (10 billion in a two-decimal
 /// currency): a larger one is just huge, and many of them still sum within an `i64`.
 pub const MAX_MINOR: i64 = 1_000_000_000_000;
@@ -1738,15 +1750,19 @@ impl Store {
         last_owner_in(&self.db)
     }
 
+    /// A notice for the owner on `channel`, or the owner last answered when it is empty.
+    fn notice(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
+        match channel.is_empty() {
+            true => self.notify_last_owner(text),
+            false => self.notify(channel, recipient, text),
+        }
+    }
+
     /// A notice for the owner on `channel` (empty: the owner last answered) about a change that
     /// has landed whatever comes of the notice: one that cannot be written now is owed, and a
     /// later tick writes it ([`Store::retry_owed`]).
     pub fn owe_notice(&self, channel: &str, recipient: &str, text: &str) {
-        let told = match channel.is_empty() {
-            true => self.notify_last_owner(text),
-            false => self.notify(channel, recipient, text),
-        };
-        if let Err(e) = told {
+        if let Err(e) = self.notice(channel, recipient, text) {
             eprintln!("zephyr: a notice to the owner could not be written, tried again: {e}");
             let mut owed = OWED.lock().unwrap_or_else(|e| e.into_inner());
             if owed.len() >= MAX_OWED {
@@ -1770,8 +1786,17 @@ impl Store {
             *all = rest;
             mine
         };
-        for (_, channel, recipient, text) in mine {
-            self.owe_notice(&channel, &recipient, &text);
+        let left = retry(mine, |(_, channel, recipient, text)| {
+            self.notice(channel, recipient, text).is_ok()
+        });
+        if !left.is_empty() {
+            eprintln!(
+                "zephyr: {} notices to the owner still cannot be written; tried again on the next \
+                 tick",
+                left.len()
+            );
+            let mut all = OWED.lock().unwrap_or_else(|e| e.into_inner());
+            all.splice(0..0, left);
         }
     }
 
@@ -4293,6 +4318,20 @@ mod tests {
             store.db.query_row(sql, params![id], |r| r.get(0)).unwrap()
         };
         assert_eq!(minor(row), 500, "the new payment is not the old card's");
+    }
+
+    /// A pass over the owed notices stops at the first that fails: the rest would fail the same
+    /// way, and stay owed in their order.
+    #[test]
+    fn a_retry_stops_at_the_first_notice_that_fails() {
+        let mut tried = 0;
+        let left = super::retry(vec![1, 2, 3], |_| {
+            tried += 1;
+            false
+        });
+        assert_eq!((tried, left), (1, vec![1, 2, 3]));
+        let left = super::retry(vec![1, 2, 3], |n| *n != 2);
+        assert_eq!(left, vec![2, 3]);
     }
 
     #[test]
