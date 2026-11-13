@@ -609,6 +609,12 @@ label admitted.
 - **Unknown exec requests get a throw.** An exec member the provider has no shape for is answered
   with an `ExecClientThrow` (`UNSUPPORTED_EXEC_REQUEST`), not ignored: an unanswered request stalls
   the turn forever while the server keeps heartbeating.
+- **Through the proxy.** The child runs as the agent, which under the network floor (§4.20) reaches
+  nothing but the proxy, so the stream honours `https_proxy`/`HTTPS_PROXY` (`http_proxy` for an
+  `http://` test URL) unless `NO_PROXY` names the host: it sends `CONNECT host:port` with a `Host`
+  header, reads at most 8 KiB up to a 200 and the blank line within the connect timeout, and runs
+  TLS and HTTP/2 over the tunnel. The key exchange goes through `reqwest`, which reads the same
+  variables.
 - **Credentials.** rpi resolves the account's key into `opts.api_key` (§4.7: `[[account]]`, `auth.json`);
   `CURSOR_API_KEY` is the env door for an operator-supplied key. The key is exchanged for a
   short-lived bearer token (`/auth/exchange_user_api_key`, refreshed at `/auth/refresh`) held in the
