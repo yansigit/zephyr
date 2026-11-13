@@ -16,6 +16,7 @@ keeps its state in DIR:
                {"webhook": <event type>, "status": <HTTP status>}, {"mark": <name>},
                {"clear": true}, {"dtmf": <digits>}, {"hangup": "api"}, {"closed": true}
   heard.ulaw   every byte of audio zephyr sent, in order
+  steps.jsonl  each script step as it finishes: {"step", "at": unix seconds} (for turn times)
 
 API: `POST /v2/calls` answers {"data": {"call_control_id": "fake-<n>", ...}} and starts the
 script; `POST /v2/calls/<id>/actions/hangup` ends the call (the socket closes, a `call.hangup`
@@ -294,6 +295,7 @@ def run(call):
             call["over"].set()
             webhook(call, "call.hangup")
             return
+        log("steps.jsonl", {"step": step[0], "at": time.time()})
     call["over"].wait(120)
     if stream:
         stream.close(stop=True)

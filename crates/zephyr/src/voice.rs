@@ -6,9 +6,13 @@
 //!
 //! A reply can also be spoken: Piper makes the speech and ffmpeg encodes it, the same way.
 //!
+//! A phone call with `calls.speech = "local"` keeps one whisper-server and one Piper loaded for
+//! its length (`Call`, DESIGN §4.26), as `CALL_UID`, which the floor also gives no network.
+//!
 //! The real binaries' argv and output shapes are in `decode_args`, `whisper_args`, `detected`,
-//! `piper_args` and `encode_args` alone; `tests/fixtures/voice/bin/ffmpeg` is their stand-in
-//! and reads the same.
+//! `piper_args`, `encode_args`, `server_args`, `PIPER_LINES` and `ask_ear` (the request to the
+//! server and the reading of its reply) alone; `tests/fixtures/voice/bin/ffmpeg` is their
+//! stand-in and reads the same.
 
 use crate::config::Config;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -23,6 +27,10 @@ use tokio::io::AsyncReadExt;
 pub const DIR: &str = "/opt/zephyr/voice";
 /// The uid and gid the decoders run as.
 pub const NOBODY: u32 = 65534;
+/// The uid and gid a phone call's whisper-server and Piper run as (`zephyr-call` in the image,
+/// no shell, no home; DESIGN §4.26): not `nobody`, so a call and a voice note never wait on
+/// each other, and neither's sweep can take the other's processes.
+pub const CALL_UID: u32 = 65533;
 /// `voice.reply`'s values.
 pub const REPLIES: [&str; 3] = ["off", "mirror", "always"];
 /// whisper's language codes, the only values `voice.languages` takes.
@@ -239,22 +247,53 @@ fn root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The one variable a decoder gets when the daemon is not root, and so cannot drop to
-/// `nobody`: this process's own mark, by which `sweep` finds what its runs left.
-fn mark() -> (&'static str, &'static str) {
-    static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let value = MARK.get_or_init(|| format!("{}-{}", std::process::id(), crate::unix_millis()));
-    ("ZEPHYR_VOICE_RUN", value)
+/// Whose a run of the voice programs is: a voice note's or a spoken reply's (`nobody`, one at a
+/// time), or a phone call's (`CALL_UID`, one call at a time). Each has its uid, its `Turn` and
+/// its sweep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Who {
+    Note,
+    Call,
 }
 
-/// Kills whatever the voice programs left running. A process group does not hold a decoder
-/// that calls `setsid`, so this goes by what it cannot shed: as root, every process whose real
-/// uid is 65534, which runs nothing but these programs, one run at a time (`Turn`). When the
-/// daemon is not root nothing was dropped to `nobody`, and it is every process of the daemon's
-/// own uid that carries this process's `mark` in its environment: enough for a test, which
+impl Who {
+    /// The uid and gid its programs run as when the daemon is root.
+    fn uid(self) -> u32 {
+        match self {
+            Who::Note => NOBODY,
+            Who::Call => CALL_UID,
+        }
+    }
+
+    /// The uid its programs do run as: `uid`, or the daemon's own when it is not root.
+    fn runs_as(self) -> u32 {
+        // Safety: geteuid cannot fail.
+        match root() {
+            true => self.uid(),
+            false => unsafe { libc::geteuid() },
+        }
+    }
+
+    /// The one variable its programs get when the daemon is not root, and so cannot drop to
+    /// their uid: this process's own mark, by which `sweep` finds what its runs left.
+    fn mark(self) -> (&'static str, &'static str) {
+        static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let value = MARK.get_or_init(|| format!("{}-{}", std::process::id(), crate::unix_millis()));
+        match self {
+            Who::Note => ("ZEPHYR_VOICE_RUN", value),
+            Who::Call => ("ZEPHYR_VOICE_CALL", value),
+        }
+    }
+}
+
+/// Kills whatever `who`'s programs left running. A process group does not hold a decoder that
+/// calls `setsid`, so this goes by what it cannot shed: as root, every process whose real uid
+/// is `who`'s, which runs nothing but these programs, one run (or call) at a time (`Turn`).
+/// When the daemon is not root nothing was dropped to that uid, and it is every process of the
+/// daemon's own uid that carries `who`'s `mark` in its environment: enough for a test, which
 /// must never kill a stranger's process, and no boundary, since a process can rewrite its own.
-fn sweep() {
-    let (name, value) = mark();
+fn sweep(who: Who) {
+    let (name, value) = who.mark();
     let mark = format!("{name}={value}");
     // Safety: getuid cannot fail.
     let me = unsafe { libc::getuid() };
@@ -262,10 +301,10 @@ fn sweep() {
         std::fs::read(format!("/proc/{pid}/environ"))
             .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == mark.as_bytes()))
     };
-    // By uid only in the floored container, whose pid namespace holds nothing else of nobody's:
-    // never a root daemon on a host, where uid 65534 runs other people's services.
+    // By uid only in the floored container, whose pid namespace holds nothing else of these
+    // uids': never a root daemon on a host, where uid 65534 runs other people's services.
     let left = |pid: i32, uid: u32| match root() && crate::egress::bridge() {
-        true => uid == NOBODY,
+        true => uid == who.uid(),
         false => uid == me && pid != std::process::id() as i32 && marked(pid),
     };
     // Again while something was found: a process may fork as it is killed.
@@ -276,35 +315,43 @@ fn sweep() {
     }
 }
 
-/// The one turn the voice programs run in, transcription and speech alike: `sweep` kills
-/// every process of `nobody`, so no other run of theirs may be going. When the turn ends, also
-/// by its future being dropped mid-run (the adapter's task aborted, a timeout around it), what
-/// it left is swept before the next one starts.
-struct Turn(#[allow(dead_code)] tokio::sync::SemaphorePermit<'static>);
+/// The one turn `who`'s programs run in: for notes, transcription and speech alike; for a
+/// call, its whole length. `sweep` kills every process of `who`'s uid, so no other run of
+/// theirs may be going. When the turn ends, also by its future being dropped mid-run (the
+/// adapter's task aborted, a timeout around it), what it left is swept before the next one.
+struct Turn(
+    #[allow(dead_code)] tokio::sync::SemaphorePermit<'static>,
+    Who,
+);
 
 impl Turn {
-    async fn take() -> Turn {
-        static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-        Turn(ONE.acquire().await.expect("never closed"))
+    async fn take(who: Who) -> Turn {
+        static NOTE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        static CALL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let one = match who {
+            Who::Note => &NOTE,
+            Who::Call => &CALL,
+        };
+        Turn(one.acquire().await.expect("never closed"), who)
     }
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        sweep();
+        sweep(self.1);
     }
 }
 
-/// Runs `prog` as `nobody` (when the daemon is root: decision 2 of the lane's plan) with a
-/// cleared environment, in `/`, in its own process group, at nice 10, each of `fds` at its
-/// number, and kills the group at `limit`.
-async fn run(
+/// `prog` as the decoders run: as `who`'s uid (when the daemon is root: decision 2 of the lane's
+/// plan) with a cleared environment, in `/`, in its own process group, at nice 10, each of `fds`
+/// at its number, its stdout and stderr piped.
+fn command(
     prog: &Path,
     args: &[String],
     fds: &[(&Mem, i32)],
     stdin: Stdio,
-    limit: Duration,
-) -> Result<Out, Stop> {
+    who: Who,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(args)
         .env_clear()
@@ -316,11 +363,11 @@ async fn run(
         .kill_on_drop(true);
     if root() {
         // std also drops the supplementary groups, and with the uid go the capabilities.
-        cmd.uid(NOBODY).gid(NOBODY);
+        cmd.uid(who.uid()).gid(who.uid());
     } else {
         // No uid to tell the run's processes by (a test, a daemon that is not root): the
         // sweep finds them by this instead.
-        let (name, value) = mark();
+        let (name, value) = who.mark();
         cmd.env(name, value);
     }
     let dups: Vec<(i32, i32)> = fds.iter().map(|(m, n)| (m.0.as_raw_fd(), *n)).collect();
@@ -337,7 +384,19 @@ async fn run(
             Ok(())
         });
     }
-    let mut child = cmd.spawn().map_err(|e| {
+    cmd
+}
+
+/// Runs `prog` as `command` does, and kills the group at `limit`.
+async fn run(
+    prog: &Path,
+    args: &[String],
+    fds: &[(&Mem, i32)],
+    stdin: Stdio,
+    limit: Duration,
+    who: Who,
+) -> Result<Out, Stop> {
+    let mut child = command(prog, args, fds, stdin, who).spawn().map_err(|e| {
         eprintln!("zephyr: voice: starting {}: {e}", prog.display());
         Stop::Failed
     })?;
@@ -390,7 +449,7 @@ pub async fn transcribe(cfg: &Config, audio: &[u8]) -> (Heard, u64) {
     if !floored(cfg) {
         return (Heard::NoFloor, 0);
     }
-    let _turn = Turn::take().await;
+    let _turn = Turn::take(Who::Note).await;
     let mut secs = 0;
     let heard = match hear(cfg, audio, &mut secs).await {
         Ok(heard) => heard,
@@ -413,7 +472,15 @@ async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop>
     // One second over the limit shows the note is too long without decoding the rest of it.
     let args = decode_args(voice.max_secs + 1);
     let ffmpeg = dir.join("bin/ffmpeg");
-    let decoded = run(&ffmpeg, &args, &[(&input, 3)], Stdio::null(), FFMPEG_LIMIT).await?;
+    let decoded = run(
+        &ffmpeg,
+        &args,
+        &[(&input, 3)],
+        Stdio::null(),
+        FFMPEG_LIMIT,
+        Who::Note,
+    )
+    .await?;
     if !decoded.ok {
         return Err(Stop::Failed);
     }
@@ -442,14 +509,28 @@ async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop>
 
 /// One whisper run of `wav` as `lang`.
 async fn whisper(cfg: &Config, wav: &Mem, lang: &str) -> Result<Out, Stop> {
-    whisper_with(cfg, wav, MODEL, lang).await
+    whisper_with(cfg, wav, MODEL, lang, Who::Note).await
 }
 
 /// One whisper run of `wav` as `lang`, with `model`.
-async fn whisper_with(cfg: &Config, wav: &Mem, model: &str, lang: &str) -> Result<Out, Stop> {
+async fn whisper_with(
+    cfg: &Config,
+    wav: &Mem,
+    model: &str,
+    lang: &str,
+    who: Who,
+) -> Result<Out, Stop> {
     let prog = cfg.voice_dir.join("bin/whisper-cli");
     let args = whisper_args(&cfg.voice_dir, model, lang);
-    let out = run(&prog, &args, &[(wav, 3)], Stdio::null(), cfg.voice_wait).await?;
+    let out = run(
+        &prog,
+        &args,
+        &[(wav, 3)],
+        Stdio::null(),
+        cfg.voice_wait,
+        who,
+    )
+    .await?;
     match out.ok {
         true => Ok(out),
         false => Err(Stop::Failed),
@@ -561,12 +642,20 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
     let text = speakable(text)?;
     let dir = &cfg.voice_dir;
     let voice = voice_for(dir, &text)?;
-    let _turn = Turn::take().await;
+    let _turn = Turn::take(Who::Note).await;
     let made = async {
         let said = mem(Mem::sealed(text.as_bytes()))?;
         let stdin = Stdio::from(mem(said.0.try_clone())?);
         let python = dir.join("py/bin/python");
-        let piper = run(&python, &piper_args(&voice), &[], stdin, SPEAK_LIMIT).await?;
+        let piper = run(
+            &python,
+            &piper_args(&voice),
+            &[],
+            stdin,
+            SPEAK_LIMIT,
+            Who::Note,
+        )
+        .await?;
         // Piper's stderr is never empty (onnxruntime warns): the exit code and the PCM count.
         if !piper.ok || piper.stdout.is_empty() {
             return Err(Stop::Failed);
@@ -574,7 +663,15 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
         let pcm = mem(Mem::sealed(&piper.stdout))?;
         let args = encode_args(format_for(channel).1);
         let ffmpeg = dir.join("bin/ffmpeg");
-        let out = run(&ffmpeg, &args, &[(&pcm, 3)], Stdio::null(), SPEAK_LIMIT).await?;
+        let out = run(
+            &ffmpeg,
+            &args,
+            &[(&pcm, 3)],
+            Stdio::null(),
+            SPEAK_LIMIT,
+            Who::Note,
+        )
+        .await?;
         match out.ok {
             true => Ok(out.stdout),
             false => Err(Stop::Failed),
@@ -629,17 +726,27 @@ pub async fn hear_call(cfg: &Config, pcm: &[i16], lang: &str) -> Heard {
     if !floored(cfg) {
         return Heard::NoFloor;
     }
-    let _turn = Turn::take().await;
+    let _turn = Turn::take(Who::Note).await;
+    hear_once(cfg, pcm, lang, Who::Note).await
+}
+
+/// `hear_call` in the turn the caller holds: one whisper-cli run.
+async fn hear_once(cfg: &Config, pcm: &[i16], lang: &str, who: Who) -> Heard {
     let heard = async {
         let wav = mem(Mem::sealed(&call_wav(pcm)))?;
-        let out = whisper_with(cfg, &wav, call_model(cfg), lang).await?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let out = whisper_with(cfg, &wav, call_model(cfg), lang, who).await?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    match heard.await {
-        Ok(text) if text.is_empty() || text == "[BLANK_AUDIO]" => Heard::Silence,
+    call_heard(heard.await, lang)
+}
+
+/// What whisper wrote for an utterance, as a `Heard`.
+fn call_heard(text: Result<String, Stop>, lang: &str) -> Heard {
+    match text.as_deref().map(str::trim) {
+        Ok("" | "[BLANK_AUDIO]") => Heard::Silence,
         Ok(text) => Heard::Said {
             lang: lang.into(),
-            text: clean(&text),
+            text: clean(text),
         },
         Err(Stop::Failed) => Heard::Failed,
         Err(Stop::TimedOut) => Heard::TimedOut,
@@ -683,27 +790,42 @@ pub async fn say_call(cfg: &Config, text: &str, lang: &str) -> Option<Vec<u8>> {
         return None;
     }
     let text = speakable(text)?;
-    let dir = &cfg.voice_dir;
-    let voice = dir.join(if lang == "ko" { VOICE_KO } else { VOICE_EN });
-    let _turn = Turn::take().await;
+    let _turn = Turn::take(Who::Note).await;
+    say_once(cfg, &text, lang, Who::Note).await
+}
+
+fn call_voice_path(cfg: &Config, lang: &str) -> std::path::PathBuf {
+    cfg.voice_dir
+        .join(if lang == "ko" { VOICE_KO } else { VOICE_EN })
+}
+
+/// `say_call` of speakable `text` in the turn the caller holds: one Piper run, then `mulaw`.
+async fn say_once(cfg: &Config, text: &str, lang: &str, who: Who) -> Option<Vec<u8>> {
     let made = async {
         let said = mem(Mem::sealed(text.as_bytes()))?;
         let stdin = Stdio::from(mem(said.0.try_clone())?);
-        let python = dir.join("py/bin/python");
-        let piper = run(&python, &piper_args(&voice), &[], stdin, SPEAK_LIMIT).await?;
-        if !piper.ok || piper.stdout.is_empty() {
+        let python = cfg.voice_dir.join("py/bin/python");
+        let args = piper_args(&call_voice_path(cfg, lang));
+        let piper = run(&python, &args, &[], stdin, SPEAK_LIMIT, who).await?;
+        match piper.ok {
+            true => Ok(piper.stdout),
+            false => Err(Stop::Failed),
+        }
+    };
+    mulaw(cfg, made.await, who).await
+}
+
+/// Piper's PCM for a line of a call as μ-law at 8 kHz: one ffmpeg run, as `who`'s.
+async fn mulaw(cfg: &Config, pcm: Result<Vec<u8>, Stop>, who: Who) -> Option<Vec<u8>> {
+    let made = async {
+        let pcm = pcm?;
+        if pcm.is_empty() {
             return Err(Stop::Failed);
         }
-        let pcm = mem(Mem::sealed(&piper.stdout))?;
-        let ffmpeg = dir.join("bin/ffmpeg");
-        let out = run(
-            &ffmpeg,
-            &call_args(),
-            &[(&pcm, 3)],
-            Stdio::null(),
-            SPEAK_LIMIT,
-        )
-        .await?;
+        let pcm = mem(Mem::sealed(&pcm))?;
+        let ffmpeg = cfg.voice_dir.join("bin/ffmpeg");
+        let (args, fds) = (call_args(), [(&pcm, 3)]);
+        let out = run(&ffmpeg, &args, &fds, Stdio::null(), SPEAK_LIMIT, who).await?;
         match out.ok {
             true => Ok(out.stdout),
             false => Err(Stop::Failed),
@@ -718,12 +840,378 @@ pub async fn say_call(cfg: &Config, text: &str, lang: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// The uid a decoder gets: `/usr/bin/id -u`, run as they are. For `doctor` and the in-image
-/// test.
+/// Piper kept loaded for a call: one JSON string a line on stdin; for each, its PCM (s16le mono
+/// at `PIPER_RATE`) on stdout after its length, 4 bytes little-endian (`ask_mouth`). Piper 1.8's
+/// own `--output-raw` also keeps the voice loaded across stdin's lines, but writes nothing
+/// between one line's audio and the next, so the daemon could not tell where a line ends.
+const PIPER_LINES: &str = "import json, struct, sys
+from piper import PiperVoice
+voice = PiperVoice.load(sys.argv[1])
+out = sys.stdout.buffer
+for line in sys.stdin:
+    texts = [t for t in json.loads(line).splitlines() if t.strip()]
+    pcm = b''.join(c.audio_int16_bytes for t in texts for c in voice.synthesize(t))
+    out.write(struct.pack('<I', len(pcm)) + pcm)
+    out.flush()
+";
+
+/// The folder of the call's whisper-server socket, in `<state>-public` (root's, 0755). Made by
+/// root as root's, group `CALL_UID`, mode 0730 (`start_ear`): the server can bind in it, root
+/// can reach the socket, and neither the agent's uid nor `nobody` can enter it. The call uid can
+/// write in it, so the daemon never follows what is there (`socket_fd`).
+fn socket_dir(cfg: &Config) -> std::path::PathBuf {
+    crate::drafts::public_dir(cfg).join("voice")
+}
+
+/// whisper-server's argv: `whisper_args` but for the file, with its one address the unix
+/// socket `sock` (the image's build binds `--host` as a path, `deploy/Dockerfile`), never a
+/// port. The call's language and model are the server's for its whole life.
+fn server_args(dir: &Path, model: &str, lang: &str, sock: &Path) -> Vec<String> {
+    let mut args = whisper_args(dir, model, lang);
+    args.truncate(args.len() - 2);
+    args.extend(["--host".into(), sock.to_string_lossy().into_owned()]);
+    args
+}
+
+/// The server's socket, opened without following anything in its place: it must be a socket
+/// of the call uid's, else a server that had been taken over could point the daemon elsewhere
+/// with a symlink. Connected through `/proc/self/fd/N`, so what was checked is what is reached.
+fn socket_fd(sock: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(sock)?;
+    let meta = file.metadata()?;
+    match meta.file_type().is_socket() && meta.uid() == Who::Call.runs_as() {
+        true => Ok(file),
+        false => Err(std::io::Error::other("not the call's socket")),
+    }
+}
+
+/// One of a call's warm processes; its group is killed when it goes, unless it was already
+/// reaped (`end`): until then its pid is still its group's.
+struct Warm(tokio::process::Child);
+
+impl Warm {
+    fn pid(&self) -> i32 {
+        self.0.id().expect("never waited on") as i32
+    }
+
+    /// Whether it has exited, seen without reaping it.
+    fn exited(&self) -> bool {
+        // Safety: `info` is plain data the call fills in; the pid is our unreaped child's.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+        let r = unsafe { libc::waitid(libc::P_PID, self.pid() as libc::id_t, &mut info, flags) };
+        r != 0 || unsafe { info.si_pid() } != 0
+    }
+
+    /// Kills its group and waits for it to be reaped.
+    async fn end(mut self) {
+        // Safety: the group is the child's own and the child is not reaped yet.
+        unsafe { libc::killpg(self.pid(), libc::SIGKILL) };
+        let _ = self.0.wait().await;
+    }
+}
+
+impl Drop for Warm {
+    fn drop(&mut self) {
+        // Not after `end`: a reaped child's pid may be another process's by now.
+        if let Some(pid) = self.0.id() {
+            // Safety: the group is the child's own and the child is not reaped.
+            unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `command` for a warm process: also killed by the kernel if the thread that started it goes
+/// (`PR_SET_PDEATHSIG`; set after std's setuid, which would clear it), and refused if that
+/// thread was already gone.
+fn warm_command(prog: &Path, args: &[String], stdin: Stdio) -> tokio::process::Command {
+    let mut cmd = command(prog, args, &[], stdin, Who::Call);
+    let parent = std::process::id() as i32;
+    // Safety: prctl and getppid are async-signal-safe and allocate nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::getppid() == parent {
+                true => Ok(()),
+                false => Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            }
+        });
+    }
+    cmd
+}
+
+/// One phone call's voice with `calls.speech = "local"` (DESIGN §4.26): one whisper-server and
+/// one Piper, each loaded once for the call, so a turn costs the models' time and not a
+/// process's start. Both run as `CALL_UID` (`command`: its own process group, no network under
+/// the floor); the server's only address is a unix socket in `socket_dir`, Piper's its pipes.
+/// The call holds the call uid's `Turn` from its first use (`warm`) to its drop, so nothing else
+/// of that uid's runs beside them; voice notes have `nobody` and a turn of their own, and never
+/// wait on a call. `kill` (the call's end, a hang-up, an error) and the drop (its future
+/// dropped) kill both groups, and the call uid's sweep takes whatever they left. Either one
+/// failing gives way, for the rest of the call, to the per-utterance path (`hear_once`,
+/// `say_once`, run as the call uid too).
+pub struct Call {
+    cfg: Config,
+    lang: String,
+    turn: tokio::sync::OnceCell<Turn>,
+    ear: tokio::sync::Mutex<Option<Warm>>,
+    mouth: tokio::sync::Mutex<Option<Warm>>,
+}
+
+impl Call {
+    /// Starts nothing yet: that is `warm`'s, or the first utterance's.
+    pub fn new(cfg: &Config, lang: &str) -> Call {
+        Call {
+            cfg: cfg.clone(),
+            lang: lang.into(),
+            turn: Default::default(),
+            ear: Default::default(),
+            mouth: Default::default(),
+        }
+    }
+
+    /// Takes the call uid's turn and starts the pair, once; they load while the call rings.
+    pub async fn warm(&self) {
+        self.turn
+            .get_or_init(|| async {
+                let turn = Turn::take(Who::Call).await;
+                // What a daemon before this one left (killed mid-call): nothing of the call uid's
+                // runs into a new call.
+                sweep(Who::Call);
+                *self.ear.lock().await = self.start_ear();
+                *self.mouth.lock().await = self.start_mouth();
+                turn
+            })
+            .await;
+    }
+
+    /// Ends the pair now, and returns once it is gone: both groups killed and reaped, then the
+    /// call uid's sweep, and the socket's folder removed.
+    pub async fn kill(&self) {
+        for side in [&self.ear, &self.mouth] {
+            if let Some(warm) = side.lock().await.take() {
+                warm.end().await;
+            }
+        }
+        sweep(Who::Call);
+        let _ = std::fs::remove_dir_all(socket_dir(&self.cfg));
+    }
+
+    fn start_ear(&self) -> Option<Warm> {
+        use std::os::unix::{fs::DirBuilderExt, process::CommandExt};
+        let (cfg, dir) = (&self.cfg, socket_dir(&self.cfg));
+        let prog = cfg.voice_dir.join("bin/whisper-server");
+        if !prog.exists() {
+            return None;
+        }
+        let started = (|| {
+            // What a call before this one left, if the daemon died mid-call.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.parent().expect("in <state>-public"))?;
+            if root() {
+                // The daemon holds no CAP_CHOWN (nor DAC_OVERRIDE): a mkdir run with the call
+                // uid's gid gives the folder that group, and root owns it.
+                let made = std::process::Command::new("/usr/bin/mkdir")
+                    .args(["-m", "0730", "--"])
+                    .arg(&dir)
+                    .env_clear()
+                    .gid(CALL_UID)
+                    .status()?;
+                if !made.success() {
+                    return Err(std::io::Error::other("mkdir failed"));
+                }
+            } else {
+                std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            }
+            let sock = dir.join("whisper.sock");
+            let args = server_args(&cfg.voice_dir, call_model(cfg), &self.lang, &sock);
+            let mut cmd = warm_command(&prog, &args, Stdio::null());
+            // srw-rw-rw-: root, which is neither its owner nor in its group, may connect; the
+            // folder keeps everyone else out.
+            // Safety: umask is async-signal-safe and cannot fail.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::umask(0o111);
+                    Ok(())
+                });
+            }
+            cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        })();
+        match started {
+            Ok(child) => Some(Warm(child)),
+            Err(e) => {
+                eprintln!("zephyr: voice: starting the call's whisper-server: {e}");
+                None
+            }
+        }
+    }
+
+    fn start_mouth(&self) -> Option<Warm> {
+        if !call_voice(&self.cfg, &self.lang) {
+            return None;
+        }
+        let python = self.cfg.voice_dir.join("py/bin/python");
+        let voice = call_voice_path(&self.cfg, &self.lang);
+        let args = ["-I", "-c", PIPER_LINES, &voice.to_string_lossy()].map(String::from);
+        let mut cmd = warm_command(&python, &args, Stdio::piped());
+        match cmd.stderr(Stdio::null()).spawn() {
+            Ok(child) => Some(Warm(child)),
+            Err(e) => {
+                eprintln!("zephyr: voice: starting the call's Piper: {e}");
+                None
+            }
+        }
+    }
+
+    /// What the other party said in one utterance, as `hear_call` has it.
+    pub async fn hear(&self, pcm: &[i16]) -> Heard {
+        if !floored(&self.cfg) {
+            return Heard::NoFloor;
+        }
+        self.warm().await;
+        let mut ear = self.ear.lock().await;
+        if let Some(server) = ear.as_ref() {
+            let asked = tokio::time::timeout(self.cfg.voice_wait, self.ask_ear(server, pcm));
+            let stop = match asked.await {
+                Ok(Ok(text)) => return call_heard(Ok(text), &self.lang),
+                Ok(Err(stop)) => stop,
+                Err(_) => Stop::TimedOut,
+            };
+            *ear = None;
+            eprintln!(
+                "zephyr: voice: the call's whisper-server is gone; each utterance runs whisper"
+            );
+            if let Stop::TimedOut = stop {
+                return Heard::TimedOut;
+            }
+        }
+        drop(ear);
+        hear_once(&self.cfg, pcm, &self.lang, Who::Call).await
+    }
+
+    /// One `POST /inference` of the utterance's WAV over the server's socket (multipart, its
+    /// `file` and `response_format=text`, `Connection: close`), waiting for the socket while
+    /// the server loads its model; the reply's body is the text, under `HTTP/1.1 200`.
+    async fn ask_ear(&self, server: &Warm, pcm: &[i16]) -> Result<String, Stop> {
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncWriteExt;
+        let sock = socket_dir(&self.cfg).join("whisper.sock");
+        let mut stream = loop {
+            let fd = match socket_fd(&sock) {
+                Ok(fd) => fd,
+                // Not there yet while it loads; something else in its place is refused.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !server.exited() => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(_) => return Err(Stop::Failed),
+            };
+            let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(stream) => break stream,
+                Err(_) if !server.exited() => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(_) => return Err(Stop::Failed),
+            }
+        };
+        const B: &str = "zephyr-voice-6f1d2c9a8e3b4a57";
+        let mut body = format!(
+            "--{B}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n\
+             --{B}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend(call_wav(pcm));
+        body.extend(format!("\r\n--{B}--\r\n").into_bytes());
+        let head = format!(
+            "POST /inference HTTP/1.1\r\nHost: whisper\r\nConnection: close\r\n\
+             Content-Type: multipart/form-data; boundary={B}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let failed = |_| Stop::Failed;
+        stream.write_all(head.as_bytes()).await.map_err(failed)?;
+        stream.write_all(&body).await.map_err(failed)?;
+        let mut reply = Vec::new();
+        (stream.take(MAX_OUT).read_to_end(&mut reply).await).map_err(failed)?;
+        let reply = String::from_utf8_lossy(&reply);
+        match reply.split_once("\r\n\r\n") {
+            Some((head, text)) if head.starts_with("HTTP/1.1 200 ") => Ok(text.into()),
+            _ => Err(Stop::Failed),
+        }
+    }
+
+    /// One line of the call spoken, as `say_call` has it.
+    pub async fn say(&self, text: &str) -> Option<Vec<u8>> {
+        if !floored(&self.cfg) || !call_voice(&self.cfg, &self.lang) {
+            return None;
+        }
+        let text = speakable(text)?;
+        self.warm().await;
+        let mut mouth = self.mouth.lock().await;
+        if let Some(piper) = mouth.as_mut() {
+            match tokio::time::timeout(SPEAK_LIMIT, ask_mouth(piper, &text)).await {
+                Ok(Ok(pcm)) => return mulaw(&self.cfg, Ok(pcm), Who::Call).await,
+                _ => *mouth = None,
+            }
+            eprintln!("zephyr: voice: the call's Piper is gone; each line runs Piper");
+        }
+        drop(mouth);
+        say_once(&self.cfg, &text, &self.lang, Who::Call).await
+    }
+}
+
+/// One line through the warm Piper (`PIPER_LINES`).
+async fn ask_mouth(piper: &mut Warm, text: &str) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncWriteExt;
+    let (stdin, stdout) = (piper.0.stdin.as_mut(), piper.0.stdout.as_mut());
+    let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+        return Err(std::io::ErrorKind::BrokenPipe.into());
+    };
+    let line = serde_json::to_string(text).expect("a string") + "\n";
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await?;
+    let len = u64::from(stdout.read_u32_le().await?);
+    if len > MAX_OUT {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut pcm = vec![0; len as usize];
+    stdout.read_exact(&mut pcm).await?;
+    Ok(pcm)
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        // Also a pair `warm` started but did not finish (its future dropped mid-way).
+        let started = self.ear.get_mut().take().is_some();
+        self.mouth.get_mut().take();
+        if started {
+            let _ = std::fs::remove_dir_all(socket_dir(&self.cfg));
+        }
+        // Then `turn` goes, and with it the call uid's sweep.
+    }
+}
+
+/// The uid a voice note's decoder gets: `/usr/bin/id -u`, run as they are. For `doctor` and the
+/// in-image test.
 pub async fn uid() -> Option<u32> {
+    let _turn = Turn::take(Who::Note).await;
+    uid_of(Who::Note).await
+}
+
+/// The uid a call's whisper and Piper get, the same way. Not under the call's turn, which a
+/// call in progress holds; `id` exits at once and its group goes with it.
+pub async fn call_uid() -> Option<u32> {
+    uid_of(Who::Call).await
+}
+
+async fn uid_of(who: Who) -> Option<u32> {
     let id = Path::new("/usr/bin/id");
-    let _turn = Turn::take().await;
-    let out = run(id, &["-u".into()], &[], Stdio::null(), FFMPEG_LIMIT).await;
+    let out = run(id, &["-u".into()], &[], Stdio::null(), FFMPEG_LIMIT, who).await;
     String::from_utf8_lossy(&out.ok()?.stdout)
         .trim()
         .parse()
@@ -769,6 +1257,12 @@ pub async fn doctor(cfg: &Config) -> Vec<String> {
             Some(NOBODY) => "ok   voice: the decoders run as uid 65534".into(),
             other => format!("warn voice: the decoders run as {other:?}, not uid 65534"),
         });
+        lines.push(match call_uid().await {
+            Some(CALL_UID) => "ok   voice: a call's whisper and Piper run as uid 65533".into(),
+            other => {
+                format!("warn voice: a call's whisper and Piper run as {other:?}, not uid 65533")
+            }
+        });
     }
     // One second of silence, as the WAV whisper itself reads.
     let mut wav = Vec::from(*b"RIFF");
@@ -804,7 +1298,12 @@ pub(crate) mod tests {
         let home = crate::test_dir(name);
         let dir = home.join("voice");
         let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
-        for file in ["bin/ffmpeg", "bin/whisper-cli", "py/bin/python"] {
+        for file in [
+            "bin/ffmpeg",
+            "bin/whisper-cli",
+            "bin/whisper-server",
+            "py/bin/python",
+        ] {
             std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
             let fake = std::fs::read_to_string(from.join(file)).unwrap();
             crate::test_exe(&dir.join(file), &fake);
@@ -925,6 +1424,218 @@ pub(crate) mod tests {
         assert_eq!(log(&cfg, "python").len(), 1);
         mark(&cfg, "piper_fail", "");
         assert_eq!(say_call(&cfg, "Hello.", "en").await, None);
+    }
+
+    /// One second of an 8 kHz square wave: an utterance as the call's endpointer cuts it.
+    fn tone() -> Vec<i16> {
+        (0..8000)
+            .map(|i| if i / 20 % 2 == 0 { 9000 } else { -9000 })
+            .collect()
+    }
+
+    /// Waits until the fake has written its pid to `file`.
+    async fn started(cfg: &Config, file: &str) {
+        let path = cfg.voice_dir.join(file);
+        for _ in 0..400 {
+            if std::fs::read_to_string(&path).is_ok_and(|s| !s.is_empty()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{file} was never written");
+    }
+
+    /// A call keeps one whisper-server and one Piper loaded (DESIGN §4.26): its second
+    /// utterance and its second line start neither again, and when the call goes, so do they.
+    #[tokio::test]
+    async fn a_calls_second_utterance_starts_no_process() {
+        let cfg = fakes("voice-call-warm", "");
+        mark(&cfg, "says", "first\nsecond\n");
+        let call = Call::new(&cfg, "en");
+        let pcm = tone();
+        assert_eq!(call.hear(&pcm).await, said("en", "first"));
+        assert_eq!(call.hear(&pcm).await, said("en", "second"));
+        let line = call.say("Seven thirty, **please**.").await.unwrap();
+        assert_eq!(line, b"ulaw:pcm:Seven thirty, please.");
+        let line = call.say("Thank you.\nGoodbye.").await.unwrap();
+        assert_eq!(line, b"ulaw:pcm:Thank you.\nGoodbye.");
+        let (server, piper) = (log(&cfg, "whisper-server"), log(&cfg, "python"));
+        assert_eq!((server.len(), piper.len()), (2, 2), "{server:?} {piper:?}");
+        assert_eq!(server[0]["pid"], server[1]["pid"]);
+        assert_eq!(piper[0]["pid"], piper[1]["pid"]);
+        assert!(log(&cfg, "whisper-cli").is_empty());
+        // Given the WAV the daemon made, and the text exactly as checked for the facts.
+        assert_eq!(server[0]["sha256"], sha256(&call_wav(&pcm)));
+        assert_eq!(piper[0]["sha256"], sha256(b"Seven thirty, please."));
+        // Run as the decoders are, and on no port: the server's one address is a socket in a
+        // 0700 folder of its own.
+        let uid = match root() {
+            true => NOBODY,
+            false => unsafe { libc::geteuid() },
+        };
+        let sock = socket_dir(&cfg).join("whisper.sock");
+        for run in [&server[0], &piper[0]] {
+            assert_eq!(run["uid"], uid);
+            assert!(!run["env"].to_string().contains("HOME"), "{run}");
+        }
+        let argv = server[0]["argv"].to_string();
+        assert!(argv.contains(&format!(r#""--host",{:?}"#, sock)), "{argv}");
+        assert!(!argv.contains("--port") && argv.contains("ggml-small-q5_1.bin"));
+        assert!(
+            argv.contains(r#""-l","en""#) && argv.contains(r#""--vad""#),
+            "{argv}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(socket_dir(&cfg))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, if root() { 0o730 } else { 0o700 });
+        let piper_argv = piper[0]["argv"].to_string();
+        assert!(
+            piper_argv.contains("en_US-lessac-medium.onnx"),
+            "{piper_argv}"
+        );
+        drop(call);
+        gone(&cfg, "whisper-server.pid").await;
+        gone(&cfg, "piper.pid").await;
+        assert!(!socket_dir(&cfg).exists());
+    }
+
+    /// Either of the pair dying mid-call: that side goes back to a process an utterance.
+    #[tokio::test]
+    async fn a_dead_server_or_piper_falls_back_to_a_run_each() {
+        let cfg = fakes("voice-call-dead", "");
+        let call = Call::new(&cfg, "en");
+        let pcm = tone();
+        assert_eq!(call.hear(&pcm).await, said("en", "hello from the fake"));
+        assert_eq!(call.say("Hello.").await.unwrap(), b"ulaw:pcm:Hello.");
+        for file in ["whisper-server.pid", "piper.pid"] {
+            let pid = std::fs::read_to_string(cfg.voice_dir.join(file)).unwrap();
+            unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+            gone(&cfg, file).await;
+        }
+        assert_eq!(call.hear(&pcm).await, said("en", "hello from the fake"));
+        assert_eq!(call.hear(&pcm).await, said("en", "hello from the fake"));
+        assert_eq!(call.say("Goodbye.").await.unwrap(), b"ulaw:pcm:Goodbye.");
+        assert_eq!(log(&cfg, "whisper-server").len(), 1);
+        let cli = log(&cfg, "whisper-cli");
+        assert_eq!(cli.len(), 2);
+        assert!(cli[0]["argv"].to_string().contains(r#""-l","en""#));
+        let piper = log(&cfg, "python");
+        assert_eq!(piper.len(), 2);
+        assert!(piper[1]["argv"].to_string().contains("--output-raw"));
+        assert_eq!(piper[1]["sha256"], sha256(b"Goodbye."));
+    }
+
+    /// The call's future dropped mid-utterance (the daemon stopping, the call's task aborted):
+    /// the pair goes with it, and the voice is free for the next note.
+    #[tokio::test]
+    async fn a_dropped_call_leaves_nothing_running() {
+        let cfg = fakes("voice-call-dropped", "");
+        mark(&cfg, "hang", "");
+        let call = std::sync::Arc::new(Call::new(&cfg, "en"));
+        let theirs = call.clone();
+        let run = tokio::spawn(async move { theirs.hear(&tone()).await });
+        started(&cfg, "hang.pid").await;
+        started(&cfg, "piper.pid").await;
+        drop(call);
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        gone(&cfg, "whisper-server.pid").await;
+        gone(&cfg, "piper.pid").await;
+        std::fs::remove_file(cfg.voice_dir.join("hang")).unwrap();
+        assert_eq!(
+            transcribe(&cfg, b"next").await.0,
+            said("en", "hello from the fake")
+        );
+    }
+
+    /// A voice note while a call is on is heard at once: the call's pair has a uid and a lock of
+    /// its own, and the note's sweep leaves it alone.
+    #[tokio::test]
+    async fn a_note_during_a_call_is_heard_at_once() {
+        let cfg = fakes("voice-call-note", "");
+        let call = Call::new(&cfg, "en");
+        call.warm().await;
+        started(&cfg, "whisper-server.pid").await;
+        started(&cfg, "piper.pid").await;
+        let note = tokio::time::timeout(Duration::from_secs(10), transcribe(&cfg, b"a note"));
+        let (heard, _) = note.await.expect("the note waited for the call");
+        assert_eq!(heard, said("en", "hello from the fake"));
+        // The pair is still up and answering, not swept with the note's run.
+        assert_eq!(call.hear(&tone()).await, said("en", "hello from the fake"));
+        assert_eq!(call.say("Hello.").await.unwrap(), b"ulaw:pcm:Hello.");
+        assert_eq!(log(&cfg, "whisper-server").len(), 1);
+        let piper = log(&cfg, "python");
+        assert!(piper
+            .iter()
+            .any(|p| p["argv"].to_string().contains("\"-c\"")));
+        // Each kind of run carries its own mark, so neither sweep can take the other's.
+        if !root() {
+            let env = log(&cfg, "whisper-server")[0]["env"].to_string();
+            assert!(env.contains("ZEPHYR_VOICE_CALL") && !env.contains("ZEPHYR_VOICE_RUN"));
+            let env = log(&cfg, "ffmpeg")[0]["env"].to_string();
+            assert!(env.contains("ZEPHYR_VOICE_RUN"), "the note's decode: {env}");
+        }
+    }
+
+    /// The socket's folder is the call uid's to write: a symlink in the socket's place is never
+    /// followed, and the utterance goes to whisper-cli instead.
+    #[tokio::test]
+    async fn a_symlink_in_the_sockets_place_is_refused() {
+        let mut cfg = fakes("voice-call-symlink", "");
+        cfg.voice_wait = Duration::from_secs(2);
+        let call = Call::new(&cfg, "en");
+        assert_eq!(call.hear(&tone()).await, said("en", "hello from the fake"));
+        let dir = socket_dir(&cfg);
+        let decoy = std::os::unix::net::UnixListener::bind(dir.join("decoy.sock")).unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        std::fs::remove_file(dir.join("whisper.sock")).unwrap();
+        std::os::unix::fs::symlink("decoy.sock", dir.join("whisper.sock")).unwrap();
+        assert_eq!(call.hear(&tone()).await, said("en", "hello from the fake"));
+        let accepted = decoy.accept().map(|_| ());
+        let refused = accepted.is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock);
+        assert!(refused, "the daemon connected through the symlink");
+        assert_eq!(log(&cfg, "whisper-server").len(), 1);
+        assert_eq!(log(&cfg, "whisper-cli").len(), 1);
+    }
+
+    /// What a daemon before this one left of the call uid's (a crash mid-call) is killed before
+    /// a new pair starts.
+    #[tokio::test]
+    async fn a_leftover_of_the_call_uid_is_killed_before_a_new_pair() {
+        let cfg = fakes("voice-call-leftover", "");
+        let (name, value) = Who::Call.mark();
+        let mut left = std::process::Command::new("/bin/sleep");
+        let mut left = left.arg("600").env(name, value).spawn().unwrap();
+        let call = Call::new(&cfg, "en");
+        call.warm().await;
+        let reaped = tokio::task::spawn_blocking(move || left.wait());
+        let ended = tokio::time::timeout(Duration::from_secs(5), reaped).await;
+        let status = ended
+            .expect("the leftover is still running")
+            .unwrap()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// `kill` ends the pair before it returns: both reaped, the folder gone, though the call
+    /// itself is still held.
+    #[tokio::test]
+    async fn kill_ends_the_pair_before_it_returns() {
+        let cfg = fakes("voice-call-kill", "");
+        let call = Call::new(&cfg, "en");
+        assert_eq!(call.hear(&tone()).await, said("en", "hello from the fake"));
+        assert_eq!(call.say("Hello.").await.unwrap(), b"ulaw:pcm:Hello.");
+        call.kill().await;
+        for file in ["whisper-server.pid", "piper.pid"] {
+            let pid = std::fs::read_to_string(cfg.voice_dir.join(file)).unwrap();
+            let proc = format!("/proc/{}", pid.trim());
+            assert!(!Path::new(&proc).exists(), "{file}: still there after kill");
+        }
+        assert!(!socket_dir(&cfg).exists());
     }
 
     fn said(lang: &str, text: &str) -> Heard {

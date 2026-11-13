@@ -1289,7 +1289,8 @@ async fn forward(
 /// `address . port` pairs of `network.allow` (`keep_allow`), the only direct routes there are.
 /// The first rule keeps the agent from sending as Docker's resolver (127.0.0.11, an address any
 /// local process may bind): a lookup root makes there must not be answerable by the agent.
-/// `nobody`, which the voice decoders run as (`voice.rs`), gets no network at all.
+/// `nobody`, which the voice decoders run as, and `zephyr-call`, a local phone call's whisper
+/// and Piper (`voice.rs`), get no network at all (`VOICE_UIDS`, proved by `voice_refused`).
 pub fn ruleset(agent_uid: u32) -> String {
     format!(
         "\
@@ -1303,6 +1304,7 @@ table inet zephyr {{
     type filter hook output priority filter; policy accept;
     meta skuid {agent_uid} jump agent
     meta skuid {nobody} reject                   # the voice decoders (voice.rs) get no network
+    meta skuid {call} reject                   # nor a phone call's whisper and Piper (voice.rs)
   }}
   chain agent {{
     ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
@@ -1316,8 +1318,33 @@ table inet zephyr {{
   }}
 }}
 ",
-        nobody = crate::voice::NOBODY
+        nobody = crate::voice::NOBODY,
+        call = crate::voice::CALL_UID,
     )
+}
+
+/// The uids of the voice programs: a voice note's decoders and a phone call's whisper and Piper.
+pub const VOICE_UIDS: [u32; 2] = [crate::voice::NOBODY, crate::voice::CALL_UID];
+
+/// Proves the rules give `VOICE_UIDS` no network: `zephyr __netcheck` (a direct connection
+/// alone) run as each, with nothing of the daemon's environment.
+pub async fn voice_refused() -> anyhow::Result<()> {
+    for uid in VOICE_UIDS {
+        let mut check = tokio::process::Command::new("/usr/local/bin/zephyr");
+        check.arg("__netcheck").env_clear().current_dir("/");
+        check.uid(uid).gid(uid).kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(5), check.output())
+            .await
+            .with_context(|| format!("the network check as uid {uid} did not finish"))?
+            .with_context(|| format!("running the network check as uid {uid}"))?;
+        let said = String::from_utf8_lossy(&out.stdout);
+        anyhow::ensure!(
+            out.status.success(),
+            "uid {uid} is not refused the network: {}",
+            said.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Loads the rules for the agent's uid (`ZEPHYR_AGENT_UID`) with root's own `nft`. `supervise`
@@ -1326,6 +1353,10 @@ pub fn load_floor() -> anyhow::Result<()> {
     let uid = std::env::var("ZEPHYR_AGENT_UID").context("ZEPHYR_AGENT_UID is not set")?;
     let uid: u32 = uid.parse().context("ZEPHYR_AGENT_UID is not a uid")?;
     anyhow::ensure!(uid != 0, "ZEPHYR_AGENT_UID is root's");
+    anyhow::ensure!(
+        !VOICE_UIDS.contains(&uid),
+        "ZEPHYR_AGENT_UID is a voice program's uid (65534 or 65533)"
+    );
     nft(&ruleset(uid))
 }
 
@@ -1907,7 +1938,7 @@ pub async fn verify() -> anyhow::Result<()> {
         "the network floor is not in place: {}",
         said.trim()
     );
-    Ok(())
+    voice_refused().await
 }
 
 #[cfg(test)]
@@ -2652,6 +2683,7 @@ table inet zephyr {
     type filter hook output priority filter; policy accept;
     meta skuid 1000 jump agent
     meta skuid 65534 reject                   # the voice decoders (voice.rs) get no network
+    meta skuid 65533 reject                   # nor a phone call's whisper and Piper (voice.rs)
   }
   chain agent {
     ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
@@ -2670,10 +2702,13 @@ table inet zephyr {
     }
 
     #[test]
-    fn the_floor_refuses_nobody() {
+    fn the_floor_refuses_nobody_and_the_call_uid() {
         let rules = ruleset(1000);
-        let (jump, reject) = ("meta skuid 1000 jump agent", "meta skuid 65534 reject");
-        assert!(rules.find(jump).unwrap() < rules.find(reject).unwrap());
+        let jump = rules.find("meta skuid 1000 jump agent").unwrap();
+        for uid in VOICE_UIDS {
+            let reject = rules.find(&format!("meta skuid {uid} reject")).unwrap();
+            assert!(jump < reject, "uid {uid}");
+        }
     }
 
     #[test]

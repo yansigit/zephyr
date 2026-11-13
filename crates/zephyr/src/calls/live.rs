@@ -582,6 +582,17 @@ struct Live<'a> {
     /// The end of what the agent has said so far (`TAIL`).
     said: String,
     tainted: bool,
+    /// With the daemon's own speech, the call's warm whisper and Piper.
+    voice: Option<Arc<crate::voice::Call>>,
+    /// The tasks that speak and hear for the call, which hold `voice` too.
+    voice_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// However the call's future ends, also dropped mid-call, its voice goes with it.
+impl Drop for Live<'_> {
+    fn drop(&mut self) {
+        self.hush();
+    }
 }
 
 impl<'a> Live<'a> {
@@ -591,29 +602,31 @@ impl<'a> Live<'a> {
         // Piper and whisper each run in a task of their own, one line at a time, so the call's
         // own loop is never waiting on them when a hang-up comes.
         let provider = cfg.calls().speech != "local";
-        let (voice_cfg, lang, tx) = (cfg.clone(), s.ask.language.clone(), s.tx.clone());
+        // The call's own whisper and Piper, kept loaded for it (`voice::Call`).
+        let voice = (!provider).then(|| Arc::new(crate::voice::Call::new(&cfg, &s.ask.language)));
+        let (ours, lang, tx) = (voice.clone(), s.ask.language.clone(), s.tx.clone());
         let (telnyx, registry, id) = (Telnyx::new(&cfg), calls.clone(), s.id);
-        tokio::spawn(async move {
+        let mouth_task = tokio::spawn(async move {
             while let Some(say) = lines.recv().await {
-                let audio = match (provider, registry.provider_ref(id)) {
-                    (false, _) => crate::voice::say_call(&voice_cfg, &say.text, &lang).await,
+                let audio = match (&ours, registry.provider_ref(id)) {
+                    (Some(voice), _) => voice.say(&say.text).await,
                     // Telnyx speaks it, after what it was given before: only text goes out.
-                    (true, Some(call)) => {
+                    (None, Some(call)) => {
                         let asked = telnyx.speak(&call, &say.text, &lang).await;
                         asked.ok().map(|()| Vec::new())
                     }
-                    (true, None) => None,
+                    (None, None) => None,
                 };
                 if tx.send(Event::Spoken(say, audio)).is_err() {
                     break;
                 }
             }
         });
-        let (voice_cfg, lang, tx) = (cfg.clone(), s.ask.language.clone(), s.tx.clone());
-        tokio::spawn(async move {
+        let (ours, tx) = (voice.clone(), s.tx.clone());
+        let ear_task = tokio::spawn(async move {
             while let Some(pcm) = utterances.recv().await {
-                let heard = crate::voice::hear_call(&voice_cfg, &pcm, &lang).await;
-                if tx.send(Event::Heard(heard)).is_err() {
+                let Some(voice) = &ours else { continue };
+                if tx.send(Event::Heard(voice.hear(&pcm).await)).is_err() {
                     break;
                 }
             }
@@ -659,6 +672,28 @@ impl<'a> Live<'a> {
             ending: None,
             said: String::new(),
             tainted: false,
+            voice,
+            voice_tasks: vec![mouth_task, ear_task],
+        }
+    }
+
+    /// The call's voice goes when its future is dropped: its two tasks are aborted, and with the
+    /// last hold on it the warm pair is killed (`voice::Call`'s drop).
+    fn hush(&mut self) {
+        self.voice_tasks.iter().for_each(|t| t.abort());
+        self.voice = None;
+    }
+
+    /// The call's voice goes at its end, and is gone when this returns: the two tasks stopped
+    /// and awaited, then the pair killed and reaped and the call uid swept (`voice::Call::kill`).
+    /// Before the call leaves `Calls`, so nothing (a re-exec, the next call) can outrun it.
+    async fn quiet(&mut self) {
+        self.voice_tasks.iter().for_each(|t| t.abort());
+        for task in self.voice_tasks.drain(..) {
+            let _ = task.await;
+        }
+        if let Some(voice) = self.voice.take() {
+            voice.kill().await;
         }
     }
 
@@ -773,14 +808,26 @@ impl<'a> Live<'a> {
         // A `/hangup`, `/stop` or `/pause` that came while the agent was starting: nobody is
         // rung for a call the owner already ended.
         while let Ok(ev) = self.rx.try_recv() {
-            match ev {
-                Event::Hangup(why) => return ("ended", why.into()),
-                Event::Stopping => return ("ended", "zephyr stopping".into()),
-                _ => {}
+            if let Some(end) = before_the_dial(Some(ev)) {
+                return end;
             }
         }
         if self.store.pause_reason().map_or(true, |p| p.is_some()) {
             return ("ended", "a pause".into());
+        }
+        // whisper and Piper load while the call rings, once it is sure to be dialled; a
+        // `/hangup` or a stop meanwhile ends it there.
+        if let Some(voice) = self.voice.clone() {
+            let warming = voice.warm();
+            tokio::pin!(warming);
+            loop {
+                tokio::select! {
+                    () = &mut warming => break,
+                    ev = self.rx.recv() => if let Some(end) = before_the_dial(ev) {
+                        return end;
+                    },
+                }
+            }
         }
         let cap = self.cfg.calls_minute * self.cfg.calls().max_minutes as u32;
         let dial = Dial {
@@ -1217,6 +1264,7 @@ impl<'a> Live<'a> {
     /// ADAD rule 4(h) gives 10 s after theirs), the call and its action are closed, the owner
     /// and main are told, and the child goes.
     async fn finish(&mut self, (status, by): End) {
+        self.quiet().await;
         let hung = match &self.provider_ref {
             Some(call) => self.telnyx.hangup(call).await,
             None => Ok(()),
@@ -1292,6 +1340,16 @@ impl<'a> Live<'a> {
         // private fact in it, in a folder the agent can read. The scrubbed transcript in
         // state.db is the record.
         crate::retention::remove_session(&self.cfg, &self.session());
+    }
+}
+
+/// How an event that comes before the dial ends the call, if it does.
+fn before_the_dial(ev: Option<Event>) -> Option<End> {
+    match ev {
+        Some(Event::Hangup(why)) => Some(("ended", why.into())),
+        Some(Event::Stopping) => Some(("ended", "zephyr stopping".into())),
+        None => Some(("failed", "zephyr lost track of it".into())),
+        Some(_) => None,
     }
 }
 
