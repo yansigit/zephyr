@@ -350,6 +350,8 @@ fn projects() -> Option<PathBuf> {
 /// Sent once, when a budget limit is crossed.
 pub const BUDGET_NOTICE: &str =
     "[zephyr] daily budget reached: paused until the next UTC day or /resume";
+/// The tick lifted a budget pause: a limit was raised (or removed) over today's spend.
+pub const BUDGET_LIFTED: &str = "[zephyr] daily budget raised over today's spend: resumed";
 
 /// `[budget]`: the daily limits are counted per UTC day; crossing one pauses the gateway until
 /// the next UTC day or `/resume`. The run limits stop one run (DESIGN §4.4).
@@ -830,6 +832,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Any positive number loads, as before (the router clamps it, `check_every`).
+        let m = self.auth.refresh_minutes;
+        if !(m.is_finite() && m > 0.0) {
+            anyhow::bail!("[auth] refresh_minutes must be a positive number of minutes");
+        }
         let mut seen = std::collections::HashSet::new();
         for a in &self.accounts {
             let safe = !a.name.is_empty()
@@ -1357,6 +1364,27 @@ prompt = "Build it."
         assert!(!cfg.auth.enabled);
         assert_eq!(cfg.auth.refresh_minutes, 3.0);
         assert!(toml::from_str::<Config>(&format!("{base}[auth]\ntypo = 1\n")).is_err());
+        // A file that loaded before still loads (the router clamps it); only a value that is no
+        // interval at all is refused.
+        let with = |v: &str| -> Config {
+            toml::from_str(&format!("{base}[auth]\nrefresh_minutes = {v}\n")).unwrap()
+        };
+        for good in ["0.5", "1e300", "60"] {
+            with(good).validate().unwrap();
+        }
+        for bad in ["inf", "nan", "-1", "0"] {
+            assert!(with(bad).validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_auth_check_interval_is_clamped_to_a_second_and_an_hour() {
+        let every = |m: f64| crate::auth_keeper::check_every(m);
+        assert_eq!(every(0.0001), std::time::Duration::from_secs(1));
+        assert_eq!(every(0.5), std::time::Duration::from_secs(30));
+        assert_eq!(every(1e300), std::time::Duration::from_secs(3600));
+        assert_eq!(every(f64::INFINITY), std::time::Duration::from_secs(3600));
+        assert_eq!(every(f64::NAN), std::time::Duration::from_secs(1));
     }
 
     #[test]

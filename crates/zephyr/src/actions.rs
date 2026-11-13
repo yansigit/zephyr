@@ -881,7 +881,10 @@ mod tests {
         );
         // With every process slot taken, a due command waits for the owner instead.
         for _ in 0..crate::store::MAX_RUNNING_PROCS {
-            store.add_proc("sleep 9", "chat", "o").unwrap().unwrap();
+            store
+                .add_proc_for("sleep 9", "chat", "o", None)
+                .unwrap()
+                .unwrap();
         }
         let r = hold(&store, ActionKind::Run, SEND, &[], Some(now - 1));
         tick(&ctx, now, false);

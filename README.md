@@ -810,7 +810,10 @@ reply comes.
 ## Limits
 
 `[budget]` in `zephyr.toml`, all optional: `daily_tokens` and `daily_cost_usd` pause the gateway
-for the rest of the UTC day (`/resume` overrides); `run_turns` and `run_minutes` stop one run that
+for the rest of the UTC day, also when you lower one under what the day has spent already.
+`/resume` of that pause overrides the limits it was paused over, as they are, until midnight UTC;
+changing one of them ends its override, and raising a limit over the day's spend ends the pause
+by itself; `run_turns` and `run_minutes` stop one run that
 goes on too long, and you are told why. A job run also stops after 30 minutes.
 
 ## Standing rules

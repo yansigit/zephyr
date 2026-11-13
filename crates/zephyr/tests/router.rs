@@ -370,6 +370,33 @@ async fn child_killed_mid_run_resumes_without_loss_or_duplicate() {
     gw.shutdown().await;
 }
 
+/// Review of PR #63, 5: a restart asked for mid-run (a rule) is done by the child's crash: the
+/// respawned child starts on the current session and rules, so nothing restarts it again.
+#[tokio::test]
+async fn a_crash_does_the_restart_a_run_was_waiting_for() {
+    let home = home("crash-restart");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    gw.say("m2", "owner", "/rule be brief").await;
+    gw.wait_replies(1).await;
+    let pid = std::fs::read_to_string(home.join("pid")).unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid])
+        .status()
+        .unwrap();
+    gw.wait_reply("resumed: [chat #1] long job").await;
+    gw.say("m3", "owner", "next").await;
+    gw.wait_reply("echo: [chat #3] next").await;
+    assert_eq!(
+        log(&home, "start").len(),
+        2,
+        "the first child and the respawn"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn gateway_killed_mid_run_resumes_after_restart() {
     let home = home("kill-gateway");
@@ -411,7 +438,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
             })
             .unwrap()
             .unwrap();
-        store.mark_dispatched(row_id).unwrap();
+        store.mark_dispatched_as(row_id, "prompt").unwrap();
         seeded.push(InboxRow {
             id: row_id,
             channel: "chat".into(),
@@ -737,17 +764,69 @@ async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
     let home = home("budget-midnight");
     let mut cfg = config(&home);
     cfg.tick = Duration::from_millis(200);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
     let store = Store::open(&cfg.db_path()).unwrap();
     let today = store.today().unwrap();
+    // Over the limit: with none, or under it, the tick lifts today's pause at once.
+    store.add_spend(&today, 500, 0.0).unwrap();
     store.set_paused(Some(&format!("budget:{today}"))).unwrap();
     let gw = start(cfg);
     wait(|| !log(&home, "get_messages").is_empty()).await; // the child is up
     gw.say("m1", "owner", "held").await;
     wait(|| inbox_status(&home, "new") == 1).await;
     assert!(log(&home, "prompt").is_empty());
-    // The UTC day turns: the pause is yesterday's, and the next tick sends the row.
+    // The UTC day turns: the pause is yesterday's, the new day has spent nothing, and the next
+    // tick sends the row.
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute("DELETE FROM spend", []).unwrap();
     store.set_paused(Some("budget:2000-01-01")).unwrap();
     assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] held"]);
+    gw.shutdown().await;
+}
+
+/// Review of PR #63, 7: a limit raised over today's spend ends the budget pause on the next
+/// tick; the owner is told once, and what waited goes.
+#[tokio::test]
+async fn a_budget_raised_over_the_spend_lifts_the_pause() {
+    let home = home("budget-raised");
+    let mut cfg = on_file(&home, "[budget]\ndaily_tokens = 100");
+    cfg.tick = Duration::from_millis(200);
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 120}"#).unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "big").await;
+    gw.wait_reply(BUDGET_NOTICE).await;
+    gw.say("m2", "owner", "held").await;
+    wait(|| inbox_status(&home, "new") == 1).await;
+    gw.say("m3", "owner", "/set budget.daily_tokens 1000").await;
+    assert_eq!(
+        gw.wait_reply("held").await,
+        "echo: [chat #2] held",
+        "{:?}",
+        gw.replies()
+    );
+    let lifted = "[zephyr] daily budget raised over today's spend: resumed";
+    let told = gw.replies().iter().filter(|r| *r == lifted).count();
+    assert_eq!(told, 1, "{:?}", gw.replies());
+    gw.shutdown().await;
+}
+
+/// Review of PR #63, 3: a daemon started running while today's spend is over a limit was
+/// resumed under the old rule; an upgrade or re-exec mid-day keeps it running.
+#[tokio::test]
+async fn a_start_over_the_budget_while_running_does_not_pause() {
+    let home = home("budget-upgrade");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
+    let store = Store::open(&cfg.db_path()).unwrap();
+    store.add_spend(&store.today().unwrap(), 500, 0.0).unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "still going").await;
+    gw.say("m2", "owner", "and again").await;
+    assert_eq!(
+        gw.wait_replies(2).await,
+        ["echo: [chat #1] still going", "echo: [chat #2] and again"]
+    );
+    assert_eq!(store.pause_reason().unwrap(), None);
     gw.shutdown().await;
 }
 
@@ -943,8 +1022,11 @@ async fn pause_aborts_a_running_job() {
 #[tokio::test]
 async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     let home = home("job-resume");
-    let cfg = config(&home);
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
     let mut store = Store::open(&cfg.db_path()).unwrap();
+    // Over the limit, so the trip below holds until `/resume`.
+    store.add_spend(&store.today().unwrap(), 500, 0.0).unwrap();
     store
         .add_job("tick", "* * * * *", "say: caught up", "chat", "owner")
         .unwrap();
@@ -1465,7 +1547,7 @@ async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
         })
         .unwrap()
         .unwrap();
-    store.mark_dispatched(id).unwrap();
+    store.mark_dispatched_as(id, "prompt").unwrap();
     assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Clean);
     drop(store);
     let gw = start(cfg);

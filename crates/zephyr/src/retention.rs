@@ -279,7 +279,8 @@ fn inbox_file(name: &str) -> bool {
         Some(n) => n.strip_suffix(".part"),
         None => name.rsplit_once('.').map(|(stem, _)| stem),
     };
-    let rest = stem.and_then(|s| s.strip_prefix("discord-").or(s.strip_prefix("imessage-")));
+    let channels = ["discord-", "imessage-", "telegram-", "signal-"];
+    let rest = stem.and_then(|s| channels.iter().find_map(|c| s.strip_prefix(c)));
     rest.and_then(|r| r.rsplit_once('-'))
         .is_some_and(|(id, n)| !id.is_empty() && n.parse::<u8>().is_ok())
 }
@@ -326,7 +327,14 @@ mod tests {
             Some(1)
         );
         store.set_task_session(1, "task-1").unwrap();
-        assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
+        assert_eq!(
+            store
+                .add_proc_for("ls", "chat", "o", None)
+                .unwrap()
+                .unwrap()
+                .id,
+            1
+        );
 
         let s = home.join("sessions/--zephyr--");
         for d in [&s, &home.join(".procs"), &home.join("tasks")] {
@@ -614,11 +622,15 @@ mod tests {
             file("discord-1433712346123456789-1.png", true),
             file("imessage-CCCC-3333-4444-10.jpg", true),
             file(".imessage-CCCC-3333-4444-2.part", true),
+            file("telegram-42-1.jpg", true),
+            file("signal-1731400000123-2.png", true),
+            file(".telegram-43-1.part", true),
         ];
         let kept = [
             file("discord-1-1.png", false), // fresh
             file("notes.txt", true),        // the agent's own
             file("discord-x.png", true),
+            file("telegram-9-1.jpg", false), // fresh
         ];
         std::os::unix::fs::symlink("/etc/hostname", dir.join("discord-2-1.png")).unwrap();
         assert_eq!(sweep(&cfg, &store, AGE).unwrap(), gone.len());

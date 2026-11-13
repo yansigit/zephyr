@@ -28,8 +28,16 @@ const EXPIRY_WINDOW_SECS: i64 = 15 * 60;
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub enabled: bool,
-    /// Minutes between checks. Fractions are allowed; the router clamps to at least a second.
+    /// Minutes between checks: a positive number (`Config::validate`), fractions allowed. The
+    /// router clamps it to a second to an hour (`check_every`); `/set` takes 1 to 60.
     pub refresh_minutes: f64,
+}
+
+/// The AuthKeeper's interval for `refresh_minutes`, from a second to an hour, so no value a file
+/// holds (`1e300`, or `inf` before `validate`) can panic the Duration.
+pub fn check_every(refresh_minutes: f64) -> std::time::Duration {
+    // `max` first: `clamp` alone keeps a NaN.
+    std::time::Duration::from_secs_f64((refresh_minutes * 60.0).max(1.0).clamp(1.0, 3600.0))
 }
 
 impl Default for AuthConfig {

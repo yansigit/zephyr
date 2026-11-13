@@ -1,6 +1,7 @@
 //! Durable inbox and outbox (DESIGN §4.2), jobs and runs (§4.5), background tasks (§4.12). SQLite in WAL mode with `synchronous=FULL`.
 
 use crate::channel::Inbound;
+use crate::config::Budget;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -11,6 +12,52 @@ pub const MAX_OPEN_TASKS: i64 = 64;
 
 /// `exec` commands running at once (DESIGN §4.13); a start past this is refused.
 pub const MAX_RUNNING_PROCS: i64 = 8;
+
+/// Meta key: the UTC day `charge` paused the gateway for the budget. A `/pause` on top keeps it,
+/// so that pause's `/resume` is still a budget pause's; the lift and `/resume` clear it.
+const BUDGET_PAUSED: &str = "budget.paused";
+/// Meta key: the owner's override, `<UTC day> tokens=<limit> cost=<limit>`, naming only the
+/// limits `/resume` found exceeded, each at its value then (DESIGN §4.4).
+const BUDGET_RESUMED: &str = "budget.resumed";
+/// Meta key: set at this version's first start, by `migrate_budget`, on any install.
+const BUDGET_MIGRATED: &str = "budget.migrated";
+
+/// Each limit `budget` sets, as an override writes it: `tokens=<n>`, `cost=<usd>`.
+fn limits(budget: &Budget) -> Vec<String> {
+    let tokens = budget.daily_tokens.map(|t| format!("tokens={t}"));
+    tokens
+        .into_iter()
+        .chain(budget.daily_cost_usd.map(|c| format!("cost={c}")))
+        .collect()
+}
+
+/// The limits of `budget` that today's spend is at or over, as `limits` writes them.
+fn exceeded(budget: &Budget, (tokens, cost): (i64, f64)) -> Vec<String> {
+    let tokens = (budget.daily_tokens.filter(|t| tokens >= *t)).map(|t| format!("tokens={t}"));
+    let cost = (budget.daily_cost_usd.filter(|c| cost >= *c)).map(|c| format!("cost={c}"));
+    tokens.into_iter().chain(cost).collect()
+}
+
+/// The limits override `resumed` still holds on `day` under `budget`: only those it names at
+/// exactly the value in force now. Another day's, or an unreadable one, holds none.
+fn overridden(resumed: &str, day: &str, budget: &Budget) -> Vec<String> {
+    let mut parts = resumed.split(' ');
+    if parts.next() != Some(day) {
+        return vec![];
+    }
+    let now = limits(budget);
+    parts
+        .filter(|p| now.iter().any(|l| l == p))
+        .map(String::from)
+        .collect()
+}
+
+fn override_text(day: &str, limits: &[String]) -> String {
+    std::iter::once(day.to_string())
+        .chain(limits.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1325,17 +1372,9 @@ impl Store {
         Ok(())
     }
 
-    /// Marks the row dispatched and counts the attempt, before the child sees it.
-    pub fn mark_dispatched(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute(
-            "UPDATE inbox SET status = 'dispatched', tries = tries + 1 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    /// As `mark_dispatched`, recording how the row went to the child: `prompt`, `steer` or
-    /// `continue` (DESIGN §4.1). Kept so a restart can rebuild what a run's steers were.
+    /// Marks the row dispatched and counts the attempt, before the child sees it, recording how
+    /// it went: `prompt`, `steer` or `continue` (DESIGN §4.1). Kept so a restart can rebuild what
+    /// a run's steers were.
     pub fn mark_dispatched_as(&self, id: i64, sent_as: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "UPDATE inbox SET status = 'dispatched', tries = tries + 1, sent_as = ?2 WHERE id = ?1",
@@ -1496,6 +1535,82 @@ impl Store {
             .optional()
     }
 
+    /// `/resume`, before it lifts the pause: when today's budget pause is among what it lifts
+    /// (a `/pause` on top included), the limits exceeded now are overridden for the rest of the
+    /// UTC day, each at its value now (`charge`). Any other pause's `/resume` overrides nothing.
+    pub fn resume_budget(&self, budget: Option<&Budget>) -> rusqlite::Result<()> {
+        self.atomically(|s| {
+            let day = s.today()?;
+            if s.meta(BUDGET_PAUSED)?.as_deref() == Some(day.as_str()) {
+                s.override_exceeded(&day, budget)?;
+            }
+            s.set_meta(BUDGET_PAUSED, None)
+        })
+    }
+
+    /// This version's first start, on any install, once (meta `budget.migrated`): the old code
+    /// paused only at a crossing and kept a plain `YYYY-MM-DD` override. A gateway running over a
+    /// limit, or that day's override, is the owner's resume: overridden as `/resume` would. Another
+    /// day's old value is dropped, and a budget pause of today is known as one.
+    pub fn migrate_budget(&self, budget: Option<&Budget>) -> rusqlite::Result<()> {
+        if self.meta(BUDGET_MIGRATED)?.is_some() {
+            return Ok(());
+        }
+        self.atomically(|s| {
+            let day = s.today()?;
+            let old = s.meta(BUDGET_RESUMED)?.filter(|v| !v.contains(' '));
+            if old.is_some() {
+                s.set_meta(BUDGET_RESUMED, None)?;
+            }
+            let reason = s.pause_reason()?;
+            if reason.is_none() || old.as_deref() == Some(day.as_str()) {
+                s.override_exceeded(&day, budget)?;
+            }
+            if reason == Some(format!("budget:{day}")) {
+                s.set_meta(BUDGET_PAUSED, Some(&day))?;
+            }
+            s.set_meta(BUDGET_MIGRATED, Some("1"))
+        })
+    }
+
+    /// Records today's override for the limits of `budget` today's spend is over, if any.
+    fn override_exceeded(&self, day: &str, budget: Option<&Budget>) -> rusqlite::Result<()> {
+        let over = match budget {
+            Some(b) => exceeded(b, self.spend(day)?),
+            None => vec![],
+        };
+        if !over.is_empty() {
+            self.set_meta(BUDGET_RESUMED, Some(&override_text(day, &over)))?;
+        }
+        Ok(())
+    }
+
+    /// The tick: today's budget pause ends once today's spend is under every limit in force (one
+    /// raised by the owner or a timed revert, or removed), with no override. Returns whether this
+    /// lifted it. It looks first without a transaction, so a tick with no such pause never waits
+    /// for the write lock.
+    pub fn lift_budget(&self, budget: Option<&Budget>) -> rusqlite::Result<bool> {
+        let under = |s: &Store| -> rusqlite::Result<bool> {
+            let day = s.today()?;
+            if s.pause_reason()? != Some(format!("budget:{day}")) {
+                return Ok(false);
+            }
+            let (tokens, cost) = s.spend(&day)?;
+            Ok(!budget.is_some_and(|b| b.exceeded(tokens, cost)))
+        };
+        if !under(self)? {
+            return Ok(false);
+        }
+        self.atomically(|s| {
+            if !under(s)? {
+                return Ok(false);
+            }
+            s.set_paused(None)?;
+            s.set_meta(BUDGET_PAUSED, None)?;
+            Ok(true)
+        })
+    }
+
     /// `user` after `/pause`, `budget:<day>` after a budget trip. Either way the pause ends with `/resume`.
     /// A budget pause ends at the next UTC day (SQLite's `date('now')` is UTC).
     pub fn pause_reason(&self) -> rusqlite::Result<Option<String>> {
@@ -1633,27 +1748,42 @@ impl Store {
         Ok(())
     }
 
-    /// Adds a session's new usage to today's spend. Returns true when this charge crossed
-    /// a budget limit, and pauses the gateway for the rest of the UTC day. Shared by `main`
-    /// settles and job runs; the caller sends `BUDGET_NOTICE`.
+    /// Adds a session's new usage to today's spend. Returns true when this call paused the
+    /// gateway for the rest of the UTC day: a limit is at or under today's spend (crossed now, or
+    /// lowered under it) and today's override does not name it at exactly its value now. Any
+    /// change to an overridden limit ends its override, here, at the next charge. Shared by
+    /// `main` settles and job runs, on connections of their own: the look and the pause are one
+    /// `BEGIN IMMEDIATE` transaction, so of two at once only one returns true, and the caller
+    /// sends the one `BUDGET_NOTICE`.
     pub fn charge(
         &self,
-        budget: Option<&crate::config::Budget>,
+        budget: Option<&Budget>,
         (tokens, cost): (i64, f64),
     ) -> rusqlite::Result<bool> {
-        let day = self.today()?;
-        let (total_tokens, total_cost) = self.add_spend(&day, tokens, cost)?;
-        let Some(budget) = budget else {
-            return Ok(false);
-        };
-        // Only the charge that crosses a limit pauses; after `/resume` the override holds for the day.
-        let crossed = budget.exceeded(total_tokens, total_cost)
-            && !budget.exceeded(total_tokens - tokens, total_cost - cost);
-        if !crossed || self.pause_reason()?.is_some() {
-            return Ok(false);
-        }
-        self.set_paused(Some(&format!("budget:{day}")))?;
-        Ok(true)
+        self.atomically(|s| {
+            let day = s.today()?;
+            let spent = s.add_spend(&day, tokens, cost)?;
+            let Some(budget) = budget else {
+                return Ok(false);
+            };
+            let resumed = s.meta(BUDGET_RESUMED)?;
+            let held = (resumed.as_deref()).map_or(vec![], |r| overridden(r, &day, budget));
+            if let Some(r) = &resumed {
+                let kept = override_text(&day, &held);
+                match held.is_empty() {
+                    true => s.set_meta(BUDGET_RESUMED, None)?,
+                    false if *r != kept => s.set_meta(BUDGET_RESUMED, Some(&kept))?,
+                    false => {}
+                }
+            }
+            let over = exceeded(budget, spent);
+            if over.iter().all(|l| held.contains(l)) || s.pause_reason()?.is_some() {
+                return Ok(false);
+            }
+            s.set_paused(Some(&format!("budget:{day}")))?;
+            s.set_meta(BUDGET_PAUSED, Some(&day))?;
+            Ok(true)
+        })
     }
 
     pub fn add_job(
@@ -2291,12 +2421,15 @@ impl Store {
         rows.collect()
     }
 
-    /// Runs `f` as one transaction: what it writes lands together, or none of it when it fails.
+    /// Runs `f` as one `BEGIN IMMEDIATE` transaction: what it writes lands together, or none of
+    /// it when it fails, and what it read is still so when it writes (another connection waits
+    /// for the write lock, on the busy timeout, rather than failing as a deferred one would).
     pub fn atomically<T>(
         &self,
         f: impl FnOnce(&Store) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let tx = self.db.unchecked_transaction()?;
+        let behavior = rusqlite::TransactionBehavior::Immediate;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, behavior)?;
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
@@ -3341,17 +3474,8 @@ impl Store {
         tx.commit()
     }
 
-    /// Records a started `exec`. `None` when [`MAX_RUNNING_PROCS`] are running already.
-    pub fn add_proc(
-        &self,
-        command: &str,
-        channel: &str,
-        recipient: &str,
-    ) -> rusqlite::Result<Option<Proc>> {
-        self.add_proc_for(command, channel, recipient, None)
-    }
-
-    /// As `add_proc`, for the command of held action `action` the owner approved.
+    /// Records a started `exec`, with the held action `action` the owner approved, if it is one.
+    /// `None` when [`MAX_RUNNING_PROCS`] are running already.
     pub fn add_proc_for(
         &self,
         command: &str,
@@ -4097,6 +4221,252 @@ mod tests {
         assert_eq!(store.pause_reason().unwrap(), None);
     }
 
+    fn budget(text: &str) -> crate::config::Budget {
+        toml::from_str(text).unwrap()
+    }
+
+    /// As the router's `/resume`: the override first, then the pause lifted.
+    fn resume(store: &Store, b: &crate::config::Budget) {
+        store.resume_budget(Some(b)).unwrap();
+        store.set_paused(None).unwrap();
+    }
+
+    fn fresh(name: &str) -> Store {
+        let store = Store::open(&crate::test_dir(name).join("state.db")).unwrap();
+        store.migrate_budget(None).unwrap(); // this version's first start, done
+        store
+    }
+
+    #[test]
+    fn a_limit_lowered_below_the_days_spend_pauses_at_the_next_charge() {
+        let store = fresh("store-budget-lowered");
+        let wide = budget("daily_cost_usd = 10");
+        assert!(!store.charge(Some(&wide), (0, 6.0)).unwrap());
+        // The owner lowers the limit to under what today has spent: the next charge pauses.
+        let low = budget("daily_cost_usd = 3");
+        assert!(store.charge(Some(&low), (0, 0.5)).unwrap());
+        let day = store.today().unwrap();
+        let paused = format!("budget:{day}");
+        assert_eq!(store.pause_reason().unwrap(), Some(paused.clone()));
+        assert_eq!(store.meta("budget.paused").unwrap(), Some(day.clone()));
+        // `/resume` overrides the limit it found exceeded, at its value then.
+        resume(&store, &low);
+        let resumed = store.meta("budget.resumed").unwrap();
+        assert_eq!(resumed, Some(format!("{day} cost=3")));
+        assert_eq!(store.meta("budget.paused").unwrap(), None);
+        assert!(!store.charge(Some(&low), (0, 0.5)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), None);
+        // An override of another day holds no longer.
+        let stale = Some("2000-01-01 cost=3");
+        store.set_meta("budget.resumed", stale).unwrap();
+        assert!(store.charge(Some(&low), (0, 0.5)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), Some(paused));
+    }
+
+    /// Review of PR #63, round 2: the old code's plain `YYYY-MM-DD` override becomes one for the
+    /// limits over at the upgrade, at their values then; another day's is dropped. Once only.
+    #[test]
+    fn an_old_override_is_converted_once() {
+        let dir = crate::test_dir("store-budget-old");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let both = budget("daily_cost_usd = 5\ndaily_tokens = 1000");
+        let day = store.today().unwrap();
+        store.add_spend(&day, 10, 6.0).unwrap();
+        store.set_meta("budget.resumed", Some(&day)).unwrap();
+        store.set_paused(Some("user")).unwrap();
+        store.migrate_budget(Some(&both)).unwrap();
+        let resumed = store.meta("budget.resumed").unwrap();
+        assert_eq!(resumed, Some(format!("{day} cost=5")));
+        store.set_paused(None).unwrap();
+        assert!(!store.charge(Some(&both), (0, 0.5)).unwrap());
+
+        let dir = crate::test_dir("store-budget-old-day");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        store
+            .set_meta("budget.resumed", Some("2000-01-01"))
+            .unwrap();
+        store.migrate_budget(Some(&both)).unwrap();
+        assert_eq!(store.meta("budget.resumed").unwrap(), None);
+        // A later start migrates nothing.
+        store.set_meta("budget.resumed", Some(&day)).unwrap();
+        store.add_spend(&day, 0, 6.0).unwrap();
+        store.migrate_budget(Some(&both)).unwrap();
+        assert_eq!(store.meta("budget.resumed").unwrap(), Some(day));
+    }
+
+    /// Review of PR #63, 3: a gateway running over its budget at the upgrade was resumed by its
+    /// owner under the old rule; the first start keeps it running. A paused one stays paused.
+    #[test]
+    fn the_first_start_over_the_budget_and_not_paused_keeps_running() {
+        let dir = crate::test_dir("store-budget-start");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let five = budget("daily_cost_usd = 5");
+        let day = store.today().unwrap();
+        store.add_spend(&day, 0, 6.0).unwrap();
+        store.migrate_budget(Some(&five)).unwrap();
+        assert_eq!(store.meta("budget.migrated").unwrap().as_deref(), Some("1"));
+        assert!(!store.charge(Some(&five), (0, 0.5)).unwrap());
+
+        let dir = crate::test_dir("store-budget-start-paused");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        store.add_spend(&day, 0, 6.0).unwrap();
+        store.set_paused(Some(&format!("budget:{day}"))).unwrap();
+        store.migrate_budget(Some(&five)).unwrap();
+        assert_eq!(store.meta("budget.resumed").unwrap(), None);
+        // Known as a budget pause, so its `/resume` overrides.
+        resume(&store, &five);
+        assert!(!store.charge(Some(&five), (0, 0.5)).unwrap());
+    }
+
+    /// A limit lowered after `/resume` pauses at the next charge, a restart between the two
+    /// included: the migration never runs again to cover it.
+    #[test]
+    fn a_limit_lowered_then_a_restart_still_pauses() {
+        let store = fresh("store-budget-lower-restart");
+        let five = budget("daily_cost_usd = 5");
+        assert!(store.charge(Some(&five), (0, 6.0)).unwrap());
+        resume(&store, &five);
+        let four = budget("daily_cost_usd = 4");
+        store.migrate_budget(Some(&four)).unwrap(); // the restart
+        assert!(store.charge(Some(&four), (0, 0.5)).unwrap());
+    }
+
+    /// A budget pause, a `/pause` on top, a charge meanwhile, then `/resume`: still a budget
+    /// pause's resume, so it overrides.
+    #[test]
+    fn a_pause_on_top_of_a_budget_pause_still_resumes_with_an_override() {
+        let store = fresh("store-budget-pause-on-top");
+        let five = budget("daily_cost_usd = 5");
+        assert!(store.charge(Some(&five), (0, 6.0)).unwrap());
+        store.set_paused(Some("user")).unwrap();
+        assert!(!store.charge(Some(&five), (0, 1.0)).unwrap());
+        resume(&store, &five);
+        assert!(!store.charge(Some(&five), (0, 0.5)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), None);
+    }
+
+    /// Review of PR #63, 2: spend that crossed a limit during the owner's own `/pause` is no
+    /// budget pause: its `/resume` overrides nothing, and the next charge pauses, so the owner
+    /// is told.
+    #[test]
+    fn a_crossing_during_a_pause_pauses_after_resume() {
+        let store = fresh("store-budget-user-pause");
+        let five = budget("daily_cost_usd = 5");
+        store.set_paused(Some("user")).unwrap();
+        assert!(
+            !store.charge(Some(&five), (0, 6.0)).unwrap(),
+            "paused already"
+        );
+        resume(&store, &five);
+        assert_eq!(store.meta("budget.resumed").unwrap(), None);
+        assert!(store.charge(Some(&five), (0, 0.5)).unwrap());
+    }
+
+    /// The override names only the limits it found over: a cost resume does not cover tokens.
+    #[test]
+    fn a_cost_resume_does_not_override_the_token_limit() {
+        let store = fresh("store-budget-cost-not-tokens");
+        let both = budget("daily_cost_usd = 5\ndaily_tokens = 100");
+        assert!(store.charge(Some(&both), (50, 6.0)).unwrap());
+        resume(&store, &both);
+        assert!(!store.charge(Some(&both), (10, 0.0)).unwrap());
+        assert!(
+            store.charge(Some(&both), (50, 0.0)).unwrap(),
+            "tokens at 110"
+        );
+    }
+
+    /// A limit added after a cost resume leaves the cost override alone.
+    #[test]
+    fn a_token_limit_added_after_a_cost_resume_does_not_pause() {
+        let store = fresh("store-budget-add-tokens");
+        let five = budget("daily_cost_usd = 5");
+        assert!(store.charge(Some(&five), (0, 6.0)).unwrap());
+        resume(&store, &five);
+        let both = budget("daily_cost_usd = 5\ndaily_tokens = 1000");
+        assert!(!store.charge(Some(&both), (10, 0.0)).unwrap());
+    }
+
+    /// Review of PR #63, 4: any change to an overridden limit ends its override, a raise and a
+    /// lowering back to the same value included.
+    #[test]
+    fn a_limit_raised_then_lowered_after_resume_is_enforced() {
+        let store = fresh("store-budget-raise-lower");
+        let five = budget("daily_cost_usd = 5");
+        assert!(store.charge(Some(&five), (0, 6.0)).unwrap());
+        resume(&store, &five);
+        let eight = budget("daily_cost_usd = 8");
+        assert!(!store.charge(Some(&eight), (0, 0.5)).unwrap());
+        assert_eq!(store.meta("budget.resumed").unwrap(), None);
+        assert!(store.charge(Some(&five), (0, 0.5)).unwrap());
+    }
+
+    /// Review of PR #63, 7: a budget pause of today lifts once the spend is under every limit in
+    /// force (raised, or removed), with no override; a user pause never.
+    #[test]
+    fn a_budget_pause_lifts_when_the_limit_is_raised_over_the_spend() {
+        let store = fresh("store-budget-lift");
+        let five = budget("daily_cost_usd = 5");
+        assert!(store.charge(Some(&five), (0, 6.0)).unwrap());
+        assert!(!store.lift_budget(Some(&five)).unwrap());
+        let eight = budget("daily_cost_usd = 8");
+        assert!(store.lift_budget(Some(&eight)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), None);
+        assert_eq!(store.meta("budget.paused").unwrap(), None);
+        assert_eq!(store.meta("budget.resumed").unwrap(), None);
+        assert!(!store.lift_budget(None).unwrap(), "lifted once");
+        assert!(store.charge(Some(&five), (0, 0.0)).unwrap(), "no override");
+        assert!(store.lift_budget(None).unwrap(), "no limit at all");
+        store.set_paused(Some("user")).unwrap();
+        assert!(!store.lift_budget(None).unwrap());
+        assert_eq!(store.pause_reason().unwrap().as_deref(), Some("user"));
+    }
+
+    /// The tick looks every few seconds: with no budget pause it never waits for the write lock.
+    #[test]
+    fn a_tick_with_nothing_paused_takes_no_write_lock() {
+        let dir = crate::test_dir("store-budget-lift-lock");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let other = Connection::open(dir.join("state.db")).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let start = std::time::Instant::now();
+        let five = budget("daily_cost_usd = 5");
+        assert!(!store.lift_budget(Some(&five)).unwrap());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        other.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Review of PR #63, 8: the router and the scheduler charge on connections of their own; of
+    /// charges at once that cross a limit, exactly one pauses, so one notice goes out.
+    #[test]
+    fn of_charges_at_once_only_one_pauses() {
+        let dir = crate::test_dir("store-budget-race");
+        let path = dir.join("state.db");
+        Store::open(&path).unwrap();
+        let five = budget("daily_cost_usd = 5");
+        for round in 0..5 {
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, gate, five) = (path.clone(), gate.clone(), five.clone());
+                    std::thread::spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        gate.wait();
+                        store.charge(Some(&five), (0, 1.0)).unwrap()
+                    })
+                })
+                .collect();
+            let n = (threads.into_iter())
+                .map(|t| t.join().unwrap())
+                .filter(|p| *p)
+                .count();
+            assert_eq!(n, 1, "round {round}");
+            let store = Store::open(&path).unwrap();
+            store.set_paused(None).unwrap();
+            store.db.execute("DELETE FROM spend", []).unwrap();
+        }
+    }
+
     #[test]
     fn spend_accumulates() {
         let dir = crate::test_dir("store-spend");
@@ -4172,9 +4542,18 @@ mod tests {
         let dir = crate::test_dir("store-procs");
         let mut store = Store::open(&dir.join("state.db")).unwrap();
         let procs: Vec<Proc> = (0..MAX_RUNNING_PROCS)
-            .map(|_| store.add_proc("sleep 9", "chat", "o").unwrap().unwrap())
+            .map(|_| {
+                store
+                    .add_proc_for("sleep 9", "chat", "o", None)
+                    .unwrap()
+                    .unwrap()
+            })
             .collect();
-        assert_eq!(store.add_proc("ls", "chat", "o").unwrap(), None, "capped");
+        assert_eq!(
+            store.add_proc_for("ls", "chat", "o", None).unwrap(),
+            None,
+            "capped"
+        );
         // Ended in its turn: the model had the output, so main gets no report.
         store
             .finish_proc(&procs[0], "exited", Some(0), None, 5)
@@ -4902,7 +5281,7 @@ mod tests {
             assert_eq!(task.model.as_deref(), Some("p/m"));
             assert_eq!(task.subagent.as_deref(), Some("explorer"));
             assert_eq!(task.preamble.as_deref(), Some("You explore."));
-            assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
+            assert_eq!(store.add_proc_for("ls", "chat", "o", None).unwrap().unwrap().id, 1);
             // The v9 and v10 columns, there whichever version the db came from.
             store
                 .db
@@ -5066,7 +5445,10 @@ mod tests {
     fn writers_since_sees_running_and_recently_started_work() {
         let mut store = Store::open(&crate::test_dir("store-writers").join("state.db")).unwrap();
         assert!(!store.writers_since(0).unwrap());
-        let p = store.add_proc("ls", "chat", "o").unwrap().unwrap();
+        let p = store
+            .add_proc_for("ls", "chat", "o", None)
+            .unwrap()
+            .unwrap();
         store
             .db
             .execute("UPDATE procs SET created_at = 100", [])
@@ -5542,7 +5924,9 @@ mod tests {
             .db
             .execute("UPDATE tasks SET created_at = 60", [])
             .unwrap();
-        store.add_proc("cargo build", "chat", "1000").unwrap();
+        store
+            .add_proc_for("cargo build", "chat", "1000", None)
+            .unwrap();
         store
             .db
             .execute("UPDATE procs SET created_at = 70", [])
@@ -5804,7 +6188,10 @@ mod tests {
             store.finish_task(&t, "completed", "done", now).unwrap();
         }
         for command in ["true", "false"] {
-            let p = store.add_proc(command, "chat", "1000").unwrap().unwrap();
+            let p = store
+                .add_proc_for(command, "chat", "1000", None)
+                .unwrap()
+                .unwrap();
             store
                 .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
                 .unwrap();
@@ -5830,7 +6217,10 @@ mod tests {
         let t = store.start_next_task(now).unwrap().unwrap();
         store.finish_task(&t, "completed", "done", now).unwrap();
         assert_eq!(inbox_count(&store, "task-3", "third goal"), 1);
-        let p = store.add_proc("echo new", "chat", "1000").unwrap().unwrap();
+        let p = store
+            .add_proc_for("echo new", "chat", "1000", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(p.id, 3);
         store
             .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
@@ -5855,7 +6245,7 @@ mod tests {
         }
         store.start_next_task(now).unwrap().unwrap();
         for _ in 0..2 {
-            store.add_proc("sleep 9", "chat", "1000").unwrap();
+            store.add_proc_for("sleep 9", "chat", "1000", None).unwrap();
         }
         store
             .db

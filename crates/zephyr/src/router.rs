@@ -1,7 +1,7 @@
 //! Inbound → inbox → `main` child → outbox → channel, with crash recovery (DESIGN §4.2).
 
 use crate::channel::{Activity, Channel, Inbound, Outbound};
-use crate::config::{Account, Config, BUDGET_NOTICE};
+use crate::config::{Account, Config, BUDGET_LIFTED, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::settings::{Actor, Apply, Outcome, Setting};
 use crate::store::{InboxRow, SessionOrigin, Store};
@@ -331,6 +331,12 @@ pub async fn run<C: Channel>(
     // After the adoption, so an approved action whose command is still running stays running;
     // a delay that came due while down waits for the owner (approvals spec §4.9).
     crate::actions::restore(&router.cfg, &router.store, crate::now());
+    // Once, at this version's first start: over the budget and running, the owner resumed under
+    // the rule before this one (DESIGN §4.4).
+    log(router
+        .store
+        .migrate_budget(router.cfg.budget.as_ref())
+        .map_err(Into::into));
     // A card's number was in the memory of the daemon before this one: what is still open is
     // closed at its issuer, never filled again (DESIGN §4.25).
     crate::cards::close_all(
@@ -827,7 +833,7 @@ impl<'a> Router<'a> {
                     let beat = self.cfg.state_dir().join(crate::supervise::HEARTBEAT);
                     let up = self.child.is_some() as u8;
                     let line = format!("{} {up} {}\n", crate::now(), self.spawn_failures);
-                    let _ = std::fs::write(beat, line);
+                    crate::supervise::write_heartbeat(&beat, &line);
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
@@ -847,6 +853,11 @@ impl<'a> Router<'a> {
                     crate::cards::tick(&self.cfg, &self.store, crate::now());
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
+                    // A limit raised over today's spend ends its pause, as midnight does: after
+                    // the actions' look, so a delay due meanwhile is asked again, never sent.
+                    if self.store.lift_budget(self.cfg.budget.as_ref()).unwrap_or(false) {
+                        log(self.store.notify_last_owner(BUDGET_LIFTED).map_err(Into::into));
+                    }
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -2047,6 +2058,9 @@ impl<'a> Router<'a> {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
                 }
                 self.child = Some(child);
+                // A fresh child starts on the current session, credentials and rules: a restart
+                // asked for before it (then a crash) is done.
+                self.restart = false;
                 self.account = account;
                 self.pending_model = None;
                 self.auth_stamp = self.auth_mtime();
@@ -2332,6 +2346,10 @@ impl<'a> Router<'a> {
                     crate::actions::resume(&self.cfg, &self.store, crate::now());
                     self.due_held = false;
                 }
+                log(self
+                    .store
+                    .resume_budget(self.cfg.budget.as_ref())
+                    .map_err(Into::into));
                 log(self.store.set_paused(None).map_err(Into::into));
                 return "[zephyr] resumed".into();
             }
@@ -2372,6 +2390,12 @@ impl<'a> Router<'a> {
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
         // Rows stay `new` while the child is down, the gateway is paused or stopping.
         if self.stopping || self.child.is_none() || self.store.pause_reason()?.is_some() {
+            return Ok(());
+        }
+        // A restart asked for mid-run (`/new`, a refresh, a rule) comes before the next prompt,
+        // or that prompt opens a run on the old child; the new child's reconcile sends it.
+        if self.restart && !self.busy {
+            self.restart_if_idle().await;
             return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
@@ -4890,7 +4914,7 @@ impl<'a> Router<'a> {
 
     /// Refreshes near-expiry OAuth credentials, then restarts the child once it is idle.
     async fn auth_check(&mut self) {
-        let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
+        let every = crate::auth_keeper::check_every(self.cfg.auth.refresh_minutes);
         self.auth_at = Instant::now() + every;
         if self.refreshing.is_some() {
             return; // one at a time: a rotating refresh token must not race itself
@@ -6226,7 +6250,7 @@ mod tests {
             derived: None,
         };
         let id = r.store.insert_inbox(&m).unwrap().unwrap();
-        r.store.mark_dispatched(id).unwrap();
+        r.store.mark_dispatched_as(id, "prompt").unwrap();
         // The main session's id cannot be read.
         rusqlite::Connection::open(cfg.db_path())
             .unwrap()
