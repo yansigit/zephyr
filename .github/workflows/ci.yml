@@ -79,7 +79,11 @@ jobs:
         with:
           persist-credentials: false
       # Two steps, so the token is never in the environment of a process that builds the branch:
-      # this one only asks the Actions API which checks to rescue.
+      # this one only asks the Actions API which checks to rescue. It runs the branch's own
+      # ci.sh with the token, on purpose: only the owner pushes branches to this private repo, the
+      # token reads only (actions, checks, contents), and a branch could as well edit this file.
+      # What the split keeps out is third-party code, the crates' build scripts, which never run
+      # in this step.
       - id: which
         run: .github/ci.sh rescue-plan
         env:
