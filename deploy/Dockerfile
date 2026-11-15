@@ -12,9 +12,9 @@
 #   --build-arg RPI_PACKAGE_REPO= --build-arg PLUGINS_REPO=
 # the image has zephyr, the policy plugin, Cursor and rpi's built-in providers only.
 
-ARG RPI_VERSION=0.21.2
-ARG RPI_SHA256_AMD64=f4477ded68eb49f069d2ec4e197371812d33cafbc7985a3531c4d3cd09ace657
-ARG RPI_SHA256_ARM64=c05cceff56cefff43c66c9e42c4443fbdaa07988788f71796d07ce640545383e
+ARG RPI_VERSION=0.24.1
+ARG RPI_SHA256_AMD64=e49f6f8646eb434f882ea04208812443318a92333e9320ee3b74bbea89f46d89
+ARG RPI_SHA256_ARM64=066b62f8474bcf7885a4c7c69260c27395b2847d52c87b6d9809c8b45b6e25ea
 ARG RPI_PACKAGE_REPO=https://github.com/yansigit/rpi-package.git
 ARG RPI_PACKAGE_REF=11e8ac183cf582144b8562ea19ec6f2620553cc3 # feat/providers-openai-codex: main cabdb15 + Antigravity, OpenCode Go, Codex
 ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git

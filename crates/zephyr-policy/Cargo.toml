@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "=0.21.2"
+rpi-plugin-sdk = "=0.24.1"
 # Already in the tree (zephyr's): the gate socket's peer uid (SO_PEERCRED; std's is unstable).
 libc = "0.2"
 serde.workspace = true

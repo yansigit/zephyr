@@ -17,7 +17,7 @@ cargo test -p zephyr --test router some_name  # one test by name filter
 cargo clippy --all-targets && cargo fmt
 cargo deny check advisories bans               # what CI's deny job runs
 
-# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.21.2/bin/rpi
+# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.24.1/bin/rpi
 # (or RPI_BIN=<path>; deploy/bump-rpi.sh rewrites that default path)
 cargo test -p zephyr --test real_rpi -- --ignored
 cargo test -p zephyr-policy --test rpi_load -- --ignored
@@ -57,9 +57,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   the outbox (client id = Discord nonce / BlueBubbles tempGuid), budgets, `/stop` `/pause` `/model`
   `/reload`, and crash reconcile (re-send rows whose text isn't in `get_messages`).
 - `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
-  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.21.x (`RPI_PIN` in
-  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.21.2"` in zephyr-policy and zephyr-cursor,
-  and `rpi-tui = "=0.21.2"` in zephyr); `deploy/bump-rpi.sh` moves them all. `rpi-bump.yml` proposes
+  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.24.x (`RPI_PIN` in
+  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.24.1"` in zephyr-policy and zephyr-cursor,
+  and `rpi-tui = "=0.24.1"` in zephyr); `deploy/bump-rpi.sh` moves them all. `rpi-bump.yml` proposes
   each bump as a PR (edits only, no build) and starts ci.yml on it, with its `real-rpi` check; a
   sweep fast-forwards main to that exact commit once `ci-ok` and `real-rpi` pass and the diff is a
   pure pin move (`.github/bump-check.py`). Anything else waits for a person, and a branch with a

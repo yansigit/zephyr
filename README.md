@@ -1286,7 +1286,7 @@ using a subscription unattended; check that your use fits them.
 
 `zephyr up --build` builds `deploy/Dockerfile` from pinned sources: this repo, `rpi-providers` from
 `yansigit/rpi-package`, the Cursor provider from `crates/zephyr-cursor`, `rpi-claude-agent` from
-`yansigit/rpi-provider-plugins`, and the upstream `rpi` 0.21.2 release (sha256 checked). Your `gh
+`yansigit/rpi-provider-plugins`, and the upstream `rpi` 0.24.1 release (sha256 checked). Your `gh
 auth token` goes in as the BuildKit secret `gh_token`, which is never stored in a layer. The
 provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`);
 local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
