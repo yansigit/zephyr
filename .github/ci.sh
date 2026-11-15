@@ -250,8 +250,9 @@ check() {
       local v s f dir
       v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
       s=$(sed -n 's/^ARG RPI_SHA256_AMD64=//p' deploy/Dockerfile)
-      [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $s =~ ^[0-9a-f]{64}$ ]] ||
+      if ! [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ $s =~ ^[0-9a-f]{64}$ ]]; then
         die "deploy/Dockerfile pins no rpi release"
+      fi
       f=rpi-v$v-x86_64-unknown-linux-gnu.tar.gz
       dir=$(mktemp -d)
       curl -fsSLo "$dir/$f" "https://github.com/bigfish1913/pi-rust/releases/download/v$v/$f" ||
