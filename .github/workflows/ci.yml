@@ -7,7 +7,11 @@
 # else on zephyr-local (everything, once GitHub refused a hosted job this month); `local` runs
 # everything there, `hosted` everything on GitHub (the server is down). `gh workflow run ci.yml -f
 # hosted=true` tests on GitHub-hosted whatever was refused, as after a raised spending limit.
-# The ignored tests need the pinned rpi binary: deploy/release.sh runs them.
+# A third check, real-rpi, runs the ignored tests against the pinned rpi binary (fetched by the
+# Dockerfile's version and sha256) on the nightly run, on an `rpi-bump/*` branch, when a commit
+# moves the Dockerfile's RPI_VERSION, and on `gh workflow run ci.yml -f real_rpi=true`.
+# rpi-bump.yml dispatches this workflow on the branch it proposes and merges that commit only when
+# this run's `ci-ok` and `real-rpi` both passed; deploy/release.sh runs the same tests.
 name: ci
 on:
   pull_request:
@@ -20,6 +24,10 @@ on:
     inputs:
       hosted:
         description: "test on GitHub-hosted even after a refusal this month"
+        type: boolean
+        default: false
+      real_rpi:
+        description: "also run the ignored tests against the pinned rpi binary"
         type: boolean
         default: false
 permissions:
@@ -53,6 +61,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
           ZEPHYR_TRY_HOSTED: ${{ inputs.hosted }}
+          ZEPHYR_REAL_RPI_CHECK: ${{ inputs.real_rpi }}
       - id: skip
         run: .github/ci.sh skip
         env:

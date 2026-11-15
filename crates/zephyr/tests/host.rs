@@ -3699,10 +3699,14 @@ fn the_image_workflow_smoke_tests_every_extension() {
     }
 }
 
-/// A crate's build script must never read a GitHub token: GH_TOKEN is set only in a step's own
-/// `env` (never a job's or the workflow's), a step that sets it runs no cargo (nor `ci.sh run` or
-/// `ci.sh rescue`, which run the checks, nor bump-rpi.sh's `cargo update`), `ci.sh rescue` refuses
-/// to start with one in its environment, and no checkout keeps its token in `.git/config`.
+/// A crate's build script must never read a GitHub token: the token reaches a step only as
+/// GH_TOKEN in the step's own `env` (never a job's or the workflow's, never under another name), a
+/// step that sets it runs no cargo (nor `ci.sh run` or `ci.sh rescue`, which run the checks, nor
+/// bump-rpi.sh's `cargo update`), `ci.sh rescue` refuses to start with one in its environment, and
+/// no checkout keeps its token in `.git/config`.
+/// rpi-bump.yml, whose jobs can push: `propose` edits the pins without running the new binary and
+/// leaves the testing to ci.yml; `merge` runs nothing of the PR's, and fast-forwards main only to
+/// a commit whose ci.yml run passed and whose diff the checker found to be the pin move.
 #[test]
 fn no_step_that_runs_cargo_holds_a_github_token() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3745,6 +3749,18 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
                     block(i)
                 );
             }
+            // The run's token under one name only, so the rule below sees every step that
+            // holds it: no other spelling of it, and no other variable named as a token.
+            let key = line.trim_start().split(':').next().unwrap();
+            let token_key =
+                key.ends_with("TOKEN") && key.bytes().all(|b| b.is_ascii_uppercase() || b == b'_');
+            if line.contains("github.token") || token_key {
+                assert_eq!(
+                    line.trim(),
+                    "GH_TOKEN: ${{ github.token }}",
+                    "{path:?}: a token under another name: {line}"
+                );
+            }
             if !line.trim_start().starts_with("GH_TOKEN:") {
                 continue;
             }
@@ -3757,8 +3773,10 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             }
             .unwrap_or_else(|| panic!("{path:?}: GH_TOKEN outside a step: {line}"));
             let step = block(step);
+            // Words as a shell would run them: quotes, brackets, pipes and `$(` end one too.
             let words: Vec<&str> = step
-                .split(|c: char| c.is_whitespace() || c == ';')
+                .split(|c: char| !(c.is_ascii_alphanumeric() || "_./-".contains(c)))
+                .filter(|w| !w.is_empty())
                 .collect();
             let ci_run = (words.windows(2))
                 .any(|w| w == [".github/ci.sh", "run"] || w == [".github/ci.sh", "rescue"]);
@@ -3768,93 +3786,280 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
             assert!(!ci_run && !cargo, "{path:?}:\n{step}");
         }
         if path.ends_with("rpi-bump.yml") {
-            // The bump's build and tests hold no token at all; the one job that can push runs no
-            // cargo, only on a fresh hosted runner, and checks the build's patch before applying it.
-            let job = |name: &str| block(lines.iter().position(|l| *l == name).unwrap());
-            let build = job("  build:");
-            assert!(build.contains("cargo test"), "{build}");
+            // rpi-bump proposes a PR, ordinary CI tests it, and a job that runs nothing of the
+            // PR's merges it. Nothing in the workflow builds or tests, holds a secret, needs a
+            // GitHub-hosted runner or Docker, or is started by another workflow's run.
+            let all = lines.join("\n");
+            let words = |text: &str| -> Vec<String> {
+                text.split(|c: char| c.is_whitespace() || c == ';')
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert!(!words(&all).iter().any(|w| w == "cargo"), "{all}");
+            // The token is on five steps, by name; no job and no workflow `env` hands one on.
+            assert_eq!(all.matches("github.token").count(), 5, "{all}");
+            assert_eq!(all.matches("GH_TOKEN: ${{ github.token }}").count(), 5);
             assert!(
-                !build.contains("GH_TOKEN") && !build.contains("token"),
-                "{build}"
+                !all.contains("\nenv:") && !all.contains("\n    env:"),
+                "{all}"
             );
-            // Its cargo and the bump run only in the sandbox (a throwaway container, from a copy
-            // of the script made first), on a hosted runner for its Docker, with no cache action.
-            assert!(build.contains("\n    runs-on: ubuntu-latest\n"), "{build}");
-            let sandboxed = "\"$RUNNER_TEMP/sandbox.sh\" run ";
-            // With what the sandbox runs taken out (the bump, and the tests' quoted script),
-            // nothing in the job names cargo or the bump.
-            let mut outside = build.replace(&format!("{sandboxed}deploy/bump-rpi.sh "), "");
-            let tests = format!("{sandboxed}sh -c '");
-            let at = outside.find(&tests).expect("the tests run in the sandbox");
-            let end = at + tests.len() + outside[at + tests.len()..].find('\'').unwrap();
-            outside.replace_range(at..=end, "");
-            let words: Vec<&str> =
-                (outside.split(|c: char| c.is_whitespace() || c == ';')).collect();
+            // What starts it, and what each job may do, to the letter.
+            let on = "\non:\n  schedule:\n    - cron: \"17 21 * * *\"\n    - cron: \"47 22 * * *\"\n    \
+                      - cron: \"47 0 * * *\"\n    - cron: \"47 3 * * *\"\n  workflow_dispatch:\n    inputs:\n      \
+                      version:\n        description: \"rpi version to propose (default: the latest)\"\n        \
+                      required: false\n      merge:\n        description: \"only look for a tested bump to merge\"\n        \
+                      type: boolean\n        default: false\npermissions:\n  contents: read\ndefaults:\n";
+            assert!(all.contains(on), "{all}");
             for never in [
                 "cargo",
-                "deploy/bump-rpi.sh",
-                "rust-cache",
-                "rust-toolchain",
+                "push -f",
+                "continue-on-error",
+                "pull_request",
+                "id-token",
+                "always()",
+                "sandbox.sh",
+                "secrets.",
+                "runs-on: ubuntu-latest",
+                "workflow_run:",
+                "docker",
+                "path:",
+                "ci.sh",
+                "upload-artifact",
+                "download-artifact",
             ] {
-                assert!(
-                    !words.iter().any(|w| w.contains(never)),
-                    "{never} outside the sandbox:\n{outside}"
-                );
+                assert!(!all.contains(never), "{never}:\n{all}");
             }
-            let copy = build
-                .find("cp .github/sandbox.sh \"$RUNNER_TEMP/sandbox.sh\"")
-                .unwrap();
-            assert!(copy < build.find(sandboxed).unwrap(), "{build}");
-            let sandbox = read(&root.join(".github/sandbox.sh"));
-            assert!(
-                sandbox.contains("docker run --rm -v \"$PWD:/src\" -v \"$PWD/.git:/src/.git:ro\"")
-            );
-            let push = job("  push:");
-            let words: Vec<&str> = push
-                .split(|c: char| c.is_whitespace() || c == ';')
-                .collect();
-            assert!(!words.contains(&"cargo"), "{push}");
-            assert!(push.contains("\n    runs-on: ubuntu-latest\n"), "{push}");
-            assert!(!push.contains("zephyr-local"), "{push}");
-            // The checker from a copy outside the tree: the first gate, then git applies the
-            // patch, then what git wrote is checked, all before anything is pushed.
-            let at = |what: &str| push.find(what).unwrap_or_else(|| panic!("{what}: {push}"));
-            let order = [
-                "cp .github/bump-check.py \"$RUNNER_TEMP/bump-check.py\"",
-                "\"$RUNNER_TEMP/bump-check.py\" patch ",
-                "git -c core.quotePath=true apply --check ",
-                "git -c core.quotePath=true apply \"$RUNNER_TEMP",
-                "\"$RUNNER_TEMP/bump-check.py\" verify ",
-                "git push ",
-            ];
-            assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{push}");
-            // V is the gate's, and both jobs refuse any ref but main and check main out.
-            assert!(
-                push.contains("V: ${{ needs.gate.outputs.version }}"),
-                "{push}"
-            );
-            for job in [&build, &push] {
+            let job = |name: &str| block(lines.iter().position(|l| *l == name).unwrap());
+            let (propose, merge) = (job("  propose:"), job("  merge:"));
+            // Both jobs: where ci.yml's plan job runs, main's checkout and no other, and no ref
+            // but main.
+            for job in [&propose, &merge] {
                 assert!(
-                    job.contains("[ \"$GITHUB_REF\" = refs/heads/main ] ||"),
+                    job.contains("\n    runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}\n"),
                     "{job}"
                 );
+                assert!(
+                    job.contains("\n    steps:\n      - run: '[ \"$GITHUB_REF\" = refs/heads/main ] || { echo \"rpi-bump runs on main only, not $GITHUB_REF\" >&2; exit 1; }'\n      - uses: actions/checkout@"),
+                    "{job}"
+                );
+                assert_eq!(job.matches("\n    if: ").count(), 1, "{job}");
+                assert_eq!(job.matches("permissions:").count(), 1, "{job}");
+                assert_eq!(job.matches("uses: ").count(), 1, "{job}");
+                assert_eq!(job.matches("uses: actions/checkout@").count(), 1, "{job}");
+                assert_eq!(job.matches("ref: ").count(), 1, "{job}");
                 assert!(job.contains("ref: main\n"), "{job}");
             }
-            // The job before them reads, with gh and main's `ci.sh plan` alone (which reads the
-            // Actions API, to stop before hosted jobs GitHub would refuse): no other repository
-            // code, no cargo, nothing that writes.
-            let gate = job("  gate:");
-            assert!(gate.contains("pull-requests: read"), "{gate}");
-            assert!(gate.contains("ref: main\n"), "{gate}");
-            assert!(gate.contains(".github/ci.sh plan)"), "{gate}");
-            for never in ["write", "cargo", "deploy/"] {
-                assert!(!gate.contains(never), "{never}: {gate}");
+            for want in [
+                "\n    if: ${{ (github.event_name == 'workflow_dispatch' && !inputs.merge) || github.event.schedule == '17 21 * * *' }}\n",
+                "\n    concurrency: rpi-bump-propose\n",
+                "\n    permissions:\n      contents: write\n      pull-requests: write\n      actions: write\n    steps:\n",
+            ] {
+                assert!(propose.contains(want), "{want}:\n{propose}");
             }
-            assert_eq!(gate.matches(".github/").count(), 1, "{gate}");
+            for want in [
+                "\n    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.merge) || (github.event_name == 'schedule' && github.event.schedule != '17 21 * * *') }}\n",
+                "\n    concurrency: rpi-bump-merge\n",
+                "\n    permissions:\n      contents: write\n      pull-requests: read\n      actions: read\n    steps:\n",
+            ] {
+                assert!(merge.contains(want), "{want}:\n{merge}");
+            }
+            // propose: the one call of the bump edits only (the new binary is never unpacked or
+            // run), with its downloads outside the tree, in a step the loop above saw holds no
+            // token; the checker was copied out before it.
+            let bump = "RPI_BUMP_EDIT_ONLY=1 RPI_BUMP_DIR=\"$RUNNER_TEMP/rpi\" deploy/bump-rpi.sh \"$V\"\n";
+            assert_eq!(all.matches("deploy/bump-rpi.sh").count(), 1, "{all}");
+            assert_eq!(all.matches("RPI_BUMP_").count(), 2, "{all}");
+            let at = |text: &str, what: &str| {
+                text.find(what).unwrap_or_else(|| panic!("{what}: {text}"))
+            };
             assert!(
-                build.contains("if: needs.gate.outputs.go == 'true'"),
-                "{build}"
+                at(
+                    &propose,
+                    "cp .github/bump-check.py \"$RUNNER_TEMP/bump-check.py\""
+                ) < at(&propose, bump),
+                "{propose}"
             );
+            // Its push replaces the branch only as the job saw it, and its CI is ci.yml on the
+            // branch, with the real-rpi check.
+            assert!(
+                propose.contains("git push --force-with-lease=\"refs/heads/$b:$SEEN\" "),
+                "{propose}"
+            );
+            assert!(
+                at(&propose, bump) < at(&propose, "git push --force-with-lease="),
+                "{propose}"
+            );
+            // No other force anywhere, and the lease is on what `pick` saw; the step that edits
+            // holds nothing to push with.
+            assert_eq!(all.matches("--force").count(), 1, "{all}");
+            assert!(
+                propose.contains("-c core.hooksPath=/dev/null commit -qam \"$title\"\n"),
+                "{propose}"
+            );
+            assert!(
+                propose.contains("\n          SEEN: ${{ steps.pick.outputs.seen }}\n"),
+                "{propose}"
+            );
+            let edit = &propose[..at(&propose, bump)];
+            let edit = &edit[edit.rfind("\n      - ").unwrap()..];
+            assert!(
+                edit.starts_with("\n      - if: steps.pick.outputs.version != ''\n        env:\n          V: ${{ steps.pick.outputs.version }}\n        run: |\n"),
+                "{edit}"
+            );
+            assert!(
+                !edit.contains("TOKEN") && !edit.contains("github."),
+                "{edit}"
+            );
+            // A branch is the bot's only when the bot both wrote and committed all of it.
+            assert!(
+                propose.contains("any(.commits[]; (.author.login // \"\") != \"github-actions[bot]\"\n                  or (.committer.login // \"\") != \"github-actions[bot]\") then \"foreign\"\n"),
+                "{propose}"
+            );
+            assert_eq!(all.matches("git push ").count(), 3, "{all}");
+            assert_eq!(
+                propose
+                    .matches("gh workflow run ci.yml --repo \"$R\" --ref \"$b\" -f real_rpi=true")
+                    .count(),
+                2,
+                "{propose}"
+            );
+            assert_eq!(all.matches("gh workflow run").count(), 2, "{all}");
+            // merge: it cannot start a workflow, and runs no file of the repository but the
+            // checker, from its copy, with python's isolated mode.
+            assert!(
+                merge.contains("actions: read") && !merge.contains("actions: write"),
+                "{merge}"
+            );
+            assert!(!merge.contains("deploy/bump-rpi.sh"), "{merge}");
+            // The git it runs: nothing that could put the PR's files in the work tree but
+            // `git apply` of the gated patch, and no forced refspec.
+            let mut subcommands = Vec::new();
+            for (i, _) in merge.match_indices("git ") {
+                let before = merge[..i].chars().next_back().unwrap();
+                if before.is_ascii_alphanumeric() || ".-_/".contains(before) {
+                    continue;
+                }
+                let mut args = merge[i + 4..].split_whitespace();
+                let mut sub = args.next().unwrap();
+                while sub == "-c" {
+                    args.next().unwrap();
+                    sub = args.next().unwrap();
+                }
+                subcommands.push(sub);
+            }
+            subcommands.sort_unstable();
+            assert_eq!(
+                subcommands,
+                [
+                    "apply",
+                    "apply",
+                    "diff",
+                    "diff",
+                    "fetch",
+                    "push",
+                    "push",
+                    "rev-parse",
+                    "rev-parse",
+                    "rev-parse",
+                    "rev-parse",
+                    "rev-parse"
+                ],
+                "{merge}"
+            );
+            for want in [
+                "\n          git push \"$url\" \"$SHA:refs/heads/main\"\n",
+                "\n          git push \"$url\" --delete \"refs/heads/rpi-bump/v$V\" || echo \"could not delete rpi-bump/v$V\"",
+            ] {
+                assert!(merge.contains(want), "{want}:\n{merge}");
+            }
+            assert!(!merge.contains("\"+") && !merge.contains(" +"), "{merge}");
+            for (i, _) in merge.match_indices(".github/") {
+                let rest = &merge[i..];
+                assert!(
+                    rest.starts_with(".github/bump-check.py \"$RUNNER_TEMP/bump-check.py\"")
+                        || rest.starts_with(".github/workflows/ci.yml\""),
+                    "{}",
+                    &rest[..rest.len().min(80)]
+                );
+            }
+            assert_eq!(
+                merge.matches("deploy/").count(),
+                merge.matches("deploy/Dockerfile").count(),
+                "{merge}"
+            );
+            for (i, _) in merge.match_indices("python") {
+                assert!(
+                    merge[i..].starts_with("python3 -I \"$RUNNER_TEMP/bump-check.py\" "),
+                    "{}",
+                    &merge[i..]
+                );
+            }
+            let merge_words = words(&merge);
+            for never in [
+                "bash", "sh", "node", "perl", "ruby", "eval", "source", ".", "make", "npm", "pip",
+            ] {
+                assert!(!merge_words.iter().any(|w| w == never), "{never}:\n{merge}");
+            }
+            // The proof it asks for: ci.yml's own run, started by workflow_dispatch, for the PR's
+            // head commit, with ci-ok and real-rpi passed.
+            for want in [
+                "actions/workflows/ci.yml/runs?head_sha=$sha&event=workflow_dispatch",
+                ".event == \"workflow_dispatch\" and .head_sha == \"'\"$sha\"'\"",
+                "and .path == \".github/workflows/ci.yml\"",
+                "and (.status != \"completed\" or .conclusion != \"cancelled\"))] | sort_by(.created_at, .id) | last | .id // empty'",
+                "map(select(.name == \"ci-ok\")) | length > 0 and all(.[]; .conclusion == \"success\")",
+                "map(select(.name | test(\"^real-rpi \\\\(\"))) | length > 0 and all(.[]; .conclusion == \"success\")",
+                "jobs?filter=latest",
+                "select(.base.ref == \"main\" and .head.repo.full_name == \"'\"$R\"'\")",
+                "[[ $ref =~ ^rpi-bump/v([0-9]+\\.[0-9]+\\.[0-9]+)$ ]] || continue\n",
+                "[[ $sha =~ ^[0-9a-f]{40}$ ]]",
+                "echo \"$V is not above $old\" >&2\n            exit 1\n",
+            ] {
+                assert!(merge.contains(want), "{want}:\n{merge}");
+            }
+            // The commit is fetched, never checked out, and must be one commit on main; then the
+            // checker from its copy: the first gate, git applies the patch, what git wrote is
+            // checked (and is the commit's tree), all before main is fast-forwarded to exactly
+            // that commit, with no force.
+            let order = [
+                "git fetch -q --depth 2 ",
+                "[ \"$(git rev-parse -q --verify 'FETCH_HEAD^1')\" != \"$(git rev-parse HEAD)\" ]",
+                "--no-color HEAD FETCH_HEAD > \"$RUNNER_TEMP/bump.patch\"",
+                "[[ $V =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]] ||",
+                "[ \"$(printf '%s\\n%s\\n' \"$old\" \"$V\" | sort -V | tail -1)\" != \"$V\" ]",
+                "cp .github/bump-check.py \"$RUNNER_TEMP/bump-check.py\"",
+                "\"$RUNNER_TEMP/bump-check.py\" patch \"$RUNNER_TEMP/bump.patch\" &&",
+                "git -c core.quotePath=true apply --check \"$RUNNER_TEMP/bump.patch\" &&",
+                "git -c core.quotePath=true apply \"$RUNNER_TEMP/bump.patch\" &&",
+                "\"$RUNNER_TEMP/bump-check.py\" verify \"$old\" \"$V\" \"$amd64\" \"$arm64\" &&",
+                "git diff --no-ext-diff --no-textconv --quiet \"$SHA\" --",
+                "if pin_move; then",
+                "- if: steps.check.outputs.ok == 'true'",
+                "git push \"$url\" \"$SHA:refs/heads/main\"",
+            ];
+            assert!(
+                order
+                    .windows(2)
+                    .all(|w| at(&merge, w[0]) < at(&merge, w[1])),
+                "{merge}"
+            );
+            for never in [
+                "--force",
+                "push -f",
+                "git checkout",
+                "git switch",
+                "git merge",
+                "gh pr merge",
+            ] {
+                assert!(!merge.contains(never), "{never}:\n{merge}");
+            }
+            for want in [
+                "--no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/",
+                "if: steps.find.outputs.sha != ''",
+                "if: steps.fetch.outputs.ok == 'true'",
+            ] {
+                assert!(merge.contains(want), "{want}:\n{merge}");
+            }
         }
     }
     assert!(tokens >= 6, "{tokens}");
@@ -3873,43 +4078,42 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
         ci_yml.contains("run: .github/ci.sh rescue-plan"),
         "{ci_yml}"
     );
+    // The run rpi-bump starts on its branch asks for the real-rpi check through ci.yml's input,
+    // which reaches `ci.sh plan` alone. The check takes the release the Dockerfile pins, by the
+    // Dockerfile's sha256, before anything is unpacked or run, and a missing binary fails it.
+    for want in [
+        "      real_rpi:\n",
+        "          ZEPHYR_REAL_RPI_CHECK: ${{ inputs.real_rpi }}\n",
+    ] {
+        assert_eq!(ci_yml.matches(want).count(), 1, "{want}: {ci_yml}");
+    }
+    let real = &ci[ci.find("\n    real-rpi)\n").unwrap()..];
+    let real = &real[..real.find(";;").unwrap()];
+    let order = [
+        "s=$(sed -n 's/^ARG RPI_SHA256_AMD64=//p' deploy/Dockerfile)",
+        "curl -fsSLo \"$dir/$f\" \"https://github.com/bigfish1913/pi-rust/releases/download/v$v/$f\"",
+        "echo \"$s  $dir/$f\" | sha256sum -c --quiet - || die",
+        "tar -xzf \"$dir/$f\" --no-same-owner -C \"$dir\" ./rpi",
+        "[ \"$(\"$dir/rpi\" --version)\" = \"rpi $v\" ] || die",
+        "ZEPHYR_REAL_RPI=1 RPI_BIN=$dir/rpi cargo test --workspace -- --ignored ",
+    ];
+    let at = |what: &str| real.find(what).unwrap_or_else(|| panic!("{what}: {real}"));
+    assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{real}");
 }
 
-/// rpi-bump's push job applies the build's patch with `git apply`, then checks what git wrote:
-/// only the pin move. A real bump (tests/fixtures/rpi-bump.patch from bump-rpi.sh, and the
-/// Cargo.lock it was made on, their versions swapped for 9.8.7 and 9.9.0 so a later bump does not
-/// rewrite them) passes; each smuggled change is refused, by the first gate or by what was written.
-#[test]
-fn the_bump_check_passes_only_a_pin_move() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let fixtures = root.join("crates/zephyr/tests/fixtures");
-    let good = read(&fixtures.join("rpi-bump.patch"));
-    let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
-    let tmp = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    let (repo, home) = (tmp.join("repo"), tmp.join("home"));
-    std::fs::create_dir_all(&home).unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .current_dir(&repo)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", &home)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    };
+/// Writes into `repo` the repository tests/fixtures/rpi-bump.patch was made in, as far as the
+/// patch shows it, for the tests of rpi-bump's checks.
+fn bump_fixture_tree(repo: &Path, good: &str, lock: &str) {
     // The repository the patch was made in, as far as the patch shows it: each file's hunks'
     // old lines at their line numbers, filler between them (it never mentions the pin), and the
     // whole Cargo.lock.
-    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(repo).unwrap();
     for section in good.split("diff --git a/").skip(1) {
         let path = &section[..section.find(' ').unwrap()];
         let file = repo.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         if path == "Cargo.lock" {
-            std::fs::write(&file, &lock).unwrap();
+            std::fs::write(&file, lock).unwrap();
             continue;
         }
         let mut lines: Vec<String> = Vec::new();
@@ -3934,6 +4138,34 @@ fn the_bump_check_passes_only_a_pin_move() {
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
+}
+
+/// rpi-bump's merge job applies the PR's diff with `git apply`, then checks what git wrote:
+/// only the pin move. A real bump (tests/fixtures/rpi-bump.patch from bump-rpi.sh, and the
+/// Cargo.lock it was made on, their versions swapped for 9.8.7 and 9.9.0 so a later bump does not
+/// rewrite them) passes; each smuggled change is refused, by the first gate or by what was written.
+#[test]
+fn the_bump_check_passes_only_a_pin_move() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixtures = root.join("crates/zephyr/tests/fixtures");
+    let good = read(&fixtures.join("rpi-bump.patch"));
+    let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
+    let tmp = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (repo, home) = (tmp.join("repo"), tmp.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    bump_fixture_tree(&repo, &good, &lock);
     git(&["init", "-q"]);
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
@@ -4934,6 +5166,8 @@ case $e in
   */pulls/*) f=pr ;;
   */git/commits/*) f=gitcommit ;;
   */actions/workflows/ci.yml/runs) f=runs ;;
+  */actions/runs/*/attempts/*/jobs) f=attempt-jobs ;;
+  */check-runs/*/annotations) f=annotations ;;
   */actions/runs/*/jobs) f=${e%/jobs}; f=jobs-${f##*/} ;;
   */actions/runs) f=refusals ;;
   *) exit 1 ;;
@@ -4980,7 +5214,9 @@ jq -r "$filter" "$FAKE_API/$f.json"
         git(&["commit", "-qm", "change"]);
         git(&["rev-parse", "HEAD^{tree}"])
     };
-    let ci = |cmd: &str, vars: &[(&str, &str)]| {
+    // Runs ci.sh; what it wrote to GITHUB_OUTPUT, when it succeeded. Nothing of the run this
+    // test is itself part of (an rpi-bump branch, a manual input) reaches it.
+    let try_ci = |cmd: &str, vars: &[(&str, &str)]| {
         let out_file = tmp.join("output");
         let _ = std::fs::remove_file(&out_file);
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
@@ -4993,13 +5229,23 @@ jq -r "$filter" "$FAKE_API/$f.json"
             .env("GITHUB_REPOSITORY", "o/r")
             .env("GITHUB_SHA", "a".repeat(40))
             .env("GITHUB_REF", "refs/heads/main")
+            .env("GITHUB_REF_NAME", "main")
+            .env_remove("GITHUB_HEAD_REF")
+            .env_remove("ZEPHYR_REAL_RPI_CHECK")
+            .env_remove("GITHUB_STEP_SUMMARY")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("HOME", &tmp)
             .envs(vars.iter().copied())
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
-        std::fs::read_to_string(&out_file).unwrap()
+        if out.status.success() {
+            Ok(std::fs::read_to_string(&out_file).unwrap())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).to_string())
+        }
+    };
+    let ci = |cmd: &str, vars: &[(&str, &str)]| {
+        try_ci(cmd, vars).unwrap_or_else(|err| panic!("ci.sh {cmd} {vars:?}: {err}"))
     };
     let skip = |vars: &[(&str, &str)]| {
         ci("skip", vars)
@@ -5025,26 +5271,88 @@ jq -r "$filter" "$FAKE_API/$f.json"
         (all_local.to_string(), false)
     );
     assert_eq!(matrix("push", "both"), (all_local.to_string(), false));
-    assert_eq!(matrix("schedule", "local"), (all_local.to_string(), false));
-    let nightly = all_local.replace(
+    // The nightly run also tests against the pinned rpi binary: a third check, never on
+    // GitHub's runner while zephyr-local is up.
+    let with_real = |m: &str, runner: &str| {
+        m.replace(
+            "]}",
+            &format!(r#",{{"check":"real-rpi","runner":"{runner}"}}]}}"#),
+        )
+    };
+    let all_local_real = with_real(all_local, "zephyr-local");
+    assert_eq!(matrix("schedule", "local"), (all_local_real.clone(), false));
+    let test_hosted = all_local.replace(
         r#"{"check":"test","runner":"zephyr-local"}"#,
         r#"{"check":"test","runner":"ubuntu-latest"}"#,
     );
+    let nightly = with_real(&test_hosted, "zephyr-local");
     assert_eq!(matrix("schedule", "both"), (nightly.clone(), true));
 
+    // real-rpi is also planned when asked for (ci.yml's manual input `real_rpi`, which rpi-bump
+    // sets on the branch it proposes) and on an rpi-bump branch, a PR's or a pushed one; nothing
+    // else adds it while the pin stays where it is.
+    let planned = |vars: &[(&str, &str)]| {
+        let out = ci("plan", vars);
+        let m = out.lines().find_map(|l| l.strip_prefix("matrix=")).unwrap();
+        m.to_string()
+    };
+    let manual = ("GITHUB_EVENT_NAME", "workflow_dispatch");
+    let pull = ("GITHUB_EVENT_NAME", "pull_request");
+    assert_eq!(planned(&[manual]), all_local);
+    assert_eq!(
+        planned(&[manual, ("ZEPHYR_REAL_RPI_CHECK", "false")]),
+        all_local
+    );
+    assert_eq!(
+        planned(&[manual, ("ZEPHYR_REAL_RPI_CHECK", "true")]),
+        all_local_real
+    );
+    assert_eq!(
+        planned(&[manual, ("GITHUB_REF_NAME", "rpi-bump/v1.2.3")]),
+        all_local_real
+    );
+    assert_eq!(
+        planned(&[pull, ("GITHUB_HEAD_REF", "rpi-bump/v1.2.3")]),
+        all_local_real
+    );
+    // A PR's own branch decides, not the ref of its merge commit, and only a branch under
+    // `rpi-bump/`.
+    assert_eq!(
+        planned(&[
+            pull,
+            ("GITHUB_HEAD_REF", "fix/x"),
+            ("GITHUB_REF_NAME", "rpi-bump/v1.2.3")
+        ]),
+        all_local
+    );
+    assert_eq!(
+        planned(&[pull, ("GITHUB_HEAD_REF", "fix/rpi-bump/v1.2.3")]),
+        all_local
+    );
+    // With the server down (ZEPHYR_CI=hosted) it goes where everything goes.
+    let all_hosted = all_local.replace("zephyr-local", "ubuntu-latest");
+    assert_eq!(
+        planned(&[
+            manual,
+            ("ZEPHYR_CI", "hosted"),
+            ("ZEPHYR_REAL_RPI_CHECK", "true")
+        ]),
+        with_real(&all_hosted, "ubuntu-latest")
+    );
+
     // Once GitHub refused a hosted job this month, and started none since, every job stays here
-    // (the nightly's test, image.yml's and rpi-bump.yml's `hosted`) until the month ends, so the
+    // (the nightly's test and image.yml's `hosted`) until the month ends, so the
     // nightly is not refused again each night. The newest run that tried hosted decides.
     let now = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
         .output()
         .unwrap();
     let now = String::from_utf8(now.stdout).unwrap().trim().to_string();
-    let runs = |list: &[(u32, &str, &str, &str)]| {
+    let runs = |list: &[(u32, &str, &str, &str, &str)]| {
         let list: Vec<String> = (list.iter())
-            .map(|(id, event, created, branch)| {
+            .map(|(id, event, created, branch, workflow)| {
                 format!(
-                    r#"{{"id":{id},"event":"{event}","created_at":"{created}","head_branch":"{branch}"}}"#
+                    r#"{{"id":{id},"event":"{event}","created_at":"{created}","head_branch":"{branch}","path":".github/workflows/{workflow}.yml"}}"#
                 )
             })
             .collect();
@@ -5081,31 +5389,46 @@ jq -r "$filter" "$FAKE_API/$f.json"
         placed(&all)
     };
     let on_github = (nightly.clone(), "ubuntu-latest".into(), "true".into());
-    let kept_here = (all_local.to_string(), "zephyr-local".into(), "false".into());
-    // rpi-bump.yml's run 5: its hosted build refused (its push skipped).
+    let kept_here = (
+        all_local_real.clone(),
+        "zephyr-local".into(),
+        "false".into(),
+    );
+    // Run 5: one job here, a hosted job refused and the one that needed it skipped.
     jobs(5, &[here, refused, skipped]);
-    runs(&[(5, "schedule", &now, "main")]);
+    runs(&[(5, "schedule", &now, "main", "ci")]);
     assert_eq!(nightly_at(&[]), kept_here);
     // A later run that tried no hosted job (a gate that stopped) changes nothing.
     jobs(6, &[here]);
-    runs(&[(6, "schedule", &now, "main"), (5, "schedule", &now, "main")]);
+    runs(&[
+        (6, "schedule", &now, "main", "ci"),
+        (5, "schedule", &now, "main", "ci"),
+    ]);
+    assert_eq!(nightly_at(&[]), kept_here);
+    // Nor do rpi-bump's runs, four a day and never on GitHub's runner, however many came
+    // since: they are not among the runs looked at, so the refusal still stands.
+    let mut since: Vec<(u32, &str, &str, &str, &str)> = (100..130)
+        .map(|id| (id, "schedule", now.as_str(), "main", "rpi-bump"))
+        .collect();
+    since.push((5, "schedule", &now, "main", "ci"));
+    runs(&since);
     assert_eq!(nightly_at(&[]), kept_here);
     // One that GitHub started (a manual run after a raised limit) ends it.
     jobs(7, &[here, started]);
     runs(&[
-        (7, "workflow_dispatch", &now, "main"),
-        (6, "schedule", &now, "main"),
-        (5, "schedule", &now, "main"),
+        (7, "workflow_dispatch", &now, "main", "ci"),
+        (6, "schedule", &now, "main", "ci"),
+        (5, "schedule", &now, "main", "ci"),
     ]);
     assert_eq!(nightly_at(&[]), on_github);
     // A release tag's image build counts; last month, a pull request and a branch push do not.
     jobs(8, &[refused]);
-    runs(&[(8, "push", &now, "v0.11.0")]);
+    runs(&[(8, "push", &now, "v0.11.0", "image")]);
     assert_eq!(nightly_at(&[]), kept_here);
     runs(&[
-        (8, "push", &now, "main"),
-        (9, "pull_request", &now, "fix/x"),
-        (10, "schedule", "2000-01-31T23:00:00Z", "main"),
+        (8, "push", &now, "main", "ci"),
+        (9, "pull_request", &now, "fix/x", "ci"),
+        (10, "schedule", "2000-01-31T23:00:00Z", "main", "ci"),
     ]);
     jobs(9, &[refused]);
     jobs(10, &[refused]);
@@ -5116,13 +5439,16 @@ jq -r "$filter" "$FAKE_API/$f.json"
     let rerun = [("GITHUB_RUN_ID", "11"), ("GITHUB_RUN_ATTEMPT", "2")];
     assert_eq!(nightly_at(&rerun), kept_here);
     // Asked to try hosted (ci.yml's manual input), the test goes there whatever was refused.
-    runs(&[(5, "schedule", &now, "main")]);
+    runs(&[(5, "schedule", &now, "main", "ci")]);
     let tried = placed(&[
         ("GITHUB_EVENT_NAME", "workflow_dispatch"),
         ("ZEPHYR_CI", "both"),
         ("ZEPHYR_TRY_HOSTED", "true"),
     ]);
-    assert_eq!(tried, on_github);
+    assert_eq!(
+        tried,
+        (test_hosted.clone(), "ubuntu-latest".into(), "true".into())
+    );
     // An API that cannot be read means trying hosted.
     assert_eq!(nightly_at(&[("FAKE_FAIL", "1")]), on_github);
     runs(&[]);
@@ -5255,6 +5581,1472 @@ jq -r "$filter" "$FAKE_API/$f.json"
         ]),
         ""
     );
+
+    // A commit that moves the Dockerfile's RPI_VERSION is tested against that rpi, whatever
+    // branch or event brought it; any other change to the Dockerfile is not. When the commit
+    // before cannot be read (it had no Dockerfile, or there is none), the pin counts as moved.
+    let dockerfile = |text: &str, reset: bool| {
+        if reset {
+            git(&["reset", "-q", "--hard", &base]);
+        }
+        std::fs::create_dir_all(repo.join("deploy")).unwrap();
+        std::fs::write(repo.join("deploy/Dockerfile"), text).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "dockerfile"]);
+    };
+    let push_event = ("GITHUB_EVENT_NAME", "push");
+    dockerfile("FROM x\nARG RPI_VERSION=1.0.0\nARG OTHER=1\n", true);
+    assert_eq!(planned(&[push_event]), all_local_real);
+    dockerfile("FROM x\nARG RPI_VERSION=1.0.0\nARG OTHER=2\n", false);
+    assert_eq!(planned(&[push_event]), all_local);
+    assert_eq!(planned(&[pull]), all_local);
+    dockerfile("FROM x\nARG RPI_VERSION=1.0.1\nARG OTHER=2\n", false);
+    assert_eq!(planned(&[push_event]), all_local_real);
+    assert_eq!(planned(&[pull]), all_local_real);
+    // The next commit leaves the pin alone again.
+    dockerfile("FROM y\nARG RPI_VERSION=1.0.1\nARG OTHER=2\n", false);
+    assert_eq!(planned(&[pull]), all_local);
+    git(&["checkout", "-q", "--orphan", "alone"]);
+    git(&["commit", "-qm", "no parent"]);
+    assert_eq!(planned(&[pull]), all_local_real);
+
+    // rescue-plan: a hosted test GitHub refused is run here, but never past a real-rpi check
+    // that ran and failed: the bump it tested must not reach ci-ok.
+    let job = |id: u32, name: &str, conclusion: &str, ran: bool| {
+        let (steps, runner) = match ran {
+            true => (r#"[{"name":"x"}]"#, "zephyr-runner-1"),
+            false => ("[]", ""),
+        };
+        format!(
+            r#"{{"id":{id},"name":"{name}","conclusion":"{conclusion}","steps":{steps},"runner_name":"{runner}"}}"#
+        )
+    };
+    let attempt = |list: &[String]| {
+        fixture(
+            "attempt-jobs",
+            &format!(r#"{{"jobs":[{}]}}"#, list.join(",")),
+        )
+    };
+    fixture(
+        "annotations",
+        r#"[{"message":"The job was not started because the spending limit was reached."}]"#,
+    );
+    let rescue_plan = || try_ci("rescue-plan", &[("GITHUB_RUN_ID", "77")]);
+    let others = [
+        job(1, "plan", "success", true),
+        job(2, "lint (zephyr-local)", "success", true),
+        job(3, "test (ubuntu-latest)", "failure", false),
+    ];
+    let with = |real: String| {
+        let mut all = others.to_vec();
+        all.push(real);
+        all
+    };
+    attempt(&with(job(4, "real-rpi (zephyr-local)", "success", true)));
+    assert_eq!(rescue_plan().unwrap(), "checks<<EOF\ntest\nEOF\n");
+    for conclusion in ["failure", "cancelled"] {
+        attempt(&with(job(4, "real-rpi (zephyr-local)", conclusion, true)));
+        let err = rescue_plan().unwrap_err();
+        assert!(
+            err.contains("did not pass: real-rpi (zephyr-local)"),
+            "{err}"
+        );
+    }
+    // One GitHub would not start is rescued like any other check.
+    attempt(&with(job(4, "real-rpi (ubuntu-latest)", "failure", false)));
+    assert_eq!(rescue_plan().unwrap(), "checks<<EOF\ntest\nreal-rpi\nEOF\n");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// bump-rpi.sh with RPI_BUMP_EDIT_ONLY=1 moves the pins without unpacking or running the release's
+/// binary (rpi-bump.yml's propose job, whose other steps hold a token that can push); without it
+/// the binary is unpacked and asked its version. The release is a fake curl serving a tarball
+/// whose `rpi` leaves a marker when run, with its matching `.sha256`; cargo is a fake too.
+#[test]
+fn the_bump_can_edit_the_pins_without_running_the_new_rpi() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tmp = std::env::temp_dir().join(format!("zephyr-bump-edit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (bin, release) = (tmp.join("bin"), tmp.join("release"));
+    for dir in [bin.clone(), release.clone()] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let (old, new) = ("9.8.7", "9.9.0");
+    let script = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // The release: one tarball per target, each holding ./rpi, and its .sha256.
+    script(
+        &release.join("rpi"),
+        &format!("#!/bin/sh\necho ran >> \"$MARKER\"\necho \"rpi {new}\"\n"),
+    );
+    for target in ["x86_64", "aarch64"] {
+        let name = format!("rpi-v{new}-{target}-unknown-linux-gnu.tar.gz");
+        let made = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "tar -czf {name} ./rpi && sha256sum {name} > {name}.sha256"
+            ))
+            .current_dir(&release)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+    // curl answers from that folder, by the URL's last part, to -o's file or stdout.
+    script(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out= url=
+while [ $# -gt 0 ]; do
+  case $1 in -fsSLo) out=$2; shift ;; -*) ;; *) url=$1 ;; esac
+  shift
+done
+f=$FAKE_RELEASE/${url##*/}
+[ -f "$f" ] || exit 22
+if [ -n "$out" ]; then cp "$f" "$out"; else cat "$f"; fi
+"#,
+    );
+    script(
+        &bin.join("cargo"),
+        "#!/bin/sh\necho \"$*\" >> \"$CARGO_LOG\"\n",
+    );
+    // A copy of the script in a tree with each file it edits, pinned to the old version.
+    let tree = |name: &str| {
+        let repo = tmp.join(name);
+        for (path, text) in [
+            (
+                "deploy/Dockerfile",
+                format!("FROM x\nARG RPI_VERSION={old}\nARG RPI_SHA256_AMD64={}\nARG RPI_SHA256_ARM64={}\n", "a".repeat(64), "b".repeat(64)),
+            ),
+            (
+                "crates/zephyr/src/main.rs",
+                "const RPI_PIN: &str = \"rpi 9.8.\";\n".to_string(),
+            ),
+            (
+                "crates/zephyr/Cargo.toml",
+                format!("[dependencies]\nrpi-tui = \"={old}\"\n"),
+            ),
+            (
+                "crates/zephyr/tests/fake-rpi.py",
+                format!("print(\"rpi {old}\")\n"),
+            ),
+            (
+                "crates/zephyr/tests/real_rpi.rs",
+                format!("// /opt/rpi-{old}/bin/rpi\n"),
+            ),
+            ("README.md", format!("the upstream `rpi` {old} release\n")),
+            ("CLAUDE.md", "rpi is pinned to 9.8.x\n".to_string()),
+        ] {
+            let file = repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        std::fs::copy(
+            root.join("deploy/bump-rpi.sh"),
+            repo.join("deploy/bump-rpi.sh"),
+        )
+        .unwrap();
+        repo
+    };
+    let bump = |name: &str, edit_only: bool| {
+        let repo = tree(name);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut cmd = Command::new("bash");
+        cmd.args(["deploy/bump-rpi.sh", new])
+            .current_dir(&repo)
+            .env("PATH", path)
+            .env("FAKE_RELEASE", &release)
+            .env("MARKER", repo.join("marker"))
+            .env("CARGO_LOG", repo.join("cargo.log"))
+            .env("RPI_BUMP_DIR", repo.join("rpi"))
+            .env("GITHUB_OUTPUT", repo.join("output"))
+            .env_remove("RPI_BUMP_EDIT_ONLY");
+        if edit_only {
+            cmd.env("RPI_BUMP_EDIT_ONLY", "1");
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        // The pins moved, either way, with the sha256s the release itself publishes.
+        let dockerfile = read(&repo.join("deploy/Dockerfile"));
+        assert!(
+            dockerfile.contains(&format!("ARG RPI_VERSION={new}\n")),
+            "{dockerfile}"
+        );
+        for (arch, target) in [("AMD64", "x86_64"), ("ARM64", "aarch64")] {
+            let sums = read(&release.join(format!(
+                "rpi-v{new}-{target}-unknown-linux-gnu.tar.gz.sha256"
+            )));
+            let sum = sums.split_whitespace().next().unwrap();
+            assert!(
+                dockerfile.contains(&format!("ARG RPI_SHA256_{arch}={sum}\n")),
+                "{dockerfile}"
+            );
+        }
+        for (path, want) in [
+            (
+                "crates/zephyr/src/main.rs",
+                "RPI_PIN: &str = \"rpi 9.9.\";".to_string(),
+            ),
+            ("crates/zephyr/Cargo.toml", format!("rpi-tui = \"={new}\"")),
+            (
+                "crates/zephyr/tests/fake-rpi.py",
+                format!("print(\"rpi {new}\")"),
+            ),
+            (
+                "crates/zephyr/tests/real_rpi.rs",
+                format!("rpi-{new}/bin/rpi"),
+            ),
+            ("README.md", format!("`rpi` {new} release")),
+            ("CLAUDE.md", "pinned to 9.9.x".to_string()),
+        ] {
+            let text = read(&repo.join(path));
+            assert!(text.contains(&want), "{path}: {text}");
+        }
+        assert_eq!(
+            read(&repo.join("cargo.log")),
+            "update -q -p rpi-tui -p rpi-plugin-sdk -p rpi-ai\n"
+        );
+        repo
+    };
+    // Edits only: both tarballs were fetched and checked, nothing was unpacked or run, and the
+    // outputs name no binary.
+    let repo = bump("edit-only", true);
+    assert!(!repo.join("marker").exists());
+    assert!(!repo.join("rpi/rpi").exists());
+    assert!(repo
+        .join(format!("rpi/rpi-v{new}-x86_64-unknown-linux-gnu.tar.gz"))
+        .exists());
+    assert_eq!(
+        read(&repo.join("output")),
+        format!("version={new}\nold={old}\n")
+    );
+    // As a person runs it: the binary is unpacked, asked its version once, and named.
+    let repo = bump("whole", false);
+    assert_eq!(read(&repo.join("marker")), "ran\n");
+    let rpi = repo.join("rpi/rpi").canonicalize().unwrap();
+    assert_eq!(
+        read(&repo.join("output")),
+        format!("version={new}\nold={old}\nrpi={}\n", rpi.display())
+    );
+    // A tarball that is not what its .sha256 says stops either before any edit.
+    std::fs::write(
+        release.join(format!("rpi-v{new}-aarch64-unknown-linux-gnu.tar.gz")),
+        "not the release",
+    )
+    .unwrap();
+    let repo = tree("tampered");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = Command::new("bash")
+        .args(["deploy/bump-rpi.sh", new])
+        .current_dir(&repo)
+        .env("PATH", path)
+        .env("FAKE_RELEASE", &release)
+        .env("MARKER", repo.join("marker"))
+        .env("CARGO_LOG", repo.join("cargo.log"))
+        .env("RPI_BUMP_DIR", repo.join("rpi"))
+        .env("RPI_BUMP_EDIT_ONLY", "1")
+        .env_remove("GITHUB_OUTPUT")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(read(&repo.join("deploy/Dockerfile")).contains(&format!("ARG RPI_VERSION={old}\n")));
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// One step of a workflow job that has a `run`, as far as these tests run it.
+#[derive(Default)]
+struct Step {
+    id: String,
+    cond: String,
+    env: Vec<(String, String)>,
+    run: String,
+}
+
+/// The `run` steps of `job` in a workflow's text, in order, read from the layout our workflows
+/// are written in: a step's keys at 8 columns, what is under `env` and `run: |` at 10.
+fn workflow_steps(yml: &str, job: &str) -> Vec<Step> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let lines: Vec<&str> = yml.lines().collect();
+    let start = (lines.iter())
+        .position(|l| *l == format!("  {job}:"))
+        .unwrap();
+    let end = (start + 1..lines.len())
+        .find(|&i| !lines[i].trim().is_empty() && indent(lines[i]) <= 2)
+        .unwrap_or(lines.len());
+    let mut i = (start..end).find(|&i| lines[i] == "    steps:").unwrap() + 1;
+    let mut steps = Vec::new();
+    while i < end {
+        if lines[i].trim().is_empty() || lines[i].trim_start().starts_with('#') {
+            i += 1;
+            continue;
+        }
+        assert!(lines[i].starts_with("      - "), "{}", lines[i]);
+        let mut step = Step::default();
+        let mut field = &lines[i][8..];
+        loop {
+            let (key, value) = field.split_once(':').unwrap();
+            let value = value.trim();
+            i += 1;
+            let mut under = Vec::new();
+            while i < end && (lines[i].trim().is_empty() || indent(lines[i]) >= 10) {
+                under.push(lines[i].get(10..).unwrap_or(""));
+                i += 1;
+            }
+            match key {
+                "id" => step.id = value.to_string(),
+                "if" => step.cond = value.to_string(),
+                "env" => {
+                    for line in under {
+                        let (k, v) = line.split_once(": ").unwrap();
+                        step.env.push((k.to_string(), v.to_string()));
+                    }
+                }
+                "run" if value == "|" => step.run = under.join("\n") + "\n",
+                "run" => {
+                    let script = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\''));
+                    step.run = script.unwrap().to_string();
+                }
+                "uses" | "with" => {}
+                other => panic!("a step key this test does not know: {other}"),
+            }
+            if i >= end || indent(lines[i]) != 8 || lines[i].trim_start().starts_with('#') {
+                break;
+            }
+            field = &lines[i][8..];
+        }
+        if !step.run.is_empty() {
+            steps.push(step);
+        }
+    }
+    steps
+}
+
+/// Runs a job's steps in `checkout` as a runner would: each `run` by `bash -eo pipefail` with
+/// `base` and the step's own `env` and nothing else in its environment, a step's `if` and
+/// `${{ }}` values read from the outputs of the steps before it, the token `tok`, and the run's
+/// `inputs`. The first step that fails ends the job with what it wrote to stderr; otherwise the
+/// job's summary comes back. `scratch` holds the scripts and the outputs.
+fn run_job(
+    steps: &[Step],
+    checkout: &Path,
+    scratch: &Path,
+    base: &[(&str, String)],
+    inputs: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut outputs: std::collections::HashMap<String, String> = Default::default();
+    let value = |expr: &str, outputs: &std::collections::HashMap<String, String>| -> String {
+        if expr == "github.token" {
+            "tok".to_string()
+        } else if let Some(name) = expr.strip_prefix("inputs.") {
+            let input = inputs.iter().find(|(k, _)| *k == name);
+            input.map(|(_, v)| v.to_string()).unwrap_or_default()
+        } else if let Some(rest) = expr.strip_prefix("steps.") {
+            let (id, key) = rest.split_once(".outputs.").unwrap();
+            outputs
+                .get(&format!("{id}.{key}"))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            panic!("an expression this test does not know: {expr}")
+        }
+    };
+    let summary = scratch.join("summary");
+    let _ = std::fs::remove_file(&summary);
+    for (n, step) in steps.iter().enumerate() {
+        if !step.cond.is_empty() {
+            let (left, right, same) = match step.cond.split_once(" != ") {
+                Some((l, r)) => (l, r, false),
+                None => {
+                    let (l, r) = step.cond.split_once(" == ").unwrap();
+                    (l, r, true)
+                }
+            };
+            let right = right.strip_prefix('\'').and_then(|r| r.strip_suffix('\''));
+            if (value(left, &outputs) == right.unwrap()) != same {
+                continue;
+            }
+        }
+        let (script, out_file) = (scratch.join("step.sh"), scratch.join("output"));
+        std::fs::write(&script, &step.run).unwrap();
+        let _ = std::fs::remove_file(&out_file);
+        let mut cmd = Command::new("bash");
+        cmd.args(["--noprofile", "--norc", "-eo", "pipefail"])
+            .arg(&script)
+            .current_dir(checkout)
+            .env_clear()
+            .envs(base.iter().map(|(k, v)| (*k, v.as_str())))
+            .env("GITHUB_OUTPUT", &out_file)
+            .env("GITHUB_STEP_SUMMARY", &summary);
+        for (k, v) in &step.env {
+            let expr = v.strip_prefix("${{ ").and_then(|v| v.strip_suffix(" }}"));
+            cmd.env(k, value(expr.unwrap(), &outputs));
+        }
+        let out = cmd.output().unwrap();
+        if !out.status.success() {
+            return Err(format!(
+                "step {n} ({}): {}",
+                step.id,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        for line in std::fs::read_to_string(&out_file)
+            .unwrap_or_default()
+            .lines()
+        {
+            let (k, v) = line.split_once('=').unwrap();
+            outputs.insert(format!("{}.{k}", step.id), v.to_string());
+        }
+    }
+    Ok(std::fs::read_to_string(&summary).unwrap_or_default())
+}
+
+/// rpi-bump.yml's two jobs, run step by step from the workflow's own text against a bare
+/// repository for GitHub's, a fake gh that answers the API from JSON fixtures through jq (so the
+/// jobs' own filters decide) and logs what it was told to do, and a fake release. `propose` makes
+/// one commit by the bot on main, never over a branch anyone else wrote or committed to, and
+/// never runs the new binary; `merge` fast-forwards main only to a commit ci.yml's newest
+/// dispatched run passed `ci-ok` and `real-rpi` for, that is one commit on main and a pin move.
+#[test]
+fn rpi_bump_proposes_one_commit_and_merges_only_a_tested_pin_move() {
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipped: no jq on PATH (CI's runners have it)");
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixtures = root.join("crates/zephyr/tests/fixtures");
+    let good = read(&fixtures.join("rpi-bump.patch"));
+    let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
+    let yml = read(&root.join(".github/workflows/rpi-bump.yml"));
+    let (propose_steps, merge_steps) = (
+        workflow_steps(&yml, "propose"),
+        workflow_steps(&yml, "merge"),
+    );
+    assert_eq!((propose_steps.len(), merge_steps.len()), (5, 5));
+    let tmp = std::env::temp_dir().join(format!("zephyr-rpi-bump-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dir = |name: &str| {
+        let dir = tmp.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let (bin, api, release, home) = (dir("bin"), dir("api"), dir("release"), dir("home"));
+    let (scratch, temp) = (dir("scratch"), dir("tmp"));
+    let (origin, work, checkout) = (tmp.join("origin.git"), tmp.join("work"), tmp.join("main"));
+    let script = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // A person's git, in `at`.
+    let git = |at: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(at)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // main: the tree the fixture patch was made in, with the checker and the bump script.
+    let (old, new) = ("9.8.7", "9.9.0");
+    bump_fixture_tree(&work, &good, &lock);
+    std::fs::create_dir_all(work.join(".github")).unwrap();
+    for file in [".github/bump-check.py", "deploy/bump-rpi.sh"] {
+        std::fs::copy(root.join(file), work.join(file)).unwrap();
+    }
+    git(&work, &["init", "-q"]);
+    git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "base"]);
+    let m0 = git(&work, &["rev-parse", "HEAD"]);
+    // The lock `cargo update` writes for this bump is the patch's own.
+    let patch = fixtures.join("rpi-bump.patch");
+    git(&work, &["apply", patch.to_str().unwrap()]);
+    std::fs::copy(work.join("Cargo.lock"), tmp.join("new.lock")).unwrap();
+    git(&work, &["checkout", "-q", "--", "."]);
+    git(&tmp, &["init", "-q", "--bare", "origin.git"]);
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    // As GitHub does, it hands out any commit asked for by its id.
+    git(
+        &origin,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    git(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&work, &["push", "-q", "origin", "main"]);
+
+    // The release: a tarball per target holding an `rpi` that leaves a marker when run, each
+    // with its .sha256, and crates.io's word on the newest version.
+    script(
+        &release.join("rpi"),
+        &format!("#!/bin/sh\necho ran >> \"$MARKER\"\necho \"rpi {new}\"\n"),
+    );
+    for target in ["x86_64", "aarch64"] {
+        let name = format!("rpi-v{new}-{target}-unknown-linux-gnu.tar.gz");
+        let made = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo {target} > arch && tar -czf {name} ./rpi ./arch && sha256sum {name} > {name}.sha256"
+            ))
+            .current_dir(&release)
+            .status()
+            .unwrap();
+        assert!(made.success());
+    }
+    std::fs::write(
+        release.join("rpi-tui"),
+        format!(r#"{{"crate":{{"max_stable_version":"{new}"}}}}"#),
+    )
+    .unwrap();
+    script(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out= url=
+while [ $# -gt 0 ]; do
+  case $1 in -fsSLo) out=$2; shift ;; -A) shift ;; -*) ;; *) url=$1 ;; esac
+  shift
+done
+f=$FAKE_RELEASE/${url##*/}
+[ -f "$f" ] || exit 22
+if [ -n "$out" ]; then cp "$f" "$out"; else cat "$f"; fi
+"#,
+    );
+    script(
+        &bin.join("cargo"),
+        "#!/bin/sh\ncp \"$FAKE_LOCK\" Cargo.lock\n",
+    );
+    script(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+[ "$GH_TOKEN" = tok ] || { echo "gh: no token" >&2; exit 4; }
+case $1 in
+  api)
+    filter=. e=
+    while [ $# -gt 0 ]; do
+      case $1 in --jq) filter=$2; shift ;; -H) shift ;; repos/*) e=${1%%\?*} ;; esac
+      shift
+    done
+    case $e in
+      */compare/*) f=compare-${e##*...} ;;
+      */pulls) f=pulls ;;
+      */git/matching-refs/heads/*) f=refs ;;
+      */actions/workflows/ci.yml/runs) f=runs ;;
+      */actions/runs/*/jobs) f=${e%/jobs}; f=jobs-${f##*/} ;;
+      *) exit 1 ;;
+    esac
+    [ -f "$FAKE_API/$f.json" ] || exit 1
+    jq -r "$filter" "$FAKE_API/$f.json" ;;
+  pr)
+    if [ "$2" = list ]; then
+      head= state=open filter=.
+      while [ $# -gt 0 ]; do
+        case $1 in
+          --head) head=$2; shift ;;
+          --state) state=$2; shift ;;
+          --jq) filter=$2; shift ;;
+          --repo | --base | --json) shift ;;
+        esac
+        shift
+      done
+      jq -r --arg h "$head" --arg s "$state" \
+        "[.[] | select(.head == \$h and .state == \$s) | {number, mergedAt}] | $filter" "$FAKE_API/prs.json"
+    else
+      printf '%s\n' "$*" >> "$FAKE_LOG"
+    fi ;;
+  workflow) printf '%s\n' "$*" >> "$FAKE_LOG" ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let gh_log = tmp.join("gh.log");
+    let marker = tmp.join("marker");
+    let base: Vec<(&str, String)> = vec![
+        (
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        ),
+        ("HOME", home.display().to_string()),
+        ("TMPDIR", temp.display().to_string()),
+        ("RUNNER_TEMP", tmp.join("runner").display().to_string()),
+        ("GITHUB_REPOSITORY", "o/r".into()),
+        ("GITHUB_REF", "refs/heads/main".into()),
+        ("FAKE_API", api.display().to_string()),
+        ("FAKE_LOG", gh_log.display().to_string()),
+        ("FAKE_RELEASE", release.display().to_string()),
+        ("FAKE_LOCK", tmp.join("new.lock").display().to_string()),
+        ("MARKER", marker.display().to_string()),
+        // GitHub's URL with the token is the bare repository; without the token, nothing.
+        ("GIT_CONFIG_NOSYSTEM", "1".into()),
+        ("GIT_CONFIG_COUNT", "1".into()),
+        (
+            "GIT_CONFIG_KEY_0",
+            format!("url.{}.insteadOf", origin.display()),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0",
+            "https://x-access-token:tok@github.com/o/r.git".into(),
+        ),
+    ];
+    // A job: a new shallow checkout of main and an empty RUNNER_TEMP, then its steps.
+    let job = |steps: &[Step], inputs: &[(&str, &str)]| {
+        for dir in [&checkout, &tmp.join("runner")] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::fs::create_dir_all(tmp.join("runner")).unwrap();
+        let url = format!("file://{}", origin.display());
+        git(
+            &tmp,
+            &[
+                "clone", "-q", "--depth", "1", "--branch", "main", &url, "main",
+            ],
+        );
+        run_job(steps, &checkout, &scratch, &base, inputs)
+    };
+    let propose = |inputs: &[(&str, &str)]| job(&propose_steps, inputs);
+    let merge = || job(&merge_steps, &[]).unwrap_or_else(|err| panic!("merge failed: {err}"));
+    // What gh was told to do since the last look.
+    let told = || {
+        let log = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        let _ = std::fs::remove_file(&gh_log);
+        log
+    };
+    let tip = |branch: &str| {
+        let out = Command::new("git")
+            .args(["rev-parse", "-q", "--verify"])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let set = |branch: &str, sha: &str| {
+        let name = format!("refs/heads/{branch}");
+        match sha {
+            "" => git(&origin, &["update-ref", "-d", &name]),
+            _ => git(&origin, &["update-ref", &name, sha]),
+        };
+    };
+    let fixture =
+        |name: &str, json: &str| std::fs::write(api.join(format!("{name}.json")), json).unwrap();
+    // The API's view. Branches as they are; PRs (number, head commit, branch, head repository,
+    // state); a comparison with main per head commit (commits, behind by, each commit's author
+    // and committer); ci.yml's runs (id, event, head commit, workflow, status, conclusion,
+    // created) and a run's jobs.
+    let refs = || {
+        let list = git(
+            &origin,
+            &[
+                "for-each-ref",
+                r#"--format={"ref":"%(refname)","object":{"sha":"%(objectname)"}}"#,
+                "refs/heads",
+            ],
+        );
+        fixture("refs", &format!("[{}]", list.replace('\n', ",")));
+    };
+    let prs = |list: &[(u32, &str, &str, &str, &str)]| {
+        let (mut pulls, mut all) = (Vec::new(), Vec::new());
+        for (n, sha, branch, repo, state) in list {
+            if *state == "open" {
+                pulls.push(format!(
+                    r#"{{"number":{n},"base":{{"ref":"main"}},"head":{{"sha":"{sha}","ref":"{branch}","repo":{{"full_name":"{repo}"}}}}}}"#
+                ));
+            }
+            all.push(format!(
+                r#"{{"number":{n},"head":"{branch}","state":"{state}","mergedAt":null}}"#
+            ));
+        }
+        fixture("pulls", &format!("[{}]", pulls.join(",")));
+        fixture("prs", &format!("[{}]", all.join(",")));
+    };
+    let compare = |sha: &str, behind: u32, commits: &[(&str, &str)]| {
+        let list: Vec<String> = (commits.iter())
+            .map(|(author, committer)| {
+                format!(
+                    r#"{{"author":{{"login":"{author}"}},"committer":{{"login":"{committer}"}}}}"#
+                )
+            })
+            .collect();
+        fixture(
+            &format!("compare-{sha}"),
+            &format!(
+                r#"{{"total_commits":{},"behind_by":{behind},"commits":[{}]}}"#,
+                list.len(),
+                list.join(",")
+            ),
+        );
+    };
+    let ci_yml = ".github/workflows/ci.yml";
+    let runs = |list: &[(u32, &str, &str, &str, &str, &str, &str)]| {
+        let list: Vec<String> = (list.iter())
+            .map(|(id, event, sha, path, status, conclusion, created)| {
+                let conclusion = match *conclusion {
+                    "" => "null".to_string(),
+                    c => format!("\"{c}\""),
+                };
+                format!(
+                    r#"{{"id":{id},"event":"{event}","head_sha":"{sha}","path":"{path}","status":"{status}","conclusion":{conclusion},"created_at":"{created}"}}"#
+                )
+            })
+            .collect();
+        fixture(
+            "runs",
+            &format!(r#"{{"workflow_runs":[{}]}}"#, list.join(",")),
+        );
+    };
+    let jobs = |id: u32, list: &[(&str, &str)]| {
+        let list: Vec<String> = (list.iter())
+            .map(|(name, conclusion)| {
+                let conclusion = match *conclusion {
+                    "" => "null".to_string(),
+                    c => format!("\"{c}\""),
+                };
+                format!(r#"{{"name":"{name}","conclusion":{conclusion}}}"#)
+            })
+            .collect();
+        fixture(
+            &format!("jobs-{id}"),
+            &format!(r#"{{"jobs":[{}]}}"#, list.join(",")),
+        );
+    };
+    let bot = ("github-actions[bot]", "github-actions[bot]");
+    let b = "rpi-bump/v9.9.0";
+    let (day1, day2) = ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+
+    // propose. Nothing there yet: the newest release, as one commit by the bot on main, a PR
+    // that says it is a pure pin move, and ci.yml started on the branch with its real-rpi check.
+    // The release's binary was never run.
+    prs(&[]);
+    runs(&[]);
+    refs();
+    let said = propose(&[]).unwrap();
+    assert!(said.contains("proposed rpi 9.9.0"), "{said}");
+    let first = tip(b);
+    assert_eq!(git(&origin, &["rev-parse", &format!("{first}^")]), m0);
+    let bot_mail = "41898282+github-actions[bot]@users.noreply.github.com";
+    assert_eq!(
+        git(&origin, &["log", "-1", "--format=%an %ae %cn %ce", &first]),
+        format!("github-actions[bot] {bot_mail} github-actions[bot] {bot_mail}")
+    );
+    let dockerfile = git(&origin, &["show", &format!("{first}:deploy/Dockerfile")]);
+    assert!(
+        dockerfile.contains(&format!("ARG RPI_VERSION={new}\n")),
+        "{dockerfile}"
+    );
+    let log = told();
+    for want in [
+        format!("pr create --repo o/r --base main --head {b} --title chore(rpi): move the rpi pins from {old} to {new} "),
+        "A pure pin move".to_string(),
+        format!("\nworkflow run ci.yml --repo o/r --ref {b} -f real_rpi=true\n"),
+    ] {
+        assert!(log.contains(&want), "{want}: {log}");
+    }
+    assert!(!marker.exists());
+    let dispatch = format!("workflow run ci.yml --repo o/r --ref {b} -f real_rpi=true\n");
+
+    // The PR is open on this main with a CI run waiting, running or finished: nothing to do.
+    // With none for that commit but a cancelled one or another commit's, one is started.
+    let open = |n: u32, sha: &str| prs(&[(n, sha, b, "o/r", "open")]);
+    let untouched = |sha: &str, why: &str| {
+        let said = propose(&[]).unwrap();
+        assert_eq!((tip(b).as_str(), told().as_str()), (sha, ""), "{said}");
+        assert!(said.contains(why), "{said}");
+    };
+    open(5, &first);
+    refs();
+    compare(&first, 0, &[bot]);
+    for (status, conclusion) in [
+        ("queued", ""),
+        ("in_progress", ""),
+        ("completed", "failure"),
+    ] {
+        runs(&[(
+            100,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            status,
+            conclusion,
+            day1,
+        )]);
+        untouched(&first, "with its CI run: nothing to do");
+    }
+    runs(&[
+        (
+            100,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            "completed",
+            "cancelled",
+            day1,
+        ),
+        (
+            101,
+            "workflow_dispatch",
+            &m0,
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (102, "push", &first, ci_yml, "completed", "success", day1),
+    ]);
+    let said = propose(&[]).unwrap();
+    assert_eq!(
+        (tip(b), told()),
+        (first.clone(), dispatch.clone()),
+        "{said}"
+    );
+    runs(&[]);
+
+    // A branch someone else wrote or committed to is theirs: an owner's amend keeps the bot as
+    // its author, and is still never replaced, on this main or an older one.
+    for commits in [
+        &[("github-actions[bot]", "owner")][..],
+        &[("owner", "github-actions[bot]")],
+        &[bot, ("owner", "owner")],
+        &[("github-actions[bot]", "web-flow")],
+    ] {
+        for behind in [0, 1] {
+            compare(&first, behind, commits);
+            untouched(&first, "holds commits that are not the bot's");
+        }
+    }
+
+    // The bot's commit on an older main is made again, over the branch only as it was seen.
+    std::fs::write(work.join("notes.txt"), "a change on main\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "main moves"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    let m1 = git(&work, &["rev-parse", "HEAD"]);
+    compare(&first, 1, &[bot]);
+    let said = propose(&[]).unwrap();
+    let second = tip(b);
+    assert_ne!(second, first, "{said}");
+    assert_eq!(git(&origin, &["rev-parse", &format!("{second}^")]), m1);
+    let log = told();
+    assert!(
+        log.starts_with("pr edit 5 --repo o/r --title ") && log.ends_with(&dispatch),
+        "{log}"
+    );
+    // Someone pushed to the branch after it was read (the fixture still names the first
+    // commit): the push is refused, and the job fails.
+    set(b, &m0);
+    let err = propose(&[]).unwrap_err();
+    assert!(err.starts_with("step 4 "), "{err}");
+    assert_eq!((tip(b), told()), (m0.clone(), String::new()), "{err}");
+    set(b, &second);
+
+    // Only a release above the pin, by its number.
+    for version in [old, "9.8.6", "9.8.10-rc1", "9.9", "9.9.0; id"] {
+        let out = propose(&[("version", version)]);
+        assert_eq!((tip(b), told()), (second.clone(), String::new()), "{out:?}");
+        match version.split('.').count() == 3 && !version.contains(['-', ';']) {
+            true => assert!(out.unwrap().contains("is not above it"), "{version}"),
+            false => assert!(
+                out.unwrap_err().contains("not a release version"),
+                "{version}"
+            ),
+        }
+    }
+
+    // A PR a person closed is not made again by the daily run, with its branch or without;
+    // a run that names the version makes it.
+    refs();
+    compare(&second, 0, &[bot]);
+    prs(&[(5, &second, b, "o/r", "closed")]);
+    untouched(&second, "PR #5 for rpi 9.9.0 was closed unmerged");
+    set(b, "");
+    refs();
+    untouched("", "PR #5 for rpi 9.9.0 was closed unmerged");
+    let said = propose(&[("version", new)]).unwrap();
+    let third = tip(b);
+    assert_eq!(
+        git(&origin, &["rev-parse", &format!("{third}^")]),
+        m1,
+        "{said}"
+    );
+    assert!(told().starts_with("pr create "));
+    // ...and an older closed PR does not stop the open one being made again on a new main.
+    refs();
+    compare(&third, 1, &[bot]);
+    prs(&[
+        (5, &second, b, "o/r", "closed"),
+        (6, &third, b, "o/r", "open"),
+    ]);
+    propose(&[]).unwrap();
+    let fourth = tip(b);
+    assert!(told().starts_with("pr edit 6 "));
+
+    // PRs for lower versions are closed when a newer release is out, but not one with commits
+    // that are not the bot's, nor the bot's one commit on this main while its CI is running or
+    // passed (the sweep may merge it yet). A higher one, a fork's and other branches are not
+    // looked at.
+    refs();
+    compare(&fourth, 0, &[bot]);
+    compare(&m0, 1, &[bot]);
+    compare(&m1, 1, &[("github-actions[bot]", "owner")]);
+    compare(&first, 0, &[bot]);
+    compare(&second, 0, &[bot]);
+    let lower = [
+        (6, fourth.as_str(), b, "o/r", "open"),
+        (11, m0.as_str(), "rpi-bump/v9.8.8", "o/r", "open"),
+        (12, m1.as_str(), "rpi-bump/v9.8.9", "o/r", "open"),
+        (13, first.as_str(), "rpi-bump/v9.8.10", "o/r", "open"),
+        (14, second.as_str(), "rpi-bump/v9.8.11", "o/r", "open"),
+        (15, m0.as_str(), "rpi-bump/v9.9.1", "o/r", "open"),
+        (16, m0.as_str(), "rpi-bump/v9.8.8", "fork/r", "open"),
+        (17, m0.as_str(), "fix/rpi-bump/v9.8.8", "o/r", "open"),
+    ];
+    prs(&lower);
+    let own = (
+        200,
+        "workflow_dispatch",
+        fourth.as_str(),
+        ci_yml,
+        "completed",
+        "failure",
+        day1,
+    );
+    runs(&[
+        own,
+        (
+            201,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            "in_progress",
+            "",
+            day1,
+        ),
+        (
+            202,
+            "workflow_dispatch",
+            &second,
+            ci_yml,
+            "completed",
+            "failure",
+            day1,
+        ),
+        (
+            203,
+            "workflow_dispatch",
+            &second,
+            ci_yml,
+            "completed",
+            "success",
+            day2,
+        ),
+    ]);
+    let close = |n: u32| {
+        format!("pr close {n} --repo o/r --delete-branch --comment Superseded by rpi 9.9.0.\n")
+    };
+    propose(&[]).unwrap();
+    assert_eq!((tip(b), told()), (fourth.clone(), close(11)));
+    // Their CI failed, or its newest run did: closed like any other.
+    runs(&[
+        own,
+        (
+            201,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            "completed",
+            "failure",
+            day1,
+        ),
+        (
+            202,
+            "workflow_dispatch",
+            &second,
+            ci_yml,
+            "completed",
+            "failure",
+            day2,
+        ),
+        (
+            203,
+            "workflow_dispatch",
+            &second,
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+    ]);
+    propose(&[]).unwrap();
+    assert_eq!(told(), format!("{}{}{}", close(11), close(13), close(14)));
+
+    // merge. The PR is the first proposal, one commit on main, with ci.yml's run for it,
+    // started by workflow_dispatch, passed: main becomes that commit and the branch goes.
+    let passed = [
+        ("plan", "success"),
+        ("lint (zephyr-local)", "success"),
+        ("test (zephyr-local)", "success"),
+        ("real-rpi (zephyr-local)", "success"),
+        ("ci-ok", "success"),
+    ];
+    let with = |name: &'static str, conclusion: &'static str| {
+        let mut list: Vec<(&str, &str)> = passed.to_vec();
+        list.retain(|(n, _)| *n != name);
+        if conclusion != "absent" {
+            list.push((name, conclusion));
+        }
+        list
+    };
+    let start = |main: &str, branch: &str, sha: &str| {
+        for other in ["rpi-bump/v9.9.1", "rpi-bump/v9.9.0-1", "rpi-bump/v9.8.7", b] {
+            set(other, "");
+        }
+        set("main", main);
+        set(branch, sha);
+        prs(&[(5, sha, branch, "o/r", "open")]);
+        runs(&[(
+            100,
+            "workflow_dispatch",
+            sha,
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        )]);
+        jobs(100, &passed);
+    };
+    start(&m0, b, &first);
+    let said = merge();
+    assert_eq!(
+        (tip("main"), tip(b)),
+        (first.clone(), String::new()),
+        "{said}"
+    );
+    assert!(
+        said.contains(&format!("main is now {first}: rpi 9.9.0")),
+        "{said}"
+    );
+    // Nothing above the new pin is left to merge.
+    let said = merge();
+    assert!(
+        said.contains("no open rpi-bump PR above rpi 9.9.0"),
+        "{said}"
+    );
+    assert_eq!(tip("main"), first);
+
+    // Anything short of that leaves main and the branch where they were, and the job green.
+    let left = |main: &str, branch: &str, sha: &str, why: &str| {
+        let said = merge();
+        assert_eq!(
+            (tip("main").as_str(), tip(branch).as_str()),
+            (main, sha),
+            "{why}: {said}"
+        );
+        assert!(said.contains(why), "{why}: {said}");
+    };
+    let unproven = "has not passed ci-ok and real-rpi: left open";
+    // real-rpi or ci-ok failed, was skipped, is still running or was never planned.
+    for (name, conclusion) in [
+        ("real-rpi (zephyr-local)", "failure"),
+        ("real-rpi (zephyr-local)", "skipped"),
+        ("real-rpi (zephyr-local)", "cancelled"),
+        ("real-rpi (zephyr-local)", ""),
+        ("real-rpi (zephyr-local)", "absent"),
+        ("ci-ok", "failure"),
+        ("ci-ok", "skipped"),
+        ("ci-ok", ""),
+        ("ci-ok", "absent"),
+    ] {
+        start(&m0, b, &first);
+        jobs(100, &with(name, conclusion));
+        left(&m0, b, &first, unproven);
+    }
+    // A job of another name does not stand in for real-rpi.
+    start(&m0, b, &first);
+    let mut renamed = with("real-rpi (zephyr-local)", "absent");
+    renamed.push(("unreal-rpi (zephyr-local)", "success"));
+    jobs(100, &renamed);
+    left(&m0, b, &first, unproven);
+    // A run of another event, another workflow or another commit, or none; a cancelled one.
+    for run in [
+        (
+            100,
+            "pull_request",
+            first.as_str(),
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            100,
+            "push",
+            first.as_str(),
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            100,
+            "workflow_dispatch",
+            first.as_str(),
+            ".github/workflows/other.yml",
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            100,
+            "workflow_dispatch",
+            m0.as_str(),
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            100,
+            "workflow_dispatch",
+            first.as_str(),
+            ci_yml,
+            "completed",
+            "cancelled",
+            day1,
+        ),
+    ] {
+        start(&m0, b, &first);
+        runs(&[run]);
+        left(&m0, b, &first, unproven);
+    }
+    start(&m0, b, &first);
+    runs(&[]);
+    left(&m0, b, &first, unproven);
+    // A later run for the commit that failed, or is still running, takes the pass back,
+    // wherever the API lists it; a later cancelled one does not.
+    for (status, conclusion) in [("completed", "failure"), ("in_progress", "")] {
+        for newest_first in [true, false] {
+            start(&m0, b, &first);
+            let mut list = vec![
+                (
+                    101,
+                    "workflow_dispatch",
+                    first.as_str(),
+                    ci_yml,
+                    status,
+                    conclusion,
+                    day2,
+                ),
+                (
+                    100,
+                    "workflow_dispatch",
+                    first.as_str(),
+                    ci_yml,
+                    "completed",
+                    "success",
+                    day1,
+                ),
+            ];
+            if !newest_first {
+                list.reverse();
+            }
+            runs(&list);
+            jobs(101, &with("real-rpi (zephyr-local)", conclusion));
+            left(&m0, b, &first, unproven);
+        }
+    }
+    // Not a PR of this repository's own `rpi-bump/v<version>` branch, or not above the pin.
+    for (branch, repo) in [
+        ("rpi-bump/v9.9.0-1", "o/r"),
+        ("fix/rpi-bump/v9.9.0", "o/r"),
+        ("rpi-bump/v9.8.7", "o/r"),
+        ("rpi-bump/v9.8.6", "o/r"),
+        (b, "fork/r"),
+    ] {
+        start(&m0, b, &first);
+        prs(&[(5, &first, branch, repo, "open")]);
+        left(&m0, b, &first, "no open rpi-bump PR above rpi 9.8.7");
+    }
+    // main moved since the proposal: not one commit on it.
+    start(&m1, b, &first);
+    left(&m1, b, &first, "is not one commit on main");
+    // Two commits: the pin move and one more.
+    git(&work, &["fetch", "-q", "origin"]);
+    git(&work, &["checkout", "-q", "--detach", &first]);
+    std::fs::write(work.join("crates/zephyr/build.rs"), "fn main() {}\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "one more"]);
+    let two = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["push", "-q", "origin", "HEAD:refs/heads/two"]);
+    start(&m0, b, &two);
+    left(&m0, b, &two, "is not one commit on main");
+    // Two commits that together are the pin move and nothing else.
+    git(&work, &["checkout", "-q", "--detach", &m0]);
+    std::fs::write(work.join("notes.txt"), "on the way\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-qm", "one"]);
+    git(&work, &["rm", "-q", "notes.txt"]);
+    git(&work, &["checkout", "-q", &first, "--", "."]);
+    git(&work, &["commit", "-qm", "two"]);
+    let pair = git(&work, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&work, &["diff", "--stat", &first, &pair]), "");
+    git(&work, &["push", "-q", "origin", "HEAD:refs/heads/pair"]);
+    start(&m0, b, &pair);
+    left(&m0, b, &pair, "is not one commit on main");
+    // One commit on main that is the pin move and something else: a new file, or one more
+    // line in a file the bump edits.
+    for (file, text) in [
+        ("crates/zephyr/build.rs", "fn main() {}\n".to_string()),
+        (
+            "README.md",
+            git(&work, &["show", &format!("{first}:README.md")]) + "\nmore\n",
+        ),
+    ] {
+        git(&work, &["checkout", "-q", "--detach", &first]);
+        std::fs::write(work.join(file), text).unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &["commit", "-q", "--amend", "-m", "the pins, and more"],
+        );
+        let more = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["push", "-qf", "origin", "HEAD:refs/heads/more"]);
+        start(&m0, b, &more);
+        left(
+            &m0,
+            b,
+            &more,
+            "is not a pure move of the rpi pins from 9.8.7 to 9.9.0",
+        );
+    }
+    // The pin move of another version than its branch names.
+    start(&m0, "rpi-bump/v9.9.1", &first);
+    left(
+        &m0,
+        "rpi-bump/v9.9.1",
+        &first,
+        "is not a pure move of the rpi pins from 9.8.7 to 9.9.1",
+    );
+
+    // Two candidates: the highest whose CI passed is taken, here the lower one, as when a
+    // person proposes a version below the newest release, whose own PR is red.
+    start(&m0, b, &first);
+    prs(&[
+        (5, &first, b, "o/r", "open"),
+        (7, &two, "rpi-bump/v9.9.5", "o/r", "open"),
+    ]);
+    runs(&[
+        (
+            100,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            300,
+            "workflow_dispatch",
+            &two,
+            ci_yml,
+            "completed",
+            "failure",
+            day2,
+        ),
+    ]);
+    jobs(300, &with("real-rpi (zephyr-local)", "failure"));
+    let said = merge();
+    assert_eq!(
+        (tip("main"), tip(b)),
+        (first.clone(), String::new()),
+        "{said}"
+    );
+    assert!(
+        said.contains("PR #7 (rpi 9.9.5,") && said.contains(unproven),
+        "{said}"
+    );
+    // The other way round, the higher one is the one looked at, and it is not a pin move.
+    start(&m0, b, &first);
+    prs(&[
+        (5, &first, b, "o/r", "open"),
+        (7, &two, "rpi-bump/v9.9.5", "o/r", "open"),
+    ]);
+    runs(&[
+        (
+            100,
+            "workflow_dispatch",
+            &first,
+            ci_yml,
+            "completed",
+            "success",
+            day1,
+        ),
+        (
+            300,
+            "workflow_dispatch",
+            &two,
+            ci_yml,
+            "completed",
+            "success",
+            day2,
+        ),
+    ]);
+    jobs(300, &passed);
+    left(&m0, b, &first, "is not one commit on main");
+    // The token went to the steps that talk to GitHub alone, and no step ran the release.
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// ci.sh's real-rpi check runs the ignored tests against the release the Dockerfile pins and no
+/// other: a tarball that is not the Dockerfile's sha256 is never unpacked, a binary of another
+/// version stops it, and the check is as red as the tests. curl, cargo and uname are fakes.
+#[test]
+fn the_real_rpi_check_tests_only_the_release_the_dockerfile_pins() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tmp = std::env::temp_dir().join(format!("zephyr-real-rpi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (repo, bin, release, temp) = (
+        tmp.join("repo"),
+        tmp.join("bin"),
+        tmp.join("release"),
+        tmp.join("tmp"),
+    );
+    for dir in [
+        &repo.join(".github"),
+        &repo.join("deploy"),
+        &bin,
+        &release,
+        &temp,
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::copy(root.join(".github/ci.sh"), repo.join(".github/ci.sh")).unwrap();
+    let script = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let name = "rpi-v9.9.0-x86_64-unknown-linux-gnu.tar.gz";
+    // The release's tarball, whose `rpi` leaves a marker when run; returns its sha256.
+    let publish = |reports: &str| {
+        script(
+            &release.join("rpi"),
+            &format!("#!/bin/sh\necho ran >> \"$MARKER\"\necho \"rpi {reports}\"\n"),
+        );
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("tar -czf {name} ./rpi && sha256sum {name}"))
+            .current_dir(&release)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let sum = String::from_utf8(out.stdout).unwrap();
+        sum.split_whitespace().next().unwrap().to_string()
+    };
+    let pin = |sha256: &str| {
+        std::fs::write(
+            repo.join("deploy/Dockerfile"),
+            format!("FROM x\nARG RPI_VERSION=9.9.0\nARG RPI_SHA256_AMD64={sha256}\n"),
+        )
+        .unwrap()
+    };
+    script(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out= url=
+while [ $# -gt 0 ]; do
+  case $1 in -fsSLo) out=$2; shift ;; -*) ;; *) url=$1 ;; esac
+  shift
+done
+case $url in https://github.com/bigfish1913/pi-rust/releases/download/v9.9.0/*) ;; *) exit 22 ;; esac
+cp "$FAKE_RELEASE/${url##*/}" "$out"
+"#,
+    );
+    script(
+        &bin.join("cargo"),
+        "#!/bin/sh\necho \"$ZEPHYR_REAL_RPI $* $(\"$RPI_BIN\" --version)\" >> \"$CARGO_LOG\"\nexit \"$CARGO_STATUS\"\n",
+    );
+    script(&bin.join("uname"), "#!/bin/sh\necho x86_64\n");
+    let (marker, cargo_log) = (tmp.join("marker"), tmp.join("cargo.log"));
+    // Runs the check; whether it passed, how often the release's rpi ran, and what cargo ran.
+    let check = |cargo_status: &str| {
+        for file in [&marker, &cargo_log] {
+            let _ = std::fs::remove_file(file);
+        }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = Command::new("bash")
+            .args([".github/ci.sh", "run", "real-rpi"])
+            .current_dir(&repo)
+            .env("PATH", path)
+            .env("FAKE_RELEASE", &release)
+            .env("MARKER", &marker)
+            .env("CARGO_LOG", &cargo_log)
+            .env("CARGO_STATUS", cargo_status)
+            .env("RUNNER_TEMP", &temp)
+            .env_remove("RUNNER_ENVIRONMENT")
+            .env_remove("RPI_BIN")
+            .env_remove("ZEPHYR_REAL_RPI")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            std::fs::read_to_string(&cargo_log).unwrap_or_default(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    // The pinned release: asked its version, then the ignored tests run against it (the fake
+    // cargo asks it once more), and a missing binary would fail them.
+    let sum = publish("9.9.0");
+    pin(&sum);
+    let (ok, ran, cargo, err) = check("0");
+    assert!(ok, "{err}");
+    assert_eq!(
+        (ran, cargo.as_str()),
+        (2, "1 test --workspace -- --ignored rpi 9.9.0\n"),
+        "{err}"
+    );
+    // Red tests are a red check.
+    let (ok, _, cargo, err) = check("101");
+    assert!(!ok && !cargo.is_empty(), "{err}");
+    // A tarball that is not what the Dockerfile pins is not unpacked, let alone run.
+    pin(&"0".repeat(64));
+    let (ok, ran, cargo, err) = check("0");
+    assert!(
+        !ok && err.contains("does not match the Dockerfile's sha256"),
+        "{err}"
+    );
+    assert_eq!((ran, cargo.as_str()), (0, ""));
+    // The right bytes, but a binary of another version: no tests run against it.
+    let sum = publish("9.8.7");
+    pin(&sum);
+    let (ok, _, cargo, err) = check("0");
+    assert!(
+        !ok && err.contains("the v9.9.0 binary reports rpi 9.8.7"),
+        "{err}"
+    );
+    assert_eq!(cargo, "");
+    // No pin to check against, or a release that cannot be fetched.
+    std::fs::write(
+        repo.join("deploy/Dockerfile"),
+        "FROM x\nARG RPI_VERSION=9.9.0\n",
+    )
+    .unwrap();
+    let (ok, ran, cargo, err) = check("0");
+    assert!(!ok && err.contains("pins no rpi release"), "{err}");
+    assert_eq!((ran, cargo.as_str()), (0, ""));
+    pin(&sum);
+    std::fs::remove_file(release.join(name)).unwrap();
+    let (ok, ran, cargo, err) = check("0");
+    assert!(!ok && err.contains("could not fetch rpi 9.9.0"), "{err}");
+    assert_eq!((ran, cargo.as_str()), (0, ""));
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

@@ -8,10 +8,14 @@
 # the fixed path the ignored tests and release.sh look in. It downloads the x86_64 binary to
 # $RPI_BUMP_DIR (default target/rpi-<version>) so the ignored tests can run against it:
 #   ZEPHYR_REAL_RPI=1 RPI_BIN=target/rpi-<version>/rpi cargo test --workspace -- --ignored
+# RPI_BUMP_EDIT_ONLY=1 makes the edits alone: the tarballs are still checked against their sha256s,
+# but nothing is unpacked and the new binary is never run. rpi-bump.yml's propose job, which holds
+# a token that can push in its other steps, calls it so; ci.yml's real-rpi check runs the binary.
 # Prose that says what rpi 0.N does is left alone: it was checked against that version.
-# rpi-bump.yml pushes only what these edits make of each file: keep `pinned` and ALLOWED in
+# rpi-bump.yml merges only what these edits make of each file: keep `pinned` and ALLOWED in
 # .github/bump-check.py in step with every sed below.
-# With GITHUB_OUTPUT set it writes version=, old= and rpi= there; already current, it writes nothing.
+# With GITHUB_OUTPUT set it writes version= and old= there, and rpi= when it unpacked the binary;
+# already current, it writes nothing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 die() { echo "bump-rpi: $*" >&2; exit 1; }
@@ -40,8 +44,11 @@ for t in x86_64 aarch64; do
   curl -fsSLo "$dir/$f" "$url/$f"
   echo "${sha[$t]}  $dir/$f" | sha256sum -c --quiet - || die "$f does not match its .sha256"
 done
-tar -xzf "$dir/rpi-v$new-x86_64-unknown-linux-gnu.tar.gz" --no-same-owner -C "$dir" ./rpi
-[ "$("$dir/rpi" --version)" = "rpi $new" ] || die "the v$new binary reports $("$dir/rpi" --version)"
+edit_only=${RPI_BUMP_EDIT_ONLY:-}
+if [ "$edit_only" != 1 ]; then
+  tar -xzf "$dir/rpi-v$new-x86_64-unknown-linux-gnu.tar.gz" --no-same-owner -C "$dir" ./rpi
+  [ "$("$dir/rpi" --version)" = "rpi $new" ] || die "the v$new binary reports $("$dir/rpi" --version)"
+fi
 
 minor=${new%.*}
 sed -i -e "s/^ARG RPI_VERSION=.*/ARG RPI_VERSION=$new/" \
@@ -59,7 +66,15 @@ sed -i -e "s/rpi is pinned to [0-9.]*x/rpi is pinned to $minor.x/" -e "s/\"=$old
 # The `=` pins leave one version to pick; this also moves rpi-telemetry, which rpi-tui pins.
 cargo update -q -p rpi-tui -p rpi-plugin-sdk -p rpi-ai
 
-echo "rpi $old -> $new; binary at $dir/rpi"
+if [ "$edit_only" = 1 ]; then
+  echo "rpi $old -> $new; edits only, the binary was not unpacked"
+else
+  echo "rpi $old -> $new; binary at $dir/rpi"
+fi
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  { echo "version=$new"; echo "old=$old"; echo "rpi=$(realpath "$dir/rpi")"; } >> "$GITHUB_OUTPUT"
+  {
+    echo "version=$new"
+    echo "old=$old"
+    [ "$edit_only" = 1 ] || echo "rpi=$(realpath "$dir/rpi")"
+  } >> "$GITHUB_OUTPUT"
 fi

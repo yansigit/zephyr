@@ -3,7 +3,8 @@
 #   .github/ci.sh plan          where jobs go, from repo variable ZEPHYR_CI (both|local|hosted)
 #   .github/ci.sh skip          why this ci run needs no checks (docs only, or main's merge of a
 #                               PR that already passed on the same tree); nothing when it does
-#   .github/ci.sh run CHECK     one check: lint (shellcheck, fmt, clippy, cargo deny) | test
+#   .github/ci.sh run CHECK     one check: lint (shellcheck, fmt, clippy, cargo deny) | test |
+#                               real-rpi (the ignored tests against the pinned rpi binary)
 #   .github/ci.sh rescue-plan   which checks GitHub refused to start on its own runners
 #   .github/ci.sh rescue        run those (CHECKS) here, with no GitHub token
 # plan, skip and rescue-plan read the Actions API with GH_TOKEN (actions, checks and contents: read).
@@ -24,9 +25,10 @@ api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
 NOT_STARTED='select(.conclusion == "failure" and (.steps | length) == 0 and (.runner_name // "") == "")'
 
 # Runs that can have tried GitHub's runner while ZEPHYR_CI is `both`: the nightly and manual runs
-# (ci.yml's nightly test, rpi-bump.yml, image.yml's manual builds) and a release tag's image build.
-# Reads run objects on stdin.
-MAY_BE_HOSTED='select(.event == "schedule" or .event == "workflow_dispatch" or (.event == "push" and (.head_branch // "" | test("^v[0-9]"))))'
+# (ci.yml's nightly test, image.yml's manual builds) and a release tag's image build. Only those
+# two workflows place a job there: rpi-bump.yml's runs, several a day, never do, and must not use
+# up the runs looked at. Reads run objects on stdin.
+MAY_BE_HOSTED='select((.path == ".github/workflows/ci.yml" or .path == ".github/workflows/image.yml") and (.event == "schedule" or .event == "workflow_dispatch" or (.event == "push" and (.head_branch // "" | test("^v[0-9]")))))'
 
 # The id of the run whose hosted job GitHub would not start, when that is this month's last word on
 # GitHub's runners: the newest run of this UTC month with a hosted job that GitHub either started
@@ -54,14 +56,35 @@ recent_refusal() {
   done
 }
 
+# Whether this run also tests against the pinned rpi binary itself (the ignored tests), and why:
+# the nightly run, a run asked to (ZEPHYR_REAL_RPI_CHECK, ci.yml's manual input `real_rpi`), an
+# rpi-bump branch, or a commit that moves the Dockerfile's RPI_VERSION. A parent that cannot be
+# read (a shallow checkout, a first commit) counts as a move: a bump must never pass untested.
+real_rpi_due() {
+  local branch=${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}} was now
+  if [ "${GITHUB_EVENT_NAME:-}" = schedule ]; then echo "the nightly run"; return 0; fi
+  if [ "${ZEPHYR_REAL_RPI_CHECK:-}" = true ]; then echo "asked for"; return 0; fi
+  case $branch in rpi-bump/*) echo "an rpi-bump branch"; return 0 ;; esac
+  [ -f deploy/Dockerfile ] || return 1
+  now=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
+  if ! was=$(git show HEAD^1:deploy/Dockerfile 2>/dev/null); then
+    echo "the commit before this one cannot be read"
+    return 0
+  fi
+  was=$(sed -n 's/^ARG RPI_VERSION=//p' <<<"$was")
+  [ "$was" != "$now" ] || return 1
+  echo "the rpi pin moves from ${was:-nothing} to ${now:-nothing}"
+}
+
 # Two checks, each compiling once: lint and test. The test job goes to GitHub's runner only on
 # the nightly run (its minutes are scarce, and a refused job costs a rescue), so its clean 2-CPU
 # environment, and the path ZEPHYR_CI=hosted falls back on, are still tested daily. `hosted` is
-# where a job that wants GitHub's runner goes (image.yml and rpi-bump.yml read it), unless GitHub
+# where a job that wants GitHub's runner goes (image.yml reads it), unless GitHub
 # refused one this month. ZEPHYR_TRY_HOSTED=true (ci.yml's manual input `hosted`) tries it whatever
 # was refused, with the test job, so a raised limit is picked up by one manual run.
+# A third check, real-rpi, joins them when the pinned rpi is what is being tested (real_rpi_due).
 plan() {
-  local mode=${ZEPHYR_CI:-both} local=$LOCAL hosted=$HOSTED test=$LOCAL why run=
+  local mode=${ZEPHYR_CI:-both} local=$LOCAL hosted=$HOSTED test=$LOCAL why real="" run=
   case $mode in
     both)
       # An API error must not stop CI: it just means trying hosted.
@@ -85,13 +108,18 @@ plan() {
     hosted) local=$HOSTED test=$HOSTED why="ZEPHYR_CI=hosted: everything on $HOSTED" ;;
     *) die "ZEPHYR_CI is '$mode'; use both, local or hosted" ;;
   esac
-  summary "placement: $why"
+  if real=$(real_rpi_due); then
+    summary "placement: $why; real-rpi on $local ($real)"
+    real=",{\"check\":\"real-rpi\",\"runner\":\"$local\"}"
+  else
+    summary "placement: $why"
+  fi
   {
     echo "local=$local"
     echo "hosted=$hosted"
     # Rescue is possible only when a check went to hosted and zephyr-local is up.
     echo "rescue=$([ "$test" = "$HOSTED" ] && [ "$local" = "$LOCAL" ] && echo true || echo false)"
-    echo "matrix={\"include\":[{\"check\":\"lint\",\"runner\":\"$local\"},{\"check\":\"test\",\"runner\":\"$test\"}]}"
+    echo "matrix={\"include\":[{\"check\":\"lint\",\"runner\":\"$local\"},{\"check\":\"test\",\"runner\":\"$test\"}$real]}"
   } >> "${GITHUB_OUTPUT:-/dev/stdout}"
 }
 
@@ -195,7 +223,7 @@ check() {
   export TMPDIR=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
   case $what in
     lint)
-      shellcheck deploy/install.sh deploy/runner/start.sh deploy/release.sh deploy/bump-rpi.sh .github/ci.sh .github/sandbox.sh
+      shellcheck deploy/install.sh deploy/runner/start.sh deploy/release.sh deploy/bump-rpi.sh .github/ci.sh
       cargo fmt --all --check
       cargo deny check advisories bans
       seed
@@ -214,18 +242,37 @@ check() {
       [ -z "$flaky" ] || summary "$(printf '### Flaky (passed on retry)\n%s' "$flaky")"
       [ -z "$failed" ] || summary "$(printf '### Failed\n%s' "$failed")"
       return "$status" ;;
+    real-rpi)
+      # The ignored tests, against the release the Dockerfile pins: fetched and checked as the
+      # image build checks it (and as deploy/release.sh does), then run as release.sh runs them.
+      [ "$(uname -m)" = x86_64 ] || die "real-rpi needs an x86_64 runner, not $(uname -m)"
+      seed
+      local v s f dir
+      v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
+      s=$(sed -n 's/^ARG RPI_SHA256_AMD64=//p' deploy/Dockerfile)
+      [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $s =~ ^[0-9a-f]{64}$ ]] ||
+        die "deploy/Dockerfile pins no rpi release"
+      f=rpi-v$v-x86_64-unknown-linux-gnu.tar.gz
+      dir=$(mktemp -d)
+      curl -fsSLo "$dir/$f" "https://github.com/bigfish1913/pi-rust/releases/download/v$v/$f" ||
+        die "could not fetch rpi $v"
+      echo "$s  $dir/$f" | sha256sum -c --quiet - || die "$f does not match the Dockerfile's sha256"
+      tar -xzf "$dir/$f" --no-same-owner -C "$dir" ./rpi
+      [ "$("$dir/rpi" --version)" = "rpi $v" ] || die "the v$v binary reports $("$dir/rpi" --version)"
+      ZEPHYR_REAL_RPI=1 RPI_BIN=$dir/rpi cargo test --workspace -- --ignored ;;
     *) die "unknown check '$what'" ;;
   esac
 }
 
 # Which checks GitHub refused to start on its runners, one per line in output `checks`. A check that
 # started and failed is never run again: that is a real failure, and so is anything else that did
-# not pass. Its step holds GH_TOKEN and runs only these API calls; `rescue`, the next step, runs
-# the checks with no token in its environment at all.
+# not pass, real-rpi included: a bump whose real-rpi check failed is never rescued past. Its step
+# holds GH_TOKEN and runs only these API calls; `rescue`, the next step, runs the checks with no
+# token in its environment at all.
 rescue_plan() {
   local jobs refused bad id name list=
   jobs=$(api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs?per_page=100" \
-    --jq '.jobs[] | select(.name | test("^(lint|test) \\("))')
+    --jq '.jobs[] | select(.name | test("^(lint|test|real-rpi) \\("))')
   bad=$(jq -r "select(.conclusion != \"success\") | select(. as \$j | [\$j | $NOT_STARTED] | length == 0) | .name" <<<"$jobs")
   [ -z "$bad" ] || die "not rescued, these ran (or were cancelled) and did not pass: $(echo "$bad" | paste -sd, -)"
   refused=$(jq -r "$NOT_STARTED | \"\(.id)\t\(.name)\"" <<<"$jobs")
