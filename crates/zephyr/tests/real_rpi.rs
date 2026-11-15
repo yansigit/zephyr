@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Channel, Inbound, Outbound};
 use zephyr::config::Config;
 
-/// The real binary: `$RPI_BIN` (CI's `rpi-bump` workflow sets it), else the pinned release at its
+/// The real binary: `$RPI_BIN` (ci.sh's real-rpi check sets it), else the pinned release at its
 /// fixed path.
 static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     std::env::var("RPI_BIN")
@@ -24,6 +24,19 @@ fn skip_without_rpi(rpi: impl std::fmt::Display) {
         panic!("ZEPHYR_REAL_RPI=1 but {rpi} is not installed");
     }
     eprintln!("skipping: {rpi} is not installed");
+}
+
+/// The config line that loads the policy plugin, when this build made it: the cdylib lands
+/// beside this test's `deps/` folder, wherever CARGO_TARGET_DIR put the target dir (as
+/// zephyr-policy's tests/common finds it).
+fn policy_plugin() -> String {
+    let exe = std::env::current_exe().unwrap();
+    // test exe: <target>/<profile>/deps/<name>; the cdylib is <target>/<profile>/<lib>.
+    let plugin = exe.ancestors().nth(2).unwrap().join("libzephyr_policy.so");
+    match plugin.exists() {
+        true => format!("policy_plugin = {plugin:?}\n"),
+        false => String::new(),
+    }
 }
 
 struct TestChannel {
@@ -214,14 +227,7 @@ async fn a_missing_extension_does_not_stop_the_child() {
     )
     .unwrap();
     // Beside the policy plugin, when this checkout has built it, as in the image.
-    let plugin = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/debug/libzephyr_policy.so"
-    );
-    let plugin = match std::path::Path::new(plugin).exists() {
-        true => format!("policy_plugin = {plugin:?}\n"),
-        false => String::new(),
-    };
+    let plugin = policy_plugin();
     let cfg: Config = toml::from_str(&format!(
         "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}\
          extensions = [\"/nonexistent/librpi_providers.so\"]\n[owners]\nchat = [\"owner\"]\n"
@@ -486,14 +492,7 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
     )
     .unwrap();
     // The policy plugin, when this checkout has built it: the btw child must still load it.
-    let plugin = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/debug/libzephyr_policy.so"
-    );
-    let plugin = match std::path::Path::new(plugin).exists() {
-        true => format!("policy_plugin = {plugin:?}\n"),
-        false => String::new(),
-    };
+    let plugin = policy_plugin();
     let cfg: Config = toml::from_str(&format!(
         "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}[owners]\nchat = [\"owner\"]\n"
     ))
@@ -762,14 +761,7 @@ async fn real_rpi_call_child_speaks_with_no_tools() {
         format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
     )
     .unwrap();
-    let plugin = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/debug/libzephyr_policy.so"
-    );
-    let plugin = match std::path::Path::new(plugin).exists() {
-        true => format!("policy_plugin = {plugin:?}\n"),
-        false => String::new(),
-    };
+    let plugin = policy_plugin();
     let cfg: Config = toml::from_str(&format!(
         "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}"
     ))

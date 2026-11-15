@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""rpi-bump.yml's push job checks the build job's patch with this. The build ran code nobody
-reviewed (the new rpi binary, the new crates' build scripts), so the patch is untrusted.
+"""rpi-bump.yml calls this in two jobs, from a copy taken out of the tree before anything is
+applied.
+
+propose calls `verify` on the tree bump-rpi.sh just edited (EDIT_ONLY, so the new binary is never
+run), only to say on the PR whether the change is a pure pin move. It gates nothing: the PR is
+opened either way, and merge checks again.
+
+merge calls `patch` and then `verify` on the PR's diff, and fast-forwards main only when both pass.
+That diff is untrusted: the rpi-bump branch takes pushes from anyone with write access to this
+repo, so the commit may hold anything. The diff is therefore read as bytes, gated, applied to main's
+checkout, and what git wrote is checked against the commit's own tree, whatever the commit meant.
 
     bump-check.py patch PATCH
         A first gate, before `git apply`: only the files deploy/bump-rpi.sh edits (ALLOWED), each

@@ -59,8 +59,11 @@ shells into the container. In the container it runs the daemon (`run`) and the c
 - `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
   rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.21.x (`RPI_PIN` in
   main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.21.2"` in zephyr-policy and zephyr-cursor,
-  and `rpi-tui = "=0.21.2"` in zephyr); `deploy/bump-rpi.sh` moves them all, daily via
-  `.github/workflows/rpi-bump.yml`, which merges the bump when the tests and real-rpi suite pass.
+  and `rpi-tui = "=0.21.2"` in zephyr); `deploy/bump-rpi.sh` moves them all. `rpi-bump.yml` proposes
+  each bump as a PR (edits only, no build) and starts ci.yml on it, with its `real-rpi` check; a
+  sweep fast-forwards main to that exact commit once `ci-ok` and `real-rpi` pass and the diff is a
+  pure pin move (`.github/bump-check.py`). Anything else waits for a person, and a branch with a
+  commit the bot did not both write and commit is never replaced or closed.
 - `pool.rs`: `[[account]]` failover. Each account gets its own `RPI_CODING_AGENT_DIR` under
   `<home>/accounts/<name>/`; rate-limit detection reads `agent_settled.error`; cooldowns live in `state.db`.
 - `auth_keeper.rs`: refreshes expiring OAuth tokens via `rpi auth refresh` subprocess (not the
@@ -319,17 +322,28 @@ rpi's frame shapes matter, update fake-rpi.py to match the real binary. `Config:
 router's 5 s housekeeping tick) is a hidden field like `stall_limit`; tests that wait on it set
 200 ms. Wait on events, not fixed sleeps, and don't assume the order of replies a slow machine can
 reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`,
-README "CI") runs two checks on Rust 1.95, each compiling once: `lint` (shellcheck, fmt, `cargo
-deny check advisories bans`, clippy) and `test`, the whole suite in one `cargo nextest` run (each
+README "CI") runs two checks on Rust 1.95 (and `real-rpi`, below), each compiling once: `lint`
+(shellcheck, fmt, `cargo deny check advisories bans`, clippy) and `test`, the whole suite in one
+`cargo nextest` run (each
 test in its own process, so no test may rely on another's process-wide state, such as a port
 counter). `.github/ci.sh plan` places them by repo variable `ZEPHYR_CI` (`both`|`local`|`hosted`;
 under `both` everything runs on the owner's `zephyr-local` runners but the nightly run's `test`,
-on GitHub's); `ci.sh skip` runs none for Markdown outside `.github/`, `crates/` and `deploy/`, or
-for main's merge of a PR whose head passed `ci-ok` on the same tree. A job on `zephyr-local` copies
-main's last build from the read-only volume `zephyr-ci-cache`, which only `deploy/runner/start.sh
+on GitHub's; once GitHub refuses a hosted job, nothing goes there for the rest of that UTC month,
+until `gh workflow run ci.yml -f hosted=true` starts one);
+`ci.sh skip` runs none for Markdown outside `.github/`, `crates/` and `deploy/`, or for main's
+merge of a PR whose head passed `ci-ok` on the same tree. A job on `zephyr-local` copies main's
+last build from the read-only volume `zephyr-ci-cache`, which only `deploy/runner/start.sh
 warm` on the host writes, from main's commit. `rescue` reruns on `zephyr-local` what GitHub
 refused to start, and `ci-ok` is the one check to gate merges on;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
+A third check, `real-rpi`, runs those ignored tests against the pinned rpi release on zephyr-local
+(x86_64) when `ci.sh` finds the pin is what is tested: the nightly run, an `rpi-bump/*` branch, a
+commit that moves `RPI_VERSION`, or `gh workflow run ci.yml -f real_rpi=true`. `rescue` never reruns
+it past a failure.
+`tests/host.rs` runs rpi-bump.yml's own steps, read from the workflow's text (`workflow_steps`,
+`run_job`), against a bare repository, a fake `gh` over JSON fixtures and a fake release
+(`rpi_bump_proposes_one_commit_and_merges_only_a_tested_pin_move`): keep the steps in the layout
+it reads, and give a new rule of `propose` or `merge` a case there.
 `tests/cards_link.rs` runs the Link issuer against a stub of Link's API; its ignored
 `a_real_link_card_for_one_dollar` is the owner's spike (`ZEPHYR_LINK_LIVE=1`, after `zephyr card link`).
 

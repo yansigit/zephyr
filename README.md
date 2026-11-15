@@ -1377,9 +1377,10 @@ with a comma cannot be masked and is named in a warning).
 The image workflow smoke-tests the built image (zephyr, rpi, the policy plugin and every extension)
 before it pushes, and tags `:<version>` and `:latest`. It runs on GitHub-hosted runners, or on
 this machine's runner (below, building on its rootless BuildKit, without the smoke test) when
-`ZEPHYR_CI=local` or GitHub refused a hosted job in the last 6 hours. If the image run itself is
-refused for minutes, `gh run rerun <id>` (the whole run, not `--failed`) plans again and builds
-here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it; `-f local=true` builds it here.
+`ZEPHYR_CI=local` or GitHub refused a hosted job this month and started none since (see CI
+below). If the image run itself is refused for minutes, `gh run rerun <id>` (the whole run, not
+`--failed`) plans again and builds here. `gh workflow run image.yml --ref <branch>` builds a test
+image (`:dev`) without pushing it; `-f local=true` builds it here.
 
 ### CI
 
@@ -1390,8 +1391,11 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   - unset or `both`: everything here, costing no hosted minutes however often a PR is pushed,
     but for the nightly run (09:17 UTC), whose `test` runs on GitHub-hosted, a clean 2-CPU
     machine, so GitHub's environment, and the `hosted` path below, are still tested daily. If
-    GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, that
-    goes here too; the first run after that tries hosted again, so the monthly reset is picked up.
+    GitHub refused a hosted job (spending limit or quota) this month, and no hosted job has
+    started since, everything goes here too for the rest of the month; the first run of the next
+    month tries hosted again. To try sooner, after a raised limit, run
+    `gh workflow run ci.yml -f hosted=true`: it tests on GitHub-hosted whatever was refused, and a
+    hosted job that starts ends the refusal.
   - `local`: everything here (`gh variable set ZEPHYR_CI --body local`).
   - `hosted`: everything on GitHub, for when this machine is down. `plan` needs a runner too, so
     in the other modes a run waits (up to a day) while no `zephyr-local` runner is online.
@@ -1410,13 +1414,22 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   `cargo deny check advisories bans`, clippy) and `test`, the whole suite in one `cargo nextest
   run` (`.config/nextest.toml` profile `ci`). A test that passes only on its one retry is listed
   as flaky in the job summary; one that hangs is killed after 3 minutes.
+- `real-rpi`, a third check, runs the ignored tests against the pinned rpi release: `ci.sh` fetches
+  the Dockerfile's x86_64 tarball, checks it against its sha256 and that `rpi --version` is the pin,
+  then runs `ZEPHYR_REAL_RPI=1 cargo test --workspace -- --ignored` with `RPI_BIN` set to it. It is
+  added when the pinned rpi is what is tested: on the nightly run, on an `rpi-bump/*` branch, when
+  the commit moves `RPI_VERSION` (or its parent cannot be read), and on `gh workflow run ci.yml -f
+  real_rpi=true`. It runs on `zephyr-local` (x86_64 only) and `ci-ok` counts it. `rescue` never
+  reruns it past a failure.
 - `rescue` runs here, after them, each check GitHub did not start (failed with no runner and no
   step; the job's annotation says why). A check that started and failed is never rescued. Its
   token only asks the Actions API which checks those are; the step that runs them has none.
 - `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
-  check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
+  check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X;
+  under the monthly rule that happens at most once a month, at the first refusal, not each night.
 
-`rpi-bump.yml` asks here whether a bump is due, and builds, tests and pushes on GitHub-hosted runners only (below); `image.yml` as above.
+`rpi-bump.yml` proposes an rpi bump and starts this workflow on its branch for the `real-rpi` check
+(below); `image.yml` as above.
 
 The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
 `deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
@@ -1468,30 +1481,47 @@ reachable.
 
 ### Keeping rpi current
 
-`.github/workflows/rpi-bump.yml` runs each day (and on `gh workflow run rpi-bump.yml [-f
-version=X.Y.Z]`). When crates.io has a newer `rpi-tui` than the Dockerfile's `RPI_VERSION`,
-`deploy/bump-rpi.sh` moves every pin (the Dockerfile's version and both sha256s, from the release's
-own `.sha256` files and checked against the tarballs, `RPI_PIN`, the `=` Cargo pins and
-`Cargo.lock`, fake-rpi's `--version`, the real-rpi test path). The workflow runs fmt, clippy, the
-tests and the real-rpi suite against the new binary (`RPI_BIN`), opens a PR `rpi-bump/v<version>`,
-and merges it when all of that passed; when anything failed the PR stays open with the run linked,
-and later runs leave it alone: a first job, with a read token and no repository code, sees the open
-PR and stops before anything is built. The bump and the tests (which run the new rpi binary and the
-new crates' build scripts) hold no token, and run on a GitHub-hosted runner inside a throwaway
-container (`.github/sandbox.sh`: the image's Ubuntu and Rust by digest, the checkout mounted, its
-`.git` read only), so nothing they start sees the runner's processes, whose environment holds the
-Actions runtime token, or outlives them. A last job on a fresh GitHub-hosted runner, never this
-machine, takes their diff to a fresh checkout of main (`.github/bump-check.py`): a first look at
-its bytes (only the files `bump-rpi.sh` edits, no control or non-ASCII character on a changed
-line), then `git apply`, then a check of what git actually wrote. Each of those files must be
-exactly what `bump-rpi.sh`'s edits make of its version on main, moving the pinned rpi to the
-gate's newer version with the sha256s the release itself publishes, fetched again; in `Cargo.lock`
-no crate but the `rpi-*` ones moved, and new ones only from crates.io. Only then does it push, and
-open and merge the PR. A bump that needs another crate moved fails that check and waits for a
-person. When GitHub will not start that job,
-the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
+`.github/workflows/rpi-bump.yml` proposes a bump each day at 21:17 UTC, when crates.io has a newer
+`rpi-tui` than the Dockerfile's `RPI_VERSION`, and merges a tested one in a sweep at 22:47, 00:47
+and 03:47 UTC. By hand: `gh workflow run rpi-bump.yml [-f version=X.Y.Z]` proposes that version (the
+newest by default), and `gh workflow run rpi-bump.yml -f merge=true` only looks for a tested bump to
+merge. It never releases: tag as above to ship an image with the new rpi.
+
+`propose` runs `deploy/bump-rpi.sh` in edits-only mode, in a step with no token. It moves every pin:
+the Dockerfile's version and both sha256s (from the release's own `.sha256` files, checked against
+the tarballs), `RPI_PIN`, the `=` Cargo pins and `Cargo.lock`, fake-rpi's `--version` and the
+real-rpi test path. The new binary is never unpacked or run, and nothing is built. The one commit
+goes to `rpi-bump/v<version>`, the PR is opened or updated, and `ci.yml` runs on that branch with
+`real_rpi=true`: the ordinary checks, plus `real-rpi` (above). A new commit always gets a CI run;
+an unchanged one gets one only if none exists. The PR's body says whether the change is a pure pin
+move (`bump-check.py verify`, run on the edited tree before the PR opens).
+
+A branch is the bot's only while `github-actions[bot]` both wrote and committed every commit on
+it. One you amended, rebased or added to is yours: propose never replaces it and never closes its
+PR. The bot's own PR for a lower version is closed when a newer release is proposed, unless it is
+one commit on the current main with its CI running or passed, which the sweep may still merge. To
+decline a bump, close its PR: the daily run does not propose that version again (`-f
+version=X.Y.Z` does).
+
+`merge` never checks out or builds the PR. Of the open `rpi-bump/v<version>` PRs above the pin it
+takes the highest whose commit has proof: the newest `ci.yml` run started by `workflow_dispatch`
+for that exact commit (a cancelled one aside) has `ci-ok` and `real-rpi` passing, so a later run
+that failed takes an earlier pass back, and a lower version you proposed by hand is merged while
+the newest release's PR is red. It fetches the commit, requires it to be one commit on main, and
+reads its diff as bytes: `bump-check.py patch` gates them, `git apply` applies them to main's
+checkout, and `bump-check.py verify` checks what git wrote, which must equal the commit's tree. Only then does it
+fast-forward `main` to that commit. A `main` that moved meanwhile refuses the push, and GitHub marks
+the PR merged when it lands. The steps that apply the diff hold no token, and the commit CI
+tested is the commit main gets.
+
+A bump that is not a pure pin move, such as one that needs another crate moved in `Cargo.lock`, is
+still proposed, with its PR saying "Not auto-merged"; a person merges or fixes it. A failing
+`ci.yml` run leaves the PR open with its run linked. The sweep skips the PR, and propose does not
+start CI again for that commit. A person pushes a fix to the branch or merges by hand.
+
 The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
-General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and
-pull-requests write on this repo) so `ci` runs on the PR, and allow auto-merge: the merge then waits
-for it. `deploy/bump-rpi.sh [version]` does the same edits locally; `release.sh` fetches the pinned
+General). No secret is needed: a PR opened with `GITHUB_TOKEN` starts no `pull_request` run, so
+propose dispatches `ci.yml` itself, and dispatched runs always run. A future required-check ruleset
+on `main` would need a GitHub App token, since checks from `workflow_dispatch` runs do not satisfy a
+ruleset. `deploy/bump-rpi.sh [version]` does the same edits locally; `release.sh` fetches the pinned
 binary when it is missing.

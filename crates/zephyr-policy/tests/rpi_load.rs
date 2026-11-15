@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
 
-/// The real binary: `$RPI_BIN` (CI's `rpi-bump` workflow sets it), else the pinned release at its
+/// The real binary: `$RPI_BIN` (ci.sh's real-rpi check sets it), else the pinned release at its
 /// fixed path.
 static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     std::env::var("RPI_BIN")
