@@ -3840,12 +3840,21 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
                 );
                 assert!(job.contains("ref: main\n"), "{job}");
             }
-            // The job before them reads, with gh alone: no checkout, no repository code, no cargo.
+            // The job before them reads, with gh and main's `ci.sh plan` alone (which reads the
+            // Actions API, to stop before hosted jobs GitHub would refuse): no other repository
+            // code, no cargo, nothing that writes.
             let gate = job("  gate:");
             assert!(gate.contains("pull-requests: read"), "{gate}");
-            for never in ["write", "actions/checkout", "cargo", ".github/", "deploy/"] {
+            assert!(gate.contains("ref: main\n"), "{gate}");
+            assert!(gate.contains(".github/ci.sh plan)"), "{gate}");
+            for never in ["write", "cargo", "deploy/"] {
                 assert!(!gate.contains(never), "{never}: {gate}");
             }
+            assert_eq!(gate.matches(".github/").count(), 1, "{gate}");
+            assert!(
+                build.contains("if: needs.gate.outputs.go == 'true'"),
+                "{build}"
+            );
         }
     }
     assert!(tokens >= 6, "{tokens}");
@@ -4925,6 +4934,7 @@ case $e in
   */pulls/*) f=pr ;;
   */git/commits/*) f=gitcommit ;;
   */actions/workflows/ci.yml/runs) f=runs ;;
+  */actions/runs/*/jobs) f=${e%/jobs}; f=jobs-${f##*/} ;;
   */actions/runs) f=refusals ;;
   *) exit 1 ;;
 esac
@@ -5020,7 +5030,102 @@ jq -r "$filter" "$FAKE_API/$f.json"
         r#"{"check":"test","runner":"zephyr-local"}"#,
         r#"{"check":"test","runner":"ubuntu-latest"}"#,
     );
-    assert_eq!(matrix("schedule", "both"), (nightly, true));
+    assert_eq!(matrix("schedule", "both"), (nightly.clone(), true));
+
+    // Once GitHub refused a hosted job this month, and started none since, every job stays here
+    // (the nightly's test, image.yml's and rpi-bump.yml's `hosted`) until the month ends, so the
+    // nightly is not refused again each night. The newest run that tried hosted decides.
+    let now = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .unwrap();
+    let now = String::from_utf8(now.stdout).unwrap().trim().to_string();
+    let runs = |list: &[(u32, &str, &str, &str)]| {
+        let list: Vec<String> = (list.iter())
+            .map(|(id, event, created, branch)| {
+                format!(
+                    r#"{{"id":{id},"event":"{event}","created_at":"{created}","head_branch":"{branch}"}}"#
+                )
+            })
+            .collect();
+        fixture(
+            "refusals",
+            &format!(r#"{{"workflow_runs":[{}]}}"#, list.join(",")),
+        );
+    };
+    let refused =
+        r#"{"conclusion":"failure","steps":[],"runner_name":"","labels":["ubuntu-latest"]}"#;
+    let skipped =
+        r#"{"conclusion":"skipped","steps":[],"runner_name":"","labels":["ubuntu-latest"]}"#;
+    let started = r#"{"conclusion":"success","steps":[{"name":"x"}],"runner_name":"GitHub Actions 3","labels":["ubuntu-latest"]}"#;
+    let here = r#"{"conclusion":"success","steps":[{"name":"x"}],"runner_name":"zephyr-runner-1","labels":["zephyr-local"]}"#;
+    let jobs = |id: u32, list: &[&str]| {
+        fixture(
+            &format!("jobs-{id}"),
+            &format!(r#"{{"jobs":[{}]}}"#, list.join(",")),
+        )
+    };
+    let placed = |vars: &[(&str, &str)]| {
+        let out = ci("plan", vars);
+        let get = |k: &str| {
+            (out.lines())
+                .find_map(|l| l.strip_prefix(k))
+                .unwrap()
+                .to_string()
+        };
+        (get("matrix="), get("hosted="), get("rescue="))
+    };
+    let nightly_at = |vars: &[(&str, &str)]| {
+        let mut all = vec![("GITHUB_EVENT_NAME", "schedule"), ("ZEPHYR_CI", "both")];
+        all.extend_from_slice(vars);
+        placed(&all)
+    };
+    let on_github = (nightly.clone(), "ubuntu-latest".into(), "true".into());
+    let kept_here = (all_local.to_string(), "zephyr-local".into(), "false".into());
+    // rpi-bump.yml's run 5: its hosted build refused (its push skipped).
+    jobs(5, &[here, refused, skipped]);
+    runs(&[(5, "schedule", &now, "main")]);
+    assert_eq!(nightly_at(&[]), kept_here);
+    // A later run that tried no hosted job (a gate that stopped) changes nothing.
+    jobs(6, &[here]);
+    runs(&[(6, "schedule", &now, "main"), (5, "schedule", &now, "main")]);
+    assert_eq!(nightly_at(&[]), kept_here);
+    // One that GitHub started (a manual run after a raised limit) ends it.
+    jobs(7, &[here, started]);
+    runs(&[
+        (7, "workflow_dispatch", &now, "main"),
+        (6, "schedule", &now, "main"),
+        (5, "schedule", &now, "main"),
+    ]);
+    assert_eq!(nightly_at(&[]), on_github);
+    // A release tag's image build counts; last month, a pull request and a branch push do not.
+    jobs(8, &[refused]);
+    runs(&[(8, "push", &now, "v0.11.0")]);
+    assert_eq!(nightly_at(&[]), kept_here);
+    runs(&[
+        (8, "push", &now, "main"),
+        (9, "pull_request", &now, "fix/x"),
+        (10, "schedule", "2000-01-31T23:00:00Z", "main"),
+    ]);
+    jobs(9, &[refused]);
+    jobs(10, &[refused]);
+    assert_eq!(nightly_at(&[]), on_github);
+    // A re-run counts its own earlier attempts.
+    runs(&[]);
+    jobs(11, &[refused]);
+    let rerun = [("GITHUB_RUN_ID", "11"), ("GITHUB_RUN_ATTEMPT", "2")];
+    assert_eq!(nightly_at(&rerun), kept_here);
+    // Asked to try hosted (ci.yml's manual input), the test goes there whatever was refused.
+    runs(&[(5, "schedule", &now, "main")]);
+    let tried = placed(&[
+        ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+        ("ZEPHYR_CI", "both"),
+        ("ZEPHYR_TRY_HOSTED", "true"),
+    ]);
+    assert_eq!(tried, on_github);
+    // An API that cannot be read means trying hosted.
+    assert_eq!(nightly_at(&[("FAKE_FAIL", "1")]), on_github);
+    runs(&[]);
 
     // A pull request, against its base: Markdown outside the code, and nothing else, runs no
     // checks; a rename counts on both its sides.

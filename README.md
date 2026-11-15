@@ -1377,9 +1377,10 @@ with a comma cannot be masked and is named in a warning).
 The image workflow smoke-tests the built image (zephyr, rpi, the policy plugin and every extension)
 before it pushes, and tags `:<version>` and `:latest`. It runs on GitHub-hosted runners, or on
 this machine's runner (below, building on its rootless BuildKit, without the smoke test) when
-`ZEPHYR_CI=local` or GitHub refused a hosted job in the last 6 hours. If the image run itself is
-refused for minutes, `gh run rerun <id>` (the whole run, not `--failed`) plans again and builds
-here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it; `-f local=true` builds it here.
+`ZEPHYR_CI=local` or GitHub refused a hosted job this month and started none since (see CI
+below). If the image run itself is refused for minutes, `gh run rerun <id>` (the whole run, not
+`--failed`) plans again and builds here. `gh workflow run image.yml --ref <branch>` builds a test
+image (`:dev`) without pushing it; `-f local=true` builds it here.
 
 ### CI
 
@@ -1390,8 +1391,11 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   - unset or `both`: everything here, costing no hosted minutes however often a PR is pushed,
     but for the nightly run (09:17 UTC), whose `test` runs on GitHub-hosted, a clean 2-CPU
     machine, so GitHub's environment, and the `hosted` path below, are still tested daily. If
-    GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, that
-    goes here too; the first run after that tries hosted again, so the monthly reset is picked up.
+    GitHub refused a hosted job (spending limit or quota) this month, and no hosted job has
+    started since, everything goes here too for the rest of the month; the first run of the next
+    month tries hosted again. To try sooner, after a raised limit, run
+    `gh workflow run ci.yml -f hosted=true`: it tests on GitHub-hosted whatever was refused, and a
+    hosted job that starts ends the refusal.
   - `local`: everything here (`gh variable set ZEPHYR_CI --body local`).
   - `hosted`: everything on GitHub, for when this machine is down. `plan` needs a runner too, so
     in the other modes a run waits (up to a day) while no `zephyr-local` runner is online.
@@ -1414,7 +1418,8 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   step; the job's annotation says why). A check that started and failed is never rescued. Its
   token only asks the Actions API which checks those are; the step that runs them has none.
 - `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
-  check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
+  check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X;
+  under the monthly rule that happens at most once a month, at the first refusal, not each night.
 
 `rpi-bump.yml` asks here whether a bump is due, and builds, tests and pushes on GitHub-hosted runners only (below); `image.yml` as above.
 
@@ -1488,8 +1493,11 @@ exactly what `bump-rpi.sh`'s edits make of its version on main, moving the pinne
 gate's newer version with the sha256s the release itself publishes, fetched again; in `Cargo.lock`
 no crate but the `rpi-*` ones moved, and new ones only from crates.io. Only then does it push, and
 open and merge the PR. A bump that needs another crate moved fails that check and waits for a
-person. When GitHub will not start that job,
-the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
+person. When GitHub will not start that job, the bump waits: `gate` stops green, with a note in its
+summary, while `.github/ci.sh plan` would not use GitHub-hosted (`ZEPHYR_CI=local`, or GitHub
+refused a hosted job this month and started none since). It waits for the next month, or for
+`gh workflow run ci.yml -f hosted=true` to start a hosted job, and the daily run then proceeds.
+It never releases: tag as above to ship an image with the new rpi.
 The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
 General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and
 pull-requests write on this repo) so `ci` runs on the PR, and allow auto-merge: the merge then waits

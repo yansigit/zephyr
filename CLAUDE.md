@@ -324,9 +324,11 @@ deny check advisories bans`, clippy) and `test`, the whole suite in one `cargo n
 test in its own process, so no test may rely on another's process-wide state, such as a port
 counter). `.github/ci.sh plan` places them by repo variable `ZEPHYR_CI` (`both`|`local`|`hosted`;
 under `both` everything runs on the owner's `zephyr-local` runners but the nightly run's `test`,
-on GitHub's); `ci.sh skip` runs none for Markdown outside `.github/`, `crates/` and `deploy/`, or
-for main's merge of a PR whose head passed `ci-ok` on the same tree. A job on `zephyr-local` copies
-main's last build from the read-only volume `zephyr-ci-cache`, which only `deploy/runner/start.sh
+on GitHub's; once GitHub refuses a hosted job, nothing goes there for the rest of that UTC month,
+and rpi-bump's gate stops green, until `gh workflow run ci.yml -f hosted=true` starts one);
+`ci.sh skip` runs none for Markdown outside `.github/`, `crates/` and `deploy/`, or for main's
+merge of a PR whose head passed `ci-ok` on the same tree. A job on `zephyr-local` copies main's
+last build from the read-only volume `zephyr-ci-cache`, which only `deploy/runner/start.sh
 warm` on the host writes, from main's commit. `rescue` reruns on `zephyr-local` what GitHub
 refused to start, and `ci-ok` is the one check to gate merges on;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.

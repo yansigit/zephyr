@@ -15,8 +15,10 @@
 #   release's own sha256s (.github/bump-check.py), applies it, pushes, opens the PR and merges. It
 #   never runs cargo or anything the build made.
 # `gate` follows variable ZEPHYR_CI as ci.yml does (README "CI"): on zephyr-local, unless that is
-# `hosted`. `build` (for its Docker) and `push` are hosted only: when GitHub will not start them
-# (quota, spending limit) they fail and the bump waits for the next day's run.
+# `hosted`. `build` (for its Docker) and `push` are hosted only, so `gate` asks .github/ci.sh plan
+# where a hosted job goes and stops, green, when that is not GitHub: ZEPHYR_CI=local, or GitHub
+# refused a hosted job this month (quota, spending limit) and started none since. The bump then
+# waits for the next month, or for `gh workflow run ci.yml -f hosted=true` to start one.
 name: rpi-bump
 on:
   schedule:
@@ -30,28 +32,43 @@ permissions:
   contents: read
 concurrency: rpi-bump
 jobs:
-  # A read token and gh, nothing from the repository: the version to move to, and whether a PR for
-  # it is already open (then the day's build and tests would be for nothing).
+  # A read token, gh and main's .github/ci.sh plan (which only reads the Actions API, as in ci.yml),
+  # nothing that builds: the version to move to, whether a PR for it is already open (then the
+  # day's build and tests would be for nothing), and whether GitHub will start the hosted jobs.
   gate:
     runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
     timeout-minutes: 5
     permissions:
+      actions: read
+      contents: read
       pull-requests: read
     outputs:
       version: ${{ steps.gate.outputs.version }}
       go: ${{ steps.gate.outputs.go }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
       - id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+          ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
         run: |
           v=${VERSION:-$(curl -fsS -A zephyr-rpi-bump https://crates.io/api/v1/crates/rpi-tui | jq -r .crate.max_stable_version)}
           [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release version: $v" >&2; exit 1; }
           open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "rpi-bump/v$v" --state open --json number --jq length)
+          plan=$(mktemp)
+          why=$(GITHUB_OUTPUT=$plan GITHUB_STEP_SUMMARY=/dev/null .github/ci.sh plan)
+          hosted=$(sed -n 's/^hosted=//p' "$plan")
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "go=$([ "$open" = 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          [ "$open" = 0 ] || echo "an open PR for rpi $v waits for a person; nothing to do"
+          echo "go=$([ "$open" = 0 ] && [ "$hosted" = ubuntu-latest ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [ "$open" != 0 ]; then
+            echo "an open PR for rpi $v waits for a person; nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "$hosted" != ubuntu-latest ]; then
+            echo "rpi $v is out, but its build and push run only on GitHub-hosted, which ci.sh plan would not use now (${why#placement: }); the bump waits" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
   # No token in any step, and everything that runs the bump's code (bump-rpi.sh runs the new rpi
   # binary and `cargo update`; the tests run the new crates' build scripts) runs in a throwaway
   # container (.github/sandbox.sh), where it cannot see the runner's processes, whose environment

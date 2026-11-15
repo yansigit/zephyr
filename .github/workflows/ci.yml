@@ -4,8 +4,9 @@
 # .github/ci.sh holds the placement, the checks and when none are needed (only Markdown outside the
 # code changed, or main's merge of a PR whose head passed on the same tree).
 # Variable ZEPHYR_CI: unset or `both` runs the nightly run's test on GitHub-hosted and everything
-# else on zephyr-local; `local` runs everything there, `hosted` everything on GitHub (the server is
-# down).
+# else on zephyr-local (everything, once GitHub refused a hosted job this month); `local` runs
+# everything there, `hosted` everything on GitHub (the server is down). `gh workflow run ci.yml -f
+# hosted=true` tests on GitHub-hosted whatever was refused, as after a raised spending limit.
 # The ignored tests need the pinned rpi binary: deploy/release.sh runs them.
 name: ci
 on:
@@ -16,6 +17,11 @@ on:
   schedule:
     - cron: '17 9 * * *'
   workflow_dispatch:
+    inputs:
+      hosted:
+        description: "test on GitHub-hosted even after a refusal this month"
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -46,6 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
+          ZEPHYR_TRY_HOSTED: ${{ inputs.hosted }}
       - id: skip
         run: .github/ci.sh skip
         env:

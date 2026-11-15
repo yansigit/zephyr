@@ -12,9 +12,6 @@ cd "$(dirname "$0")/.."
 
 LOCAL=zephyr-local
 HOSTED=ubuntu-latest
-# How far back a hosted job refused for quota sends everything to zephyr-local; the first run after
-# it tries hosted again, so a month's reset (or a raised limit) is picked up by itself.
-WINDOW="6 hours"
 # Where zephyr-local's runners find main's last build, read only (deploy/runner/start.sh warm).
 CACHE=/cache/current
 
@@ -26,37 +23,58 @@ api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
 # whose annotation says "The job was not started because ..."). Reads job objects on stdin.
 NOT_STARTED='select(.conclusion == "failure" and (.steps | length) == 0 and (.runner_name // "") == "")'
 
-# The id of a run in the last $WINDOW with a hosted job GitHub would not start, if any.
+# Runs that can have tried GitHub's runner while ZEPHYR_CI is `both`: the nightly and manual runs
+# (ci.yml's nightly test, rpi-bump.yml, image.yml's manual builds) and a release tag's image build.
+# Reads run objects on stdin.
+MAY_BE_HOSTED='select(.event == "schedule" or .event == "workflow_dispatch" or (.event == "push" and (.head_branch // "" | test("^v[0-9]"))))'
+
+# The id of the run whose hosted job GitHub would not start, when that is this month's last word on
+# GitHub's runners: the newest run of this UTC month with a hosted job that GitHub either started
+# or refused. GitHub's included minutes and spending limit are monthly, so one refusal keeps every
+# hosted job here for the rest of the month instead of being refused again each night, and the
+# first run of the next month tries hosted again. A hosted job that started since (a manual run with
+# ZEPHYR_TRY_HOSTED, after a raised limit) ends it sooner.
 recent_refusal() {
-  local since ids id n
-  since=$(date -u -d "$WINDOW ago" +%Y-%m-%dT%H:%M:%SZ)
-  ids=$(api "repos/$GITHUB_REPOSITORY/actions/runs?status=failure&created=%3E%3D$since&per_page=10" \
-    --jq '.workflow_runs[].id')
-  # A re-run is in progress, so not listed as failed: its earlier attempts count too.
+  local since ids id verdict
+  since=$(date -u +%Y-%m-01T00:00:00Z)
+  ids=$(api "repos/$GITHUB_REPOSITORY/actions/runs?created=%3E%3D$since&per_page=100" \
+    --jq "[.workflow_runs[] | select(.created_at >= \"$since\") | $MAY_BE_HOSTED | .id] | .[:20][]") || return
+  # A re-run's earlier attempts count too (jobs?filter=all lists them).
   [ "${GITHUB_RUN_ATTEMPT:-1}" = 1 ] || ids="$GITHUB_RUN_ID $ids"
   for id in $ids; do
-    n=$(api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?filter=all&per_page=100" \
-      --jq "[.jobs[] | $NOT_STARTED | select(any(.labels[]; . == \"$LOCAL\") | not)] | length") || return
-    if [ "$n" -gt 0 ]; then
-      echo "$id"
-      return 0
-    fi
+    verdict=$(api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?filter=all&per_page=100" \
+      --jq "[.jobs[] | select(any(.labels[]; . == \"$LOCAL\") | not)] |
+        if any(.[]; [$NOT_STARTED] | length > 0) then \"refused\"
+        elif any(.[]; (.runner_name // \"\") != \"\") then \"started\"
+        else \"\" end") || return
+    case $verdict in
+      refused) echo "$id"; return 0 ;;
+      started) return 0 ;;
+    esac
   done
 }
 
 # Two checks, each compiling once: lint and test. The test job goes to GitHub's runner only on
 # the nightly run (its minutes are scarce, and a refused job costs a rescue), so its clean 2-CPU
 # environment, and the path ZEPHYR_CI=hosted falls back on, are still tested daily. `hosted` is
-# where a job that wants GitHub's runner goes (image.yml reads it), after the refusal window.
+# where a job that wants GitHub's runner goes (image.yml and rpi-bump.yml read it), unless GitHub
+# refused one this month. ZEPHYR_TRY_HOSTED=true (ci.yml's manual input `hosted`) tries it whatever
+# was refused, with the test job, so a raised limit is picked up by one manual run.
 plan() {
-  local mode=${ZEPHYR_CI:-both} local=$LOCAL hosted=$HOSTED test=$LOCAL why run
+  local mode=${ZEPHYR_CI:-both} local=$LOCAL hosted=$HOSTED test=$LOCAL why run=
   case $mode in
     both)
       # An API error must not stop CI: it just means trying hosted.
-      run=$(recent_refusal) || { echo "ci: could not read recent runs; trying hosted" >&2; run=; }
-      if [ -n "$run" ]; then
+      if [ "${ZEPHYR_TRY_HOSTED:-}" != true ] && ! run=$(recent_refusal); then
+        echo "ci: could not read recent runs; trying hosted" >&2
+        run=
+      fi
+      if [ "${ZEPHYR_TRY_HOSTED:-}" = true ]; then
+        test=$HOSTED
+        why="asked to try $HOSTED: test there, lint on $LOCAL"
+      elif [ -n "$run" ]; then
         hosted=$LOCAL
-        why="GitHub refused a hosted job within $WINDOW (run $run): everything on $LOCAL"
+        why="GitHub refused a hosted job this month (run $run), and started none since: everything on $LOCAL"
       elif [ "${GITHUB_EVENT_NAME:-}" = schedule ]; then
         test=$HOSTED
         why="the nightly run: test on $HOSTED, lint on $LOCAL"

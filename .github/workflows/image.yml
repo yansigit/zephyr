@@ -8,9 +8,9 @@
 # yansigit/rpi-provider-plugins, passed to the build as the gh_token secret. It is only needed while
 # one of them is private; the build works without it when both are public.
 # Where it runs follows variable ZEPHYR_CI as ci.yml does (.github/ci.sh plan, README "CI"): on
-# GitHub-hosted, unless that is `local` or GitHub refused a hosted job in the last hours; then on
-# zephyr-local (deploy/runner/start.sh), which builds on its zephyr-buildkitd without the smoke test;
-# `-f local=true` builds there whatever ZEPHYR_CI says.
+# GitHub-hosted, unless that is `local` or GitHub refused a hosted job this month (and started none
+# since); then on zephyr-local (deploy/runner/start.sh), which builds on its zephyr-buildkitd
+# without the smoke test; `-f local=true` builds there whatever ZEPHYR_CI says.
 name: image
 on:
   push:
