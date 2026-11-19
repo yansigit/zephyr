@@ -903,7 +903,7 @@ fn skip_without_rpi(rpi: impl std::fmt::Display) {
 #[ignore = "drives the real rpi 0.21.2 --connect client"]
 async fn stock_rpi_connect_attaches_chats_and_detaches() {
     let rpi = std::env::var("RPI_BIN")
-        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.24.1/bin/rpi".into());
+        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.25.0/bin/rpi".into());
     let rpi = Path::new(&rpi);
     if !rpi.exists() {
         skip_without_rpi(rpi.display());

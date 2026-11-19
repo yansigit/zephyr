@@ -47,7 +47,7 @@ data-encoding = "2.11.1"
 croner = { version = "4", default-features = false, features = ["jiff"] }
 jiff = "0.2"
 # Pinned with the rpi binary (DESIGN §3); bump the two together.
-rpi-tui = "=0.24.1"
+rpi-tui = "=0.25.0"
 crossterm = { version = "0.27", features = ["bracketed-paste"] }
 # The public suffix list, compiled in: browser pacing's sites are registrable domains (DESIGN §4.24).
 psl = "2.1"

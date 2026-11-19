@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use support::cursor_service::{self, Observed, Script};
 
-const PINNED: &str = "/home/user/Projects/.always-on/rpi-0.24.1/bin/rpi";
+const PINNED: &str = "/home/user/Projects/.always-on/rpi-0.25.0/bin/rpi";
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A bearer token the exchange step must pass through untouched: three segments, `exp` far ahead.

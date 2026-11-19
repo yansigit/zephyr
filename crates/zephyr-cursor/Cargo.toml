@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Pinned with the rpi binary (RPI_PIN); bump both together. The `provider` feature is the
 # streaming-provider bridge this crate exports (DESIGN §4.9).
-rpi-plugin-sdk = { version = "=0.24.1", features = ["provider"] }
-rpi-ai = { version = "=0.24.1", features = ["providers"] }
+rpi-plugin-sdk = { version = "=0.25.0", features = ["provider"] }
+rpi-ai = { version = "=0.25.0", features = ["providers"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -22,7 +22,7 @@ use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
 /// fixed path.
 static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     std::env::var("RPI_BIN")
-        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.24.1/bin/rpi".into())
+        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.25.0/bin/rpi".into())
 });
 
 /// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
