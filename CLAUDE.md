@@ -43,7 +43,8 @@ it out, `KO_VOICE=1` adds the CC BY-NC-SA Korean voice. `--target voice-out` bui
 ## Architecture
 
 **One binary, two roles.** `crates/zephyr/src/main.rs` checks `host::in_container()` (true when
-`ZEPHYR_IN_CONTAINER` or `ZEPHYR_CONFIG` is set, or `/.dockerenv` exists). On the host it runs the
+`ZEPHYR_IN_CONTAINER` or `ZEPHYR_CONFIG` is set, or `/.dockerenv` exists together with the
+daemon state dir). On the host it runs the
 setup/ops CLI in `src/host/` (`init`, `up`, `login`, `accounts`, `model`, `config`, ...), which mostly
 shells into the container. In the container it runs the daemon (`run`) and the commands beside it
 (`status`, `doctor`, `chat`, `pause`/`resume`/`reload`, which talk to the daemon over its chat socket).

@@ -103,11 +103,21 @@ const COMMANDS: [&str; 29] = [
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
-/// at a daemon config, so it selects the daemon commands too.
+/// at a daemon config, so it selects the daemon commands too. A plain `/.dockerenv` alone is not
+/// enough (devcontainers and Codespaces have one); the daemon's state dir (`DAEMON_MOUNT`) must
+/// also exist.
 pub fn in_container() -> bool {
-    std::env::var_os("ZEPHYR_IN_CONTAINER").is_some()
-        || std::env::var_os("ZEPHYR_CONFIG").is_some()
-        || std::path::Path::new("/.dockerenv").exists()
+    detect_container(
+        |k| std::env::var_os(k).is_some(),
+        Path::new("/.dockerenv").exists(),
+        Path::new(DAEMON_MOUNT).exists(),
+    )
+}
+
+/// Container detection from its probes: `ZEPHYR_IN_CONTAINER` or `ZEPHYR_CONFIG` set, else both
+/// `/.dockerenv` and `DAEMON_MOUNT` present.
+fn detect_container(get_env: impl Fn(&str) -> bool, dockerenv: bool, state_dir: bool) -> bool {
+    get_env("ZEPHYR_IN_CONTAINER") || get_env("ZEPHYR_CONFIG") || (dockerenv && state_dir)
 }
 
 /// After `zephyr --version` on the host: the container's own version, which differs from this CLI's
@@ -1736,5 +1746,16 @@ mod tests {
         for bad in ["v1.2.3", "1.2", "1.2.3.4", "1.+2.3", "latest", ""] {
             assert_eq!(semver(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn container_detection_requires_a_zephyr_marker() {
+        let none = |_: &str| false;
+        assert!(detect_container(|k| k == "ZEPHYR_IN_CONTAINER", false, false));
+        assert!(detect_container(|k| k == "ZEPHYR_CONFIG", false, false));
+        assert!(!detect_container(none, true, false));
+        assert!(!detect_container(none, false, true));
+        assert!(detect_container(none, true, true));
+        assert!(!detect_container(none, false, false));
     }
 }
