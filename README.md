@@ -49,7 +49,7 @@ each of which you can change.
 **What you need.** Linux on x86_64 (arm64 only from source: the published image is amd64, and the
 Claude Agent SDK path in the image is the x64 one), Docker with BuildKit that you run as your own
 user (`docker version` works without `sudo`), and about 20 GB of disk. Optional: Tailscale (for the
-web app and iMessage) and `gh` signed in (for a private image on ghcr.io).
+web app and iMessage) and `gh` signed in.
 
 **Get the CLI.** From a clone, `deploy/install.sh` (see [Quick start](#quick-start)), or
 `cargo install --locked --path crates/zephyr`.
@@ -67,7 +67,7 @@ repository; one copied from the image upgrades from the repository the image was
 keep `ZEPHYR_REPO` set (install.sh says so) unless that image was built with `ZEPHYR_BUILD_REPO`.
 
 ```sh
-# Without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first)
+# Without Rust (Linux x86_64, from the public image on ghcr.io)
 docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/zephyr > ~/.local/bin/zephyr && chmod +x ~/.local/bin/zephyr
 ```
 
@@ -1477,7 +1477,7 @@ without incremental compilation the copy is 8 GB but that takes 104 s). Why PR c
 write it: the writer is outside Actions, on the host, and builds only main's commit; a runner's
 mount is read only, whatever label a PR's workflow file picks; and no workflow names the volume.
 A PR can read main's build, which it could build itself. What this trusts, as the releases do, is
-that only the owner's own merges reach main: this free private repo has no branch protection, so a
+that only the owner's own merges reach main: this repo has no branch protection, so a
 workflow a PR from this repo starts can ask for `contents: write`, and a PR that edits `.github/`
 needs a person to read it before it is merged. A job runs as the runner
 user with no capabilities, no-new-privileges and no sudo. Run `up` again after changing the
