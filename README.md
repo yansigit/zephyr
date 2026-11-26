@@ -6,6 +6,8 @@ An always-on personal agent runtime written in Rust that runs in a single Docker
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/yansigit/zephyr)](https://github.com/yansigit/zephyr/releases)
 
+![Zephyr at work: checking the morning mail, drafting replies, and waiting for an /ok before sending the summary](docs/assets/zephyr-demo.webp)
+
 ## Why Zephyr
 
 - **Always-on daemon, not a chat window:** Runs continuously in the background over `rpi --mode rpc` with scheduled jobs, background tasks, provider failover, and crash recovery.
