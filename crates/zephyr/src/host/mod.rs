@@ -1751,7 +1751,11 @@ mod tests {
     #[test]
     fn container_detection_requires_a_zephyr_marker() {
         let none = |_: &str| false;
-        assert!(detect_container(|k| k == "ZEPHYR_IN_CONTAINER", false, false));
+        assert!(detect_container(
+            |k| k == "ZEPHYR_IN_CONTAINER",
+            false,
+            false
+        ));
         assert!(detect_container(|k| k == "ZEPHYR_CONFIG", false, false));
         assert!(!detect_container(none, true, false));
         assert!(!detect_container(none, false, true));
