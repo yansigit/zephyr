@@ -1558,9 +1558,9 @@ mod tests {
         // A key pasted where the name goes reaches a chat notice and an attach reply: the error
         // may say what a name looks like, never what was typed.
         for pasted in [
-            "sk-ant-api03-ZZl7c2VjcmV0LXZhbHVlLXRoYXQtaXMtbG9uZw",
-            "sk-proj-3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a",
-            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-ant-FAKE-EXAMPLE-KEY-FAKE-EXAMPLE-KEY-FAKE-EXAMP",
+            "sk-proj-FAKE-EXAMPLE-KEY-FAKE-EXAMPLE-KEY-FAKE-E",
+            "ghp_FAKEEXAMPLEKEY0FAKEEXAMPLEKEY0FAKEEX",
             // Unbroken and lowercase, so only the unbroken-run rule can refuse it.
             &"a".repeat(MAX_ACCOUNT_NAME),
         ] {

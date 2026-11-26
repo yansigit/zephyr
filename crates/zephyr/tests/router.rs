@@ -5886,7 +5886,7 @@ const VAULT: &str = r#"[[login]]
 name = "github"
 site = "https://github.com"
 username = "aiden"
-password = "hunter2-secret"
+password = "example-test-password"
 
 [[token]]
 name = "GH_TOKEN"

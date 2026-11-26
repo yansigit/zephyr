@@ -613,7 +613,7 @@ async fn zephyr_models_lists_each_accounts_models() {
 #[tokio::test]
 async fn zephyr_login_methods_report_providers_refuse_bad_input_and_cancel() {
     // A pasted credential where the account name goes: the refusal must not repeat it.
-    const PASTED: &str = "sk-ant-api03-9f4a2c7b8e1d6f0a3c5b7e2d";
+    const PASTED: &str = "sk-ant-FAKE-EXAMPLE-KEY-FAKE-EXAMPLE-";
     let gw = start("login");
     // An OAuth provider with a URL to print: the child waits there for the browser to come back
     // (`login_go`), which this test never writes — it cancels before the sign-in can finish.
