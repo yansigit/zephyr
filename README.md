@@ -1,17 +1,58 @@
 # Zephyr
 
-An always-on personal agent gateway over upstream `rpi --mode rpc`, running in one Docker container.
-It talks to you through its own terminal UI (or the stock rpi TUI), a line chat, Discord, iMessage, Telegram and Signal. See [DESIGN.md](DESIGN.md).
+An always-on personal agent runtime written in Rust that runs in a single Docker container on your own machine, reaches you over your chat channels, and puts approval gates in front of consequential actions. You own the agent. You own the data. You own the machine.
+
+[![CI](https://github.com/yansigit/zephyr/actions/workflows/ci.yml/badge.svg)](https://github.com/yansigit/zephyr/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/yansigit/zephyr)](https://github.com/yansigit/zephyr/releases)
+
+## Why Zephyr
+
+- **Always-on daemon, not a chat window:** Runs continuously in the background over `rpi --mode rpc` with scheduled jobs, background tasks, provider failover, and crash recovery.
+- **Your channels:** Talk to the agent from its terminal UI (`zephyr attach`), scripted line chat (`zephyr chat`), Discord, iMessage, Telegram, Signal, or the optional Tailscale-backed web app.
+- **Permission and approval gates:** Outbound messages, posts, payments, private facts, and memory edits wait for your `/ok` under configurable presets (`manual`, `semi`, `full`).
+- **Credential redaction:** Vault tokens are handed to commands as `zsur_…` surrogates swapped only on bound HTTPS hosts by the egress proxy, and secrets and private facts are scrubbed from command logs and replies so they never reach model output.
+- **Single-container deployment:** The daemon, policy plugin, browser and desktop tools, voice pipeline, and isolated egress network floor all live in one Linux Docker container on your own machine.
+
+## How it differs
+
+| | Zephyr | Typical chat-window agent |
+|---|---|---|
+| **Always-on** | Persistent background daemon with scheduled jobs and background tasks | Runs only while a chat window or CLI session is open |
+| **Channels** | Terminal UI, line chat, Discord, iMessage, Telegram, Signal, and optional web app | Single IDE panel, web UI, or local terminal session |
+| **Approvals** | Outbound messages, posts, payments, private facts, and memory edits gated by presets and `/ok` cards | Interactive per-tool or session-level prompts inside the active UI |
+| **Data ownership** | State, SQLite database, vault, private facts, and session logs live on your machine | Often stored in vendor-hosted cloud workspaces or tied to a local IDE session |
+| **Deployment** | One self-hosted Docker container with an isolated network floor and host CLI | Desktop app, IDE extension, or hosted SaaS |
 
 ## Quick start
 
-You need Docker and, for the image from GitHub, the `gh` CLI signed in to an account that can read `yansigit/zephyr`.
+Requires Linux with Docker runnable without `sudo`. See [Self-hosting](#self-hosting) and [DESIGN.md](DESIGN.md) for prerequisites, flags, and architecture details.
 
-From a clone, as your own user (no `sudo`):
+From a clone, install the CLI and run the setup wizard (`zephyr init`):
 
 ```sh
-deploy/install.sh                    # installs the CLI, then runs zephyr init
+deploy/install.sh
 ```
+
+Or build and install the CLI from source with Rust (1.91+), then run the wizard:
+
+```sh
+cargo install --locked --path crates/zephyr
+zephyr init
+```
+
+## Self-hosting
+
+Zephyr runs on your own machine with nothing of this project's owner in it but the defaults below,
+each of which you can change.
+
+**What you need.** Linux on x86_64 (arm64 only from source: the published image is amd64, and the
+Claude Agent SDK path in the image is the x64 one), Docker with BuildKit that you run as your own
+user (`docker version` works without `sudo`), and about 20 GB of disk. Optional: Tailscale (for the
+web app and iMessage) and `gh` signed in (for a private image on ghcr.io).
+
+**Get the CLI.** From a clone, `deploy/install.sh` (see [Quick start](#quick-start)), or
+`cargo install --locked --path crates/zephyr`.
 
 It copies the CLI out of `ghcr.io/yansigit/zephyr:latest` into `~/.local/bin/zephyr` (Linux
 x86_64; a failed pull logs in to ghcr.io with your `gh` token), or builds it with
@@ -25,17 +66,19 @@ has zephyr (the container, `~/.zephyr-daemon`, `~/.zephyr` or a `~/.local/bin/ze
 repository; one copied from the image upgrades from the repository the image was built for, so
 keep `ZEPHYR_REPO` set (install.sh says so) unless that image was built with `ZEPHYR_BUILD_REPO`.
 
-Or by hand, either of:
-
-```sh
-cargo install --path crates/zephyr   # the same binary runs on the host and in the container
-zephyr init                          # the wizard; safe to run again, it offers the current values
-```
-
 ```sh
 # Without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first)
 docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/zephyr > ~/.local/bin/zephyr && chmod +x ~/.local/bin/zephyr
 ```
+
+**Get the image.** `zephyr init` pulls `<repo>:<CLI version>` if you can read the registry.
+Otherwise build it: `zephyr up --build` builds `deploy/Dockerfile` here, and since the provider
+sources are public it needs no token. For a smaller image without the owner's provider sources, see
+[Building the image](#building-the-image) and what it leaves out. To use your own registry, build
+the CLI with it (`ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr cargo install --locked --path
+crates/zephyr`), build the image with `--build-arg ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr`,
+and push it there as `<repo>:<version>` and `<repo>:latest`. Run `docker login` for that registry
+yourself: your `gh` token only ever goes to ghcr.io.
 
 `zephyr init` checks Docker, asks for the projects folder the agent may work in, pulls the image
 (`docker login ghcr.io` with your `gh` token when needed; it builds locally when it cannot pull),
@@ -64,28 +107,6 @@ zephyr login openai-codex --account codex-main
 `--preset manual|semi|full` sets the approvals preset as `/approvals PRESET` does (a class you set
 by hand that is looser than the preset is cleared); without it a non-interactive `init` leaves
 `[approvals]` out (which is `manual`) and asks for no facts.
-
-## Self-hosting
-
-Zephyr runs on your own machine with nothing of this project's owner in it but the defaults below,
-each of which you can change.
-
-**What you need.** Linux on x86_64 (arm64 only from source: the published image is amd64, and the
-Claude Agent SDK path in the image is the x64 one), Docker with BuildKit that you run as your own
-user (`docker version` works without `sudo`), and about 20 GB of disk. Optional: Tailscale (for the
-web app and iMessage) and `gh` signed in (for a private image on ghcr.io).
-
-**Get the CLI.** From a clone, `deploy/install.sh` (see [Quick start](#quick-start)), or
-`cargo install --locked --path crates/zephyr`.
-
-**Get the image.** `zephyr init` pulls `<repo>:<CLI version>` if you can read the registry.
-Otherwise build it: `zephyr up --build` builds `deploy/Dockerfile` here, and since the provider
-sources are public it needs no token. For a smaller image without the owner's provider sources, see
-[Building the image](#building-the-image) and what it leaves out. To use your own registry, build
-the CLI with it (`ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr cargo install --locked --path
-crates/zephyr`), build the image with `--build-arg ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr`,
-and push it there as `<repo>:<version>` and `<repo>:latest`. Run `docker login` for that registry
-yourself: your `gh` token only ever goes to ghcr.io.
 
 **`zephyr init`, step by step.**
 
