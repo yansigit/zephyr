@@ -18,9 +18,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The credential host; `CURSOR_API_BASE` overrides it (tests point this at a loopback server).
 const DEFAULT_BASE: &str = "https://api2.cursor.sh";
-/// Cursor user API keys (`crsr_…`, minted at cursor.com/dashboard/api) are not bearer credentials
+/// Cursor user API keys (minted at cursor.com/dashboard/api) are not bearer credentials
 /// themselves: they are exchanged once and the result is reused (attribution: `omni-cursor-auth.ts`).
-const API_KEY_PREFIX: &str = "crsr_";
+/// Legacy keys carry the `crsr_` prefix; keys minted now are fine-grained and carry `grok_`.
+const API_KEY_PREFIXES: [&str; 2] = ["crsr_", "grok_"];
+
+/// Whether a credential is a Cursor user API key (either prefix), as opposed to a bearer token.
+fn is_api_key(key: &str) -> bool {
+    API_KEY_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
 const EXCHANGE_PATH: &str = "/auth/exchange_user_api_key";
 const REFRESH_PATH: &str = "/auth/refresh";
 /// A token whose JWT carries no readable `exp` is treated as fresh for this long, matching the
@@ -80,10 +86,10 @@ fn fingerprint(key: &str) -> [u8; 32] {
 }
 
 /// The bearer token for this turn: `explicit` (rpi's resolved key) when given, `CURSOR_API_KEY`
-/// otherwise. API keys (`crsr_…`) are exchanged; anything else is taken as a bearer token already.
+/// otherwise. API keys (`crsr_…`, `grok_…`) are exchanged; anything else is taken as a bearer token already.
 pub async fn token(explicit: Option<&str>) -> anyhow::Result<String> {
     let key = credential(explicit)?;
-    if key.starts_with(API_KEY_PREFIX) {
+    if is_api_key(&key) {
         return api_key_token(&key).await;
     }
     // A three-segment value is a JWT — a bearer token already — and any other shape is passed
@@ -518,6 +524,24 @@ mod tests {
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].path, EXCHANGE_PATH);
             assert_eq!(hits[0].bearer, "crsr_test_exchange");
+        })
+        .await
+        .expect("bounded");
+    }
+
+    #[tokio::test]
+    async fn a_fine_grained_api_key_is_exchanged_for_a_bearer_token() {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (api, script) = scripted_api().await;
+            let _environment = point_at(&api.base).await;
+
+            let token = token(Some("grok_test_exchange")).await.expect("a token");
+
+            assert_eq!(token, script.exchange);
+            let hits = api.answers();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, EXCHANGE_PATH);
+            assert_eq!(hits[0].bearer, "grok_test_exchange");
         })
         .await
         .expect("bounded");
