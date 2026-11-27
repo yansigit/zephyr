@@ -35,7 +35,7 @@ cargo test -q
 
 step "testing against the pinned rpi"
 # The ignored tests drive the real binary: $RPI_BIN, else this fixed path (the tests' RPI consts).
-rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.24.1/bin/rpi}
+rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.29.0/bin/rpi}
 if [ ! -x "$rpi" ] && [ "$(uname -m)" = x86_64 ]; then
   # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.
   v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)

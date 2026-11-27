@@ -2016,9 +2016,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.24.1"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaf0b24e177ff6a534670a7a00d65517ad187b8c9223bff1c2fbfbc4dd26f9b1"
+checksum = "1e752e09e26744474c3e40e5e1dc48a9d5fe86313177df1352412434ba185683"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2041,9 +2041,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.24.1"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "255843304e5c6dbb9e3719de97017bc3867e7f29d4c1d29ee9f352153490fc62"
+checksum = "600b9bd7341ecc5a28c743afe0d7c879f4911c97d2ccd01c40051dc87b22ccda"
 dependencies = [
  "reqwest",
  "rpi-ai",
@@ -2054,9 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.24.1"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b348538d8da92d2946e73031e89d0daa9bfa02fa571dc4317c6ff8930d2d688"
+checksum = "c9fb3e852a29f14865e0f4554ca0f967a1b70efe5d43b5683d2d928d1aba774f"
 dependencies = [
  "async-trait",
  "serde",
@@ -2066,9 +2066,9 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.24.1"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b3267a1908a6bf655b82baf9d058422cd43676e5709b3665cd7766742bb2608"
+checksum = "4c3a8faa9ceed08f811890211cb9ad6d57ac3e11cae26ec92fd25f02930243a1"
 dependencies = [
  "base64 0.22.1",
  "crossterm",
