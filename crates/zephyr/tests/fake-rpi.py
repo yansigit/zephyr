@@ -127,7 +127,7 @@ import glob, json, os, queue as queues, re, select, socket, struct, sys, threadi
 
 args = sys.argv[1:]
 if "--version" in args:
-    print("rpi 0.24.1"); sys.exit(0)
+    print("rpi 0.31.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
 GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/goals", "/persona", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]

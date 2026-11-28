@@ -5005,7 +5005,7 @@ fn release_and_runner_scripts_keep_their_defaults() {
     }
     let release = read(&deploy.join("release.sh"));
     assert!(
-        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.24.1/bin/rpi}"),
+        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.31.0/bin/rpi}"),
         "{release}"
     );
     assert!(release.contains("export RPI_BIN=\"$rpi\""), "{release}");
